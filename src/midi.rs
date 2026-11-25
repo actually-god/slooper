@@ -187,12 +187,15 @@ impl MidiMsg {
     }
 }
 
-/// Standard note name with scientific octave (MIDI 60 = C4).
+/// Standard note name for a physical key, routed through the single label
+/// home (edo-2, card t_cdca60c1): the name follows the LIVE tuning — at
+/// 12-EDO byte-identical to the historical naming (`v166_12edo_all_anchors_
+/// identical` in tune.rs), in other EDOs anchor keys keep their standard
+/// name and intermediates render relative `<name>±cents` labels. Callers
+/// that need pure 12-EDO naming use [`crate::tune::std_name`].
+#[inline]
 pub fn note_name(note: u8) -> String {
-    const NAMES: [&str; 12] = [
-        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-    ];
-    format!("{}{}", NAMES[(note % 12) as usize], ((note / 12) as i8 - 1))
+    crate::tune::label_text_live(note)
 }
 
 /// Standard names for the most common CC numbers; "GENERIC" otherwise.
@@ -698,6 +701,43 @@ mod tests {
         assert_eq!(note_name(60), "C4");
         assert_eq!(note_name(0), "C-1");
         assert_eq!(note_name(127), "G9");
+    }
+
+    // ---- v166 (card t_cdca60c1): echoes follow the label home ----
+
+    #[test]
+    fn v166_note_name_delegates_home() {
+        // Single-home contract (edo-2): midi.rs keeps NO name table —
+        // note_name is a thin delegate to the label home in tune.rs.
+        let src = include_str!("midi.rs");
+        let i = src.find("pub fn note_name").expect("fn present");
+        let j = i + src[i..].find("pub fn cc_name").expect("next fn");
+        assert!(src[i..j].contains("tune::label_text_live"), "must delegate");
+        // Sabotage polarity: re-forking the table in THIS file turns the
+        // count RED (concat! split keeps the pin's own text away from
+        // the assembled needle — source-pin doctrine).
+        let table = concat!("\"C\", \"C#\"", ", \"D\", \"D#\"");
+        assert!(
+            !src.contains(table),
+            "the note-name table has exactly one home: tune.rs"
+        );
+    }
+
+    #[test]
+    fn v166_midi_echo_follows_tuning() {
+        // The MIDI monitor's one-line description is a labeled surface:
+        // it names the key through the live builder, identical at N=12.
+        let back = crate::tune::get();
+        let m = MidiMsg::NoteOn {
+            channel: 0,
+            note: 61,
+            velocity: 99,
+        };
+        crate::tune::set(12, 60);
+        assert_eq!(m.describe(), "ch 01  note C#4 (61)  vel 99");
+        crate::tune::set(24, 60);
+        assert_eq!(m.describe(), "ch 01  note C4+50c (61)  vel 99");
+        crate::tune::set(back.0, back.1);
     }
 
     #[test]

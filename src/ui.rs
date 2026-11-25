@@ -12819,6 +12819,13 @@ impl App {
             tt += step_sec;
         }
         // keyboard strip + row lines (only rows intersecting view)
+        // edo-2 (card t_cdca60c1): key labels come from the single label
+        // home. 12-EDO paints exactly as before (C rows only, today's
+        // brightness); any other N names EVERY row — anchors in the
+        // standard name/brightness, intermediates relative (`C4+50c`) and
+        // dimmed with the existing kit token — but intermediates only on
+        // rows tall enough to read (tiny zooms keep anchor-only labels).
+        let (edo_n, edo_root) = crate::tune::get();
         for n in lo as i32..=hi as i32 {
             let black = matches!((n.rem_euclid(12)) as u8, 1 | 3 | 6 | 8 | 10);
             let y = y_of(n);
@@ -12867,14 +12874,31 @@ impl App {
                     },
                 ),
             );
-            if n.rem_euclid(12) == 0 {
-                painter.text(
-                    egui::pos2(rect.min.x + 4.0, y + roll.row_h * 0.5),
-                    egui::Align2::LEFT_CENTER,
-                    format!("C{}", n.div_euclid(12) - 1),
-                    egui::FontId::proportional(8.0),
-                    Color32::from_gray(225),
-                );
+            if edo_n == 12 {
+                if n.rem_euclid(12) == 0 {
+                    painter.text(
+                        egui::pos2(rect.min.x + 4.0, y + roll.row_h * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        crate::tune::std_name(n),
+                        egui::FontId::proportional(8.0),
+                        Color32::from_gray(225),
+                    );
+                }
+            } else {
+                let lab = crate::tune::label(edo_n, edo_root, n.clamp(0, 127) as u8);
+                if lab.anchor || roll.row_h >= 6.0 {
+                    painter.text(
+                        egui::pos2(rect.min.x + 4.0, y + roll.row_h * 0.5),
+                        egui::Align2::LEFT_CENTER,
+                        lab.text,
+                        egui::FontId::proportional(8.0),
+                        if lab.anchor {
+                            Color32::from_gray(225)
+                        } else {
+                            crate::kit::MUTED
+                        },
+                    );
+                }
             }
         }
         // pattern end + playhead markers
@@ -15821,12 +15845,19 @@ impl App {
                     egui::StrokeKind::Inside,
                 );
                 if wn.is_multiple_of(12) {
+                    // edo-2: label via the single home — standard C names
+                    // where the step anchors, relative+dims otherwise.
+                    let lab = crate::tune::label_live(wn);
                     ui.painter().text(
                         egui::pos2(x + 2.0, kr.max.y - 4.0),
                         egui::Align2::LEFT_BOTTOM,
-                        note_name(wn),
+                        lab.text,
                         egui::FontId::proportional(8.0),
-                        egui::Color32::from_gray(60),
+                        if lab.anchor {
+                            egui::Color32::from_gray(60)
+                        } else {
+                            crate::kit::MUTED
+                        },
                     );
                 }
             }
@@ -32258,11 +32289,11 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 ui.horizontal(|ui| {
                     ui.label("root note:");
                     egui::ComboBox::from_id_salt("edo_root_pick")
-                        .selected_text(edo_note_name(app.edo_root))
+                        .selected_text(crate::tune::std_name(app.edo_root as i32))
                         .show_ui(ui, |ui| {
                             for k in (0..=127).step_by(1) {
                                 if ui
-                                    .selectable_value(&mut app.edo_root, k, edo_note_name(k))
+                                    .selectable_value(&mut app.edo_root, k, crate::tune::std_name(k as i32))
                                     .clicked()
                                 {
                                     break;
@@ -32304,7 +32335,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     app.status = format!(
                         "tuning: {}-EDO, root {} ({:.2} cents/step) \u{2014} saved",
                         app.edo_n,
-                        edo_note_name(app.edo_root),
+                        crate::tune::std_name(app.edo_root as i32),
                         1200.0 / app.edo_n.max(1) as f64
                     );
                 }
@@ -32360,16 +32391,6 @@ fn settings_sect(ui: &mut egui::Ui, filt: &str, title: &str, keys: &str) -> bool
         ui.label(RichText::new(title).strong());
     }
     hit
-}
-
-/// v164 (card t_0c73850c): MIDI note number -> ASCII note name (C4 = 60).
-/// Plain letters + '#' only: the default fonts carry no flat/accident
-/// glyphs beyond the proven-safe set, and the name rides widgets.
-fn edo_note_name(n: u8) -> String {
-    const NAMES: [&str; 12] = [
-        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-    ];
-    format!("{}{}", NAMES[(n % 12) as usize], n as i32 / 12 - 1)
 }
 
 /// The settings category chips: (label, query). Each query must hit its
@@ -64249,5 +64270,287 @@ mod tests {
         app.mcp_apply_setting("edo_n", &cfg).unwrap();
         assert_eq!(crate::tune::get().0, crate::tune::EDO_MAX, "clamp via set");
         crate::tune::set(back.0, back.1);
+    }
+
+    // ---- v166 (card t_cdca60c1): EDO note labels on every surface ----
+
+    /// Floating-roll opener for the label pins: vscroll lands the viewport
+    /// on the C4 neighborhood (lo = 58) for any sane body height.
+    fn v166_open_roll(tag: &str) -> (App, egui::Context) {
+        let mut app = headless_app(tag);
+        let ctx = egui::Context::default();
+        app.piano_roll = Some(Box::new(PianoRoll {
+            pat: Pattern::new(120),
+            px_per_beat: 90.0,
+            row_h: 11.0,
+            vscroll_px: 640.0,
+            scroll_sec: 0.0,
+            changed: false,
+            gesture: RollGesture::None,
+            canvas_rect: None,
+            new_vel: 100,
+            sel_notes: Vec::new(),
+            sel_anchor: None,
+            drag_notes: Vec::new(),
+            focused: false,
+            win_rect: None,
+            edit_asset: None,
+            sel_bend: None,
+            nb_live: Vec::new(),
+            nb_base: Vec::new(),
+            menu_anchor: None,
+        }));
+        frame(&mut app, &ctx, vec![]);
+        (app, ctx)
+    }
+
+    /// Every painted text once, with its first-section color — the label
+    /// tint probe (pins assert kit-token identity from the real paint).
+    fn v166_text_colors(app: &mut App, ctx: &egui::Context) -> Vec<(String, egui::Color32)> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let v: Vec<(String, egui::Color32)> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) => t
+                    .galley
+                    .job
+                    .sections
+                    .first()
+                    .map(|s| (t.galley.text().trim().to_string(), s.format.color)),
+                _ => None,
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        v
+    }
+
+    /// Failing-dump helper: only the label-ish entries.
+    fn v166_labelish(items: &[(String, egui::Color32)]) -> Vec<&(String, egui::Color32)> {
+        items
+            .iter()
+            .filter(|(s, _)| {
+                s.chars()
+                    .next()
+                    .is_some_and(|c| ('A'..='G').contains(&c))
+                    && s.len() <= 9
+            })
+            .collect()
+    }
+
+    #[test]
+    fn v166_roll_key_labels_24edo() {
+        // Anchor rows paint the STANDARD name at today's brightness;
+        // intermediates paint the relative label, dimmed with the kit
+        // token — one builder, two visual classes (R2/R3/R7/R9).
+        let (mut app, ctx) = v166_open_roll("v166roll24");
+        let back = crate::tune::get();
+        crate::tune::set(24, 60);
+        frame(&mut app, &ctx, vec![]);
+        let items = v166_text_colors(&mut app, &ctx);
+        let bright = egui::Color32::from_gray(225);
+        let has = |needle: &str, col: egui::Color32| {
+            items.iter().any(|(s, c)| s == needle && *c == col)
+        };
+        assert!(has("C4", bright), "anchor standard name: {:?}", v166_labelish(&items));
+        assert!(has("D4", bright), "next anchor standard name");
+        assert!(
+            has("C4+50c", crate::kit::MUTED),
+            "intermediate relative + MUTED: {:?}",
+            v166_labelish(&items)
+        );
+        // Tiny rows: intermediates yield to avoid collisions, anchors keep.
+        app.piano_roll.as_mut().unwrap().row_h = 4.0;
+        let items = v166_text_colors(&mut app, &ctx);
+        let has2 = |needle: &str, col: egui::Color32| {
+            items.iter().any(|(s, c)| s == needle && *c == col)
+        };
+        assert!(!has2("C4+50c", crate::kit::MUTED), "row_h 4 hides intermediates");
+        assert!(has2("C4", bright), "anchors survive tiny rows");
+        crate::tune::set(back.0, back.1);
+    }
+
+    #[test]
+    fn v166_roll_key_labels_12edo_unchanged() {
+        // Hard 12-EDO law (R8): the roll renders EXACTLY as before the
+        // builder existed — C rows only, today's brightness, no cents
+        // label anywhere.
+        let (mut app, ctx) = v166_open_roll("v166roll12");
+        assert_eq!(crate::tune::get(), (12, 60), "default live tuning");
+        frame(&mut app, &ctx, vec![]);
+        let items = v166_text_colors(&mut app, &ctx);
+        let bright = egui::Color32::from_gray(225);
+        assert!(
+            items.iter().any(|(s, c)| s == "C4" && *c == bright),
+            "C rows paint as today: {:?}",
+            v166_labelish(&items)
+        );
+        assert!(
+            !items.iter().any(|(s, _)| s == "C#4" || s == "D#4"),
+            "12-EDO keeps C-only row labels"
+        );
+        assert!(
+            !items.iter().any(|(s, _)| s.ends_with('c') && s.contains(['+', '-'])),
+            "no relative labels at N=12"
+        );
+    }
+
+    #[test]
+    fn v166_roll_root_key_reattaches_labels() {
+        // Surface half of R4: moving the root to A4 moves the anchor grid
+        // with it — key 69 reads its standard name, 70 reads relative.
+        let (mut app, ctx) = v166_open_roll("v166rollA");
+        let back = crate::tune::get();
+        crate::tune::set(24, 69);
+        frame(&mut app, &ctx, vec![]);
+        let items = v166_text_colors(&mut app, &ctx);
+        let bright = egui::Color32::from_gray(225);
+        assert!(
+            items.iter().any(|(s, c)| s == "A4" && *c == bright),
+            "root key anchors with its standard name: {:?}",
+            v166_labelish(&items)
+        );
+        assert!(
+            items.iter().any(|(s, c)| s == "A4+50c" && *c == crate::kit::MUTED),
+            "step above root renders relative"
+        );
+        crate::tune::set(back.0, back.1);
+    }
+
+    #[test]
+    fn v166_smap_strip_labels_follow_tuning() {
+        // The sampler-map keyboard strip is the third surface: at 19-EDO
+        // root C the C4 key still anchors, but the C5 key really sits 42c
+        // BELOW G#4 — the strip says so, honestly and dimmed.
+        let (mut app, ctx) = v56_open_sampler_map("v166smap");
+        let back = crate::tune::get();
+        crate::tune::set(19, 60);
+        frame(&mut app, &ctx, vec![]);
+        let items = v166_text_colors(&mut app, &ctx);
+        assert!(
+            items
+                .iter()
+                .any(|(s, c)| s == "C4" && *c == egui::Color32::from_gray(60)),
+            "root anchor keeps today's ink: {:?}",
+            v166_labelish(&items)
+        );
+        assert!(
+            items
+                .iter()
+                .any(|(s, c)| s == "G#4-42c" && *c == crate::kit::MUTED),
+            "C5 row renders its true relative label at 19-EDO"
+        );
+        crate::tune::set(back.0, back.1);
+    }
+
+    #[test]
+    fn v166_status_echo_names_by_tuning() {
+        // Status-line echo (one of the 28 wrapper-consumed sites) follows
+        // the live tuning; at N=12 the text is the historical one.
+        let mut app = headless_app("v166echo");
+        app.sample_rate = 44100; // NULL engine: audition bookkeeping only
+        let back = crate::tune::get();
+        crate::tune::set(24, 60);
+        app.roll_key_hold(61);
+        assert!(
+            app.status.contains("C4+50c"),
+            "key-audition echo follows tuning: {}",
+            app.status
+        );
+        crate::tune::set(12, 60);
+        app.roll_hold = None;
+        app.roll_key_hold(61);
+        assert!(
+            app.status.contains("C#4"),
+            "12-EDO echo byte-identical: {}",
+            app.status
+        );
+        app.roll_hold = None;
+        crate::tune::set(back.0, back.1);
+    }
+
+    #[test]
+    fn v166_single_home_source_scan() {
+        // The edo-2 completeness audit (v54 pattern, R1/R6): EXACTLY ONE
+        // note-name table in the repo, every labeled surface consumes the
+        // home, and the two historical forks are gone. Both polarities use
+        // concat! so the pin cannot match its own text (source-pin law).
+        let ui_src = include_str!("ui.rs");
+        let midi_src = include_str!("midi.rs");
+        let tune_src = include_str!("tune.rs");
+        let table = concat!("\"C\", \"C#\"", ", \"D\", \"D#\"");
+        assert_eq!(
+            tune_src.matches(table).count(),
+            1,
+            "single home: exactly one name table"
+        );
+        assert!(!midi_src.contains(table), "no table fork in midi.rs");
+        assert!(!ui_src.contains(table), "no table fork in ui.rs");
+        let cfmt = concat!("format!", "(\"C{");
+        assert!(!ui_src.contains(cfmt), "inline C-octave formatting is gone");
+        let fork = concat!("edo_note", "_name");
+        assert!(!ui_src.contains(fork), "the v164 settings fork is removed");
+        // Wiring: surfaces delegate to the home (sabotage: re-inline any
+        // surface's naming and its needle disappears -> RED).
+        assert!(midi_src.contains("tune::label_text_live"), "echo wrapper delegates");
+        assert!(
+            ui_src.contains("crate::tune::label(edo_n, edo_root, n.clamp"),
+            "roll key rows consume the builder"
+        );
+        assert!(ui_src.contains("crate::tune::label_live(wn)"), "smap strip consumes the builder");
+        assert!(ui_src.contains("crate::tune::std_name(n)"), "roll 12-EDO path names via the home");
+        assert!(
+            ui_src.contains("tune::std_name(app.edo_root as i32)"),
+            "settings root naming via the home"
+        );
+    }
+
+    #[test]
+    fn v166_anchor_tint_uses_kit_token() {
+        // R7 source half: the intermediate dim is the EXISTING kit token,
+        // not a new literal (the paint-side identity is asserted by the
+        // 24-EDO roll pin reading real galley colors).
+        let ui_src = include_str!("ui.rs");
+        let grab = |a: &str, b: &str| -> String {
+            let i = ui_src.find(a).expect("anchor a");
+            let j = i + ui_src[i..].find(b).expect("anchor b");
+            ui_src[i..j].to_string()
+        };
+        let roll = grab(
+            "let (edo_n, edo_root) = crate::tune::get();",
+            "// pattern end + playhead",
+        );
+        assert_eq!(
+            roll.matches("crate::kit::MUTED").count(),
+            1,
+            "roll intermediate tint is the kit token"
+        );
+        assert_eq!(
+            roll.matches("from_gray(225)").count(),
+            2,
+            "both label branches reuse today's anchor brightness"
+        );
+        let strip = grab("let lab = crate::tune::label_live(wn);", "// Black keys straddle");
+        assert_eq!(
+            strip.matches("crate::kit::MUTED").count(),
+            1,
+            "strip intermediate tint is the kit token"
+        );
+        assert_eq!(
+            strip.matches("from_gray(60)").count(),
+            1,
+            "strip anchors keep today's ink"
+        );
     }
 }
