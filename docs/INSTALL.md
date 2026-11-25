@@ -41,32 +41,41 @@ source repo. Notes about the PKGBUILD:
 
 Grab `slooper-<version>-linux-x86_64.tar.zst` from
 [the GitHub Releases page](https://github.com/actually-god/slooper/releases).
-It carries an FHS `usr/` tree (same layout as the Arch package), so one
-command installs binary + desktop entry + icon on any x86_64 distro:
+It unpacks to a `slooper-<version>-linux-x86_64/` folder holding an FHS
+`usr/` tree (the layout the Arch package installs) plus its README and
+license files — copy the `usr/` tree into `/` and you have binary +
+desktop entry + icon on any x86_64 distro:
 
 ```sh
-sudo tar -C / --zstd -xf slooper-<version>-linux-x86_64.tar.zst
+tar --zstd -xf slooper-<version>-linux-x86_64.tar.zst
+sudo cp -a slooper-<version>-linux-x86_64/usr /   # binary + desktop entry + icon
 # uninstall again:
 sudo rm /usr/bin/slooper /usr/share/applications/slooper.desktop \
         /usr/share/pixmaps/slooper.png
 ```
 
 Per-distro runtime packages (see the contract below; Arch users: the
-tarball above is the install path until the AUR package lands):
+tarball above is the install path until the AUR package lands). The two
+hard deps are the same everywhere; only the JACK-provider name varies:
 
 ```sh
-# Debian 12 / Ubuntu 22.04+:
+# Debian 12 / Ubuntu 24.04+ (pipewire-jack provides libjack.so.0):
 sudo apt-get install -y libx11-6 libstdc++6 pipewire-jack
-# Fedora:
-sudo dnf install libX11 libstdc++ pipewire-jack
+# Ubuntu 22.04 has no pipewire-jack package — jackd2 provides libjack:
+sudo apt-get install -y libx11-6 libstdc++6 libjack-jackd2-0
+# Fedora (PipeWire's JACK client library package):
+sudo dnf install libX11 libstdc++ pipewire-jack-audio-connection-kit-libs
 ```
 
 On Debian/Ubuntu you can skip the tar entirely: grab
 `slooper-<version>_amd64.deb` from the same Releases page — apt pulls the
 runtime deps for you (`sudo apt install ./slooper-<version>_amd64.deb`,
-remove again with `sudo apt remove slooper`). Same binary, same payload
-as the tar.zst — the package exists to answer "there's no .deb" reports;
-the tar.zst stays the reference artifact.
+remove again with `sudo apt remove slooper`). Fedora/openSUSE likewise:
+`slooper-<version>-1.fc40.x86_64.rpm`
+(`sudo dnf install ./slooper-<version>-1.fc40.x86_64.rpm` or
+`sudo rpm -Uvh …rpm`). Same binary, same payload as the tar.zst — the
+packages exist to answer "there's no .deb/.rpm" reports; the tar.zst
+stays the reference artifact.
 
 ### The dependency contract (why one binary runs on every distro)
 
@@ -74,8 +83,9 @@ A Linux binary permanently carries the **versioned symbols of its build
 machine's libc**: a slooper built on Arch today demands `GLIBC_2.43` and
 dies on Debian 12 at exec with `version 'GLIBC_2.43' not found`. So the
 single tar.zst runs everywhere **only because it is built on the floor
-distro** — the oldest glibc we support (Ubuntu 22.04, glibc 2.35; Debian
-12 ships 2.36, every newer distro more). CI enforces this twice per
+distro** — the oldest glibc we support (Ubuntu 22.04, glibc 2.35 — the
+floor Debian 12 (2.36) and Fedora 38+ satisfy, and every newer distro
+carries more). CI enforces this twice per
 release: the shipped exe's symbol demand is asserted against the floor,
 then the packaged exe is load-and-probe smoke-tested in Arch, Debian 12,
 Ubuntu 22.04 and Fedora containers (`WINDOWS-PORT.md` W13a/W13b). If you
@@ -97,7 +107,7 @@ installed):
 
 | dlopen'd | Needed for |
 | --- | --- |
-| `libjack.so` (the JACK API) | audio, in practice: install `pipewire-jack` or `jack2` — slooper never spawns a server itself |
+| `libjack.so` (the JACK API) | audio, in practice: install your distro's JACK package — `pipewire-jack` (Arch, Debian 12, Ubuntu 24.04+), `pipewire-jack-audio-connection-kit-libs` (Fedora) or `jack2` — slooper never spawns a server itself |
 | Wayland client libs | native Wayland; without them the GUI uses X11/XWayland |
 | GL / EGL drivers | any display at all (software `llvmpipe` works — see `SLOOPER_GPU_GL`) |
 
@@ -138,8 +148,11 @@ sudo install -Dm644 assets/icon.png \
 slooper is just another JACK client — whatever works for other DAWs works
 for it.
 
-**PipeWire (recommended).** Install PipeWire with the JACK support package
-(`pipewire-jack` on Arch/DP/Fedora — the package that provides `libjack.so`).
+**PipeWire (recommended).** Install PipeWire with the JACK support
+package — `pipewire-jack` on Arch and Debian 12 / Ubuntu 24.04+,
+`pipewire-jack-audio-connection-kit-libs` on Fedora; Ubuntu 22.04's
+archive has no PipeWire-JACK package, so there use jack2. These are the
+packages that provide `libjack.so.0`.
 Start a session as usual; PipeWire answers JACK clients automatically.
 
 **jack2.** Install `jack2`, then start a server before launching slooper,

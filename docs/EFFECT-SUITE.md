@@ -38,8 +38,12 @@ becomes fake-stereo and a downmix never changes level.
 
 ## Roster
 
-Parameter ranges below are what the slider shows; values are native units
-(Hz, dB, ms). Every effect carries a **mix** (wet/dry) and an **out** trim
+The roster is a quick map: each effect's **key parameters** with the
+ranges the sliders show, in native units (Hz, dB, ms). For the complete
+set, let the app show it — every shipped parameter carries metadata and
+every widget states itself: hover for its current value and the full
+range with unit (see Conventions → Widget feedback).
+Every effect carries a **mix** (wet/dry) and an **out** trim
 unless noted. Factory presets live beside your own in
 `~/.local/share/slooper/effects/user presets/` and are ordinary JSON files
 you can edit — see [USAGE.md](USAGE.md#presets).

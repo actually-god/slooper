@@ -1,5 +1,13 @@
 # WINDOWS-PORT.md — Windows compatibility program
 
+> **Status (2026-11-25): historical engineering log.** This file is the
+> ledger of the Windows port series — W1→W14 plus follow-ups, program
+> closed 2026-11-13. The port is **shipped and maintained on `main`**:
+> live Windows usage lives in [INSTALL.md](INSTALL.md) (Windows section)
+> and the wiki, not here. The W-numbers cited elsewhere in the tree (code
+> comments, `.github/workflows/release.yml` header, CI) are stable
+> historical identifiers — each named step below still exists as written.
+
 > Living task ledger, one task per cron session. Same protocol as the
 > native-suite ledger:
 > work one task at a time, tick it, append a one-paragraph DONE note with the
