@@ -56,7 +56,11 @@ libloading = "0.8"
 libc = "0.2"
 # VST hosting: VST3 backend (loaded plugins run through its realtime runner)
 # and the vendored, host-patched VST2 backend (vendor/vst2, see VENDOR-NOTES).
-vst3-host = { version = "0.10", default-features = false }
+# SLOOPER PATCH (v165): vendored vst3-host 0.10.0 — plugin_impl delivers
+# unmapped CC/bend/channel-AT/program-change as raw kLegacyMIDICCOutEvent
+# input events instead of silently dropping them (mapped-parameter route
+# unchanged). See vendor/vst3-host/SLOOPER-PATCH.md.
+vst3-host = { path = "vendor/vst3-host", default-features = false }
 vst2 = { path = "vendor/vst2" }
 
 # OS-gated audio backends (WINDOWS-PORT W5): the jack crate is Linux-only in
