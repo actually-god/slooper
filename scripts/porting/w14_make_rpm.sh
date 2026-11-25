@@ -68,7 +68,14 @@ BuildArch:      x86_64
 
 # Hard deps ride rpm's automatic requires (the binary's real NEEDED set).
 # jack / Wayland / GL are dlopen'd at runtime -> weak deps only.
-Recommends:     pipewire-jack-libs
+# The JACK line is the rpm mirror of the deb's
+# "Recommends: pipewire-jack | libjack-jackd2-0": on Fedora exactly two
+# packages provide libjack.so.0 (dnf repoquery --whatprovides, fc40,
+# verified 2026-11-25) - the PipeWire JACK shim libs and jack2's server
+# package. The previously shipped "pipewire-jack-libs" never existed in
+# any Fedora release, and dnf skips unresolvable weak deps SILENTLY, so
+# the v0.24.0 rpm pulled no JACK provider (t_590eb1f1).
+Recommends:     (pipewire-jack-audio-connection-kit-libs or jack-audio-connection-kit)
 Recommends:     libwayland-client.so.0()(64bit)
 Recommends:     libEGL.so.1()(64bit)
 Suggests:       rustc
