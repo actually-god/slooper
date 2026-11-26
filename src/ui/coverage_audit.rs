@@ -577,7 +577,14 @@ fn hover_audit(files: &[AF]) -> HoverAudit {
                         }
                     }
                     end = extend_for_builder(f.lines, end, &var);
+                    // Window lines are the depth-aware statement; comment
+                    // lines carry no tokens, so hovers in comments never
+                    // count (the echo scan's comment strip is sabotage-
+                    // proved the same way, polarity B).
                     let stmt = f.lines[li..=end].join("\n");
+                    let core = strip_closures(&stmt);
+                    let core = strip_closures(&stmt);
+                    let core = strip_closures(&stmt);
                     let core = strip_closures(&stmt);
                     triggers += 1;
                     if !core.contains("on_hover") {
