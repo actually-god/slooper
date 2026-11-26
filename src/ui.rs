@@ -62051,7 +62051,13 @@ mod tests {
         assert_eq!(active(&kit_src, "fn armed_outside_click("), 1);
         assert_eq!(active(&kit_src, "button_clicked(PointerButton::Primary)"), 1);
         assert_eq!(active(&kit_src, "button_clicked(PointerButton::Secondary)"), 1);
-        assert_eq!(active(&kit_src, "key_pressed(Key::Escape)"), 1);
+        // v170 retarget: the bare `key_pressed(Key::Escape)` needle counted
+        // the WHOLE predicate vocabulary — legal since it was the file's only
+        // Escape read. The standard confirm dialog (kit::confirm) adds an
+        // independent Escape-as-Cancel for modals (not an armed dismissal),
+        // so the one-home law is now fingerprinted on the armed-gated body
+        // line itself, which only armed_outside_click may write.
+        assert_eq!(active(&kit_src, "escape && i.key_pressed(Key::Escape)"), 1);
         assert_eq!(active(&kit_src, "hover_pos().unwrap_or(rect.center())"), 1);
     }
 
@@ -65685,11 +65691,11 @@ mod tests {
                 .count()
         };
         // The ONLY live caller of `arr.remove_lane` is do_remove_lane.
-        assert_eq!(active(&concat!("self.a", "rr.remove_lane(")), 1, "remove_lane must live only in do_remove_lane");
+        assert_eq!(active(concat!("self.a", "rr.remove_lane(")), 1, "remove_lane must live only in do_remove_lane");
         // No ad-hoc arrange pokes via a App-binding (the pre-v170 shape).
-        assert_eq!(active(&concat!("app.arr.remove_l", "ane(")), 0, "no direct remove_lane outside the seam");
+        assert_eq!(active(concat!("app.arr.remove_l", "ane(")), 0, "no direct remove_lane outside the seam");
         // kit::confirm renders from exactly ONE app site.
-        assert_eq!(active(&concat!("crate::kit::con", "firm(")), 1, "standard_confirm_window is the single render home");
+        assert_eq!(active(concat!("crate::kit::con", "firm(")), 1, "standard_confirm_window is the single render home");
         // The strip "−" button routes through the gate seam.
         let at = src
             .find("Remove the last child lane")
@@ -65697,7 +65703,7 @@ mod tests {
         let win = &src[at..(at + 500).min(src.len())];
         assert!(
             win.lines()
-                .any(|l| l.trim_start().starts_with(&concat!("app.request_lane_remo", "val("))),
+                .any(|l| l.trim_start().starts_with(concat!("app.request_lane_remo", "val("))),
             "the strip minus-button must live-call the gate seam"
         );
     }
