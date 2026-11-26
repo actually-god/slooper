@@ -49,6 +49,14 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Changed
 
+- **Record groups live in the selection now.** The mixer strip's `G`
+  checkbox is retired — the track HEAD MENU carries both directions for
+  the whole selection at once: *REC group (selection)* joins every
+  selected track (unchanged join order and shared loop selector), and a
+  new *Leave group* removes the selected tracks that are members while
+  the rest of the group stays. Joined tracks still arm and stop
+  together from the top-bar **REC GROUP** master.
+
 - **The master spectrum reads evenly now.** The analyzer window doubled
   to 16384 samples (bin spacing ≈2.9 Hz @ 48 kHz, 8192 bins), and the
   displayed trace is projected onto 1024 equal-per-octave points, so
