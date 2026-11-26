@@ -2623,23 +2623,23 @@ fn toggle_record(engine: &Engine, i: usize, tx: &SyncSender<Evt>) {
 /// a block, re-read, then copy below the (older) committed watermark — the
 /// RT cursor only ever advances, so those frames cannot be mid-write.
 fn pump_live_takes(engine: &Engine, tx: &SyncSender<Evt>, sent: &mut [(u64, u64); MAX_LOOPS]) {
-    for t in 0..MAX_LOOPS {
+    for (t, st) in sent.iter_mut().enumerate() {
         if engine.rec_state_of(t) != TR_REC {
-            sent[t] = (0, 0);
+            *st = (0, 0);
             continue;
         }
         let at = engine.rec_at(t);
-        let (pass_at, pass_len) = sent[t];
+        let (pass_at, pass_len) = *st;
         let base = if pass_at == at { pass_len } else { 0 };
         let len = engine.rec_len_of(t) as u64;
         if len <= base {
-            sent[t] = (at, base.min(len));
+            *st = (at, base.min(len));
             continue;
         }
         std::thread::sleep(std::time::Duration::from_millis(6));
         let frames = engine.copy_take_delta(t, base as usize);
         if !frames.is_empty() {
-            sent[t] = (at, base + frames.len() as u64);
+            *st = (at, base + frames.len() as u64);
             let _ = tx.try_send(Evt::TakeProgress {
                 track: t,
                 at,

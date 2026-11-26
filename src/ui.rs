@@ -45466,7 +45466,7 @@ mod tests {
         {
             let g = app
                 .live_takes
-                .get(0)
+                .first()
                 .and_then(|o| o.as_ref())
                 .expect("ghost after the first progress event");
             assert_eq!((g.at, g.frames.len()), (1000, 400));
