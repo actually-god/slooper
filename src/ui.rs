@@ -948,22 +948,37 @@ fn track_head_menu(ui: &mut egui::Ui, app: &mut App, t: usize) {
     }
     // v94 (sc-1): the selection replaces one-by-one checkbox joins — every
     // selected track joins the RECORD GROUP here (ascending order, v52
-    // loop-inherit contract via the shared `rec_group_join` seam). The "G"
-    // checkbox stays for single-track join/leave: membership outlives the
-    // volatile selection.
+    // loop-inherit contract via the shared `rec_group_join` seam).
+    // v171: the strip "G" checkbox is RETIRED (user: multi-track selection
+    // is the way) — the head menu is now the ONLY membership surface:
+    // join AND leave both act on the selection through shared seams.
     let n_sel = app.track_sel.len();
     if ui
         .button("REC group (selection)")
         .on_hover_text(format!(
             "join the {} selected track(s) to the record group so they arm \
              and stop TOGETHER from the top-bar 'REC GROUP' button (loop \
-             'l' is shared); leave with the strip's G checkbox",
+             'l' is shared); leave with 'Leave group' below",
             n_sel
         ))
         .clicked()
     {
         let sel = app.track_sel.clone();
         app.rec_group_join(&sel);
+        ui.close();
+    }
+    if ui
+        .button("Leave group")
+        .on_hover_text(format!(
+            "remove the {} selected track(s) from the record group \
+             (members only — tracks outside the group are untouched); \
+             membership does NOT depend on the selection otherwise",
+            n_sel
+        ))
+        .clicked()
+    {
+        let sel = app.track_sel.clone();
+        app.rec_group_leave(&sel);
         ui.close();
     }
     if ui
@@ -5814,11 +5829,12 @@ impl App {
         }
     }
 
-    /// v94 (sc-1): join `ts` to the RECORD GROUP from ONE seam — the strip
-    /// "G" checkbox and the head-menu join-from-selection share it, so the
-    /// v52 R4 contract (join order = ascending front-oldest; a joiner
-    /// inherits the LINKED loop selector from the front member) cannot
-    /// drift between entry points. Already-member tracks are skipped.
+    /// v94 (sc-1): join `ts` to the RECORD GROUP from ONE seam — the
+    /// head-menu join-from-selection is the ONLY caller (v171 retired the
+    /// strip "G" checkbox), so the v52 R4 contract (join order = ascending
+    /// front-oldest; a joiner inherits the LINKED loop selector from the
+    /// front member) cannot drift between entry points. Already-member
+    /// tracks are skipped.
     fn rec_group_join(&mut self, ts: &[usize]) {
         let mut ts: Vec<usize> = ts.to_vec();
         ts.sort_unstable();
@@ -5851,6 +5867,47 @@ impl App {
                 joined
                     .iter()
                     .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.rec_group.len()
+            );
+        }
+    }
+
+    /// v171: leave mirror of the join seam — removes the GROUP MEMBERS of
+    /// `ts` (tracks outside the group are untouched), keeping join-order
+    /// intact for the survivors. The head menu's "Leave group" (selection)
+    /// is the ONLY caller since the strip "G" checkbox was retired; a
+    /// leave that removes nothing echoes a refusal (goal 1: no silent
+    /// clicks).
+    fn rec_group_leave(&mut self, ts: &[usize]) {
+        let mut ts: Vec<usize> = ts.to_vec();
+        ts.sort_unstable();
+        ts.dedup();
+        let left: Vec<usize> = ts
+            .iter()
+            .copied()
+            .filter(|t| *t < self.n_tracks && self.rec_group.contains(t))
+            .collect();
+        if left.is_empty() {
+            self.status = format!(
+                "record group: no selected track is in the group \u{b7} {} track(s) selected",
+                self.rec_group.len()
+            );
+            return;
+        }
+        self.rec_group.retain(|j| !left.contains(j));
+        if left.len() == 1 {
+            self.status = format!(
+                "record group: track {} leaves \u{2014} {} track(s) selected",
+                left[0] + 1,
+                self.rec_group.len()
+            );
+        } else {
+            self.status = format!(
+                "record group: tracks {} leave \u{2014} {} track(s) selected",
+                left.iter()
+                    .map(|n| (n + 1).to_string())
                     .collect::<Vec<_>>()
                     .join(", "),
                 self.rec_group.len()
@@ -20641,10 +20698,11 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                     )
                     .min_size(egui::vec2(84.0, 0.0));
                     let g_resp = ui.add(g_btn).on_hover_text(format!(
-                        "Record group: {} track(s) joined (select them with \
-                         'grp' on their strips). Click arms every member at \
-                         once, each with its own ticked sources; while any \
-                         member records, this STOPs them all together.",
+                        "Record group: {} track(s) joined (use the track \
+                         head menu: 'REC group (selection)' / 'Leave \
+                         group'). Click arms every member at once, each \
+                         with its own ticked sources; while any member \
+                         records, this STOPs them all together.",
                         mem.len()
                     ));
                     if g_resp.clicked() && !mem.is_empty() {
@@ -22231,6 +22289,9 @@ fn def_w(idx: usize) -> f32 {
         // default explicitly; windows can still shrink freely by hand.
         // v52 R4 added the strip's group ('G') toggle — 360 then clipped
         // the child-lane '+' off the row (pinned by v32_mixer_state_swaps).
+        // v171 retired the 'G' toggle again; 390 stays the COMFORTABLE
+        // default (the pins own this width budget — do not squeeze it back
+        // just because the row lost one widget).
         3 => 390.0,
         _ => 440.0,
     }
@@ -26681,35 +26742,11 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         {
             app.toggle_record_all(t);
         }
-        // v52 R4: RECORD GROUP membership. Joined tracks are armed/stopped
-        // together by the top-bar master; the loop ("l") selector is LINKED
-        // across members — joining inherits the oldest member's value, a
-        // toggle on any member mirrors to all. The other selectors stay
-        // independent.
-        let mut grp = app.rec_group.contains(&t);
-        let grp_resp = ui
-            .checkbox(&mut grp, "G")
-            .on_hover_text(
-                "Record group: joined tracks arm and stop TOGETHER from the \
-                 top-bar 'REC GROUP' button. The loop ('l') selector is shared \
-                 across members: joining inherits it from the first member, \
-                 toggling it mirrors to all. The other source selectors stay \
-                 per-track.",
-            );
-        if grp_resp.changed() {
-            if grp {
-                // v94 (sc-1): join goes through the shared seam (the head
-                // menu's join-from-selection uses the same code path).
-                app.rec_group_join(&[t]);
-            } else {
-                app.rec_group.retain(|&j| j != t);
-                app.status = format!(
-                    "record group: track {} leaves — {} track(s) selected",
-                    t + 1,
-                    app.rec_group.len()
-                );
-            }
-        }
+        // v52 R4: RECORD GROUP membership (joined tracks arm/stop together
+        // via the top-bar master; the loop "l" selector below is LINKED
+        // across members). v171: the strip "G" checkbox is RETIRED — the
+        // head menu carries join/leave for the whole selection, and the
+        // v94 selection-join seam is the single entry point.
         let mut src = app.rec_src[t];
         let ac = ui
             .checkbox(&mut src.audio, "a")
@@ -51413,8 +51450,12 @@ mod tests {
         let mut app = headless_app("v52rec1");
         let ctx = egui::Context::default();
         app.sample_rate = 48_000; // null audio never sends Evt::Ready
+        app.show_master = false; // v171: v94_strip_head band = master closed…
         clear_canvas(&mut app);
-        frame(&mut app, &ctx, vec![]);
+        for _ in 0..3 {
+            // …+ 3 settle frames before the strip-header read.
+            frame(&mut app, &ctx, vec![]);
+        }
         app.rec_src[0] = RecSrc {
             audio: false,
             preview: false,
@@ -51429,12 +51470,21 @@ mod tests {
             midi: true,
             auto: false,
         };
-        // Join tracks 1 and 2 with real strip clicks.
-        let g = galley_centers(&mut app, &ctx, "G", true);
-        assert!(g.len() >= 2, "every strip carries a group checkbox");
-        click_pt(&mut app, &ctx, g[0]);
-        let g = galley_centers(&mut app, &ctx, "G", true);
-        click_pt(&mut app, &ctx, g[1]);
+        // v171 retarget: join through REAL UI now that the strip "G"
+        // checkbox is retired — ctrl-add track 2 to the loaded project's
+        // default selection, then the shared head-menu join entry.
+        let p = v94_strip_head(&mut app, &ctx, 2);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        assert_eq!(
+            app.track_sel,
+            vec![0, 1],
+            "track 1 (default) + ctrl-added track 2"
+        );
+        let p = v94_strip_head(&mut app, &ctx, 2);
+        rmb(&mut app, &ctx, p);
+        let item = galley_at_last(&mut app, &ctx, "REC group (selection)")
+            .expect("join entry in the shared head menu");
+        click_pt(&mut app, &ctx, item.center());
         frame(&mut app, &ctx, vec![]);
         assert_eq!(app.rec_group, vec![0, 1], "two tracks selected for recording");
         // The master arms both at once.
@@ -51464,13 +51514,21 @@ mod tests {
         let mut app = headless_app("v52reclink");
         let ctx = egui::Context::default();
         app.sample_rate = 48_000;
+        app.show_master = false; // v171: v94_strip_head band setup (see above)
         clear_canvas(&mut app);
-        frame(&mut app, &ctx, vec![]);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
         app.rec_src[0].loop_rec = true;
-        let g = galley_centers(&mut app, &ctx, "G", true);
-        click_pt(&mut app, &ctx, g[0]);
-        let g = galley_centers(&mut app, &ctx, "G", true);
-        click_pt(&mut app, &ctx, g[1]);
+        // v171 retarget: join via selection + head menu (the strip "G"
+        // checkbox is retired) — the inherit contract below is unchanged.
+        let p = v94_strip_head(&mut app, &ctx, 2);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        let p = v94_strip_head(&mut app, &ctx, 2);
+        rmb(&mut app, &ctx, p);
+        let item = galley_at_last(&mut app, &ctx, "REC group (selection)")
+            .expect("join entry in the shared head menu");
+        click_pt(&mut app, &ctx, item.center());
         frame(&mut app, &ctx, vec![]);
         assert!(
             app.rec_src[1].loop_rec,
@@ -61880,6 +61938,159 @@ mod tests {
         );
     }
 
+    /// v171 AC1: the strip "G" checkbox is GONE — no exact "G" galley
+    /// paints anywhere. Positive controls (the 'a'/'l' source checkboxes
+    /// of the SAME strip rows) prove the strips still render, so the
+    /// absence is not a blank-canvas false green.
+    #[test]
+    fn v171_strip_no_g_checkbox() {
+        let mut app = headless_app("v171nog");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let g = galley_centers(&mut app, &ctx, "G", true);
+        assert!(g.is_empty(), "no surface may paint the retired G checkbox: {g:?}");
+        // Positive control: same rows still carry their source checkboxes.
+        assert!(
+            galley_centers(&mut app, &ctx, "a", true).len() >= 3,
+            "strips still render (audio ticks)"
+        );
+        assert!(
+            galley_centers(&mut app, &ctx, "l", true).len() >= 3,
+            "strips still render (loop ticks)"
+        );
+    }
+
+    /// v171 AC4: the head menu's "Leave group" acts on the SELECTION and
+    /// round-trips membership through real UI — join three, ctrl-drop one
+    /// from the selection and leave: the non-selected member SURVIVES
+    /// (membership does not track the selection); then leave the last
+    /// member (singular echo), then a refusal echo with nothing to remove.
+    /// Each menu opens on a DIFFERENT anchor (v50(e) popup re-arm rule).
+    #[test]
+    fn v171_leave_group_roundtrip() {
+        let mut app = headless_app("v171leave");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // Join tracks 1-3 through the real menu (labels Track 1..3 = idx 0..2).
+        let p = v94_strip_head(&mut app, &ctx, 2);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        let p = v94_strip_head(&mut app, &ctx, 3);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        assert_eq!(app.track_sel, vec![0, 1, 2], "three tracks selected");
+        let p = v94_strip_head(&mut app, &ctx, 3);
+        rmb(&mut app, &ctx, p);
+        let item = galley_at_last(&mut app, &ctx, "REC group (selection)")
+            .expect("join entry in the shared head menu");
+        click_pt(&mut app, &ctx, item.center());
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.rec_group, vec![0, 1, 2], "three selected tracks joined in order");
+        // Ctrl-drop Track 1 from the selection, then leave from Track 2's
+        // menu: tracks 2+3 go, track 1 STAYS (not in the selection).
+        let p = v94_strip_head(&mut app, &ctx, 1);
+        v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
+        assert_eq!(app.track_sel, vec![1, 2], "track 1 deselected, still a member");
+        let p = v94_strip_head(&mut app, &ctx, 2);
+        rmb(&mut app, &ctx, p);
+        let item = galley_at_last(&mut app, &ctx, "Leave group")
+            .expect("leave entry in the shared head menu");
+        click_pt(&mut app, &ctx, item.center());
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.rec_group,
+            vec![0],
+            "only the SELECTED members leave — track 1 survives"
+        );
+        assert!(
+            app.status.contains("tracks 2, 3 leave")
+                && app.status.contains("1 track(s) selected"),
+            "plural leave echo names the leavers: {:?}",
+            app.status
+        );
+        // Leave the last member through a fresh selection + its own menu.
+        let p = v94_strip_head(&mut app, &ctx, 1);
+        click_pt(&mut app, &ctx, p);
+        assert_eq!(app.track_sel, vec![0], "plain click replaces selection");
+        rmb(&mut app, &ctx, p);
+        let item = galley_at_last(&mut app, &ctx, "Leave group")
+            .expect("leave entry on a fresh anchor");
+        click_pt(&mut app, &ctx, item.center());
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.rec_group.is_empty(), "membership fully dropped");
+        assert!(
+            app.status.contains("track 1 leaves"),
+            "singular leave echo: {:?}",
+            app.status
+        );
+        // Refusal: an open group menu with nothing selected that is a
+        // member echoes — membership stays empty, no silent no-op.
+        let p = v94_strip_head(&mut app, &ctx, 4);
+        rmb(&mut app, &ctx, p);
+        let item = galley_at_last(&mut app, &ctx, "Leave group")
+            .expect("leave entry for the refusal pass");
+        click_pt(&mut app, &ctx, item.center());
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.rec_group.is_empty(), "refusal touches nothing");
+        assert!(
+            app.status.contains("no selected track is in the group"),
+            "refusal echo: {:?}",
+            app.status
+        );
+    }
+
+    /// v171 AC2/AC5 source scan: the retired G affordance and every stale
+    /// copy referring to it are ABSENT from the production slice; the head
+    /// menu is the ONE caller of each direction, and both membership
+    /// buttons carry their own hover (goal 1, v86 adjacency class).
+    #[test]
+    fn v171_g_affordance_retired_source() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ui.rs"))
+            .expect("own source");
+        let prod = src.split("\nmod tests").next().expect("tests module boundary");
+        let count = |needle: &str| -> usize {
+            prod.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && t.contains(needle)
+                })
+                .count()
+        };
+        // Retired affordance + every stale copy string gone (comment lines
+        // are stripped — history comments MAY mention the old toggle).
+        assert_eq!(count(".checkbox(&mut grp"), 0, "the G checkbox is retired");
+        assert_eq!(count("leave with the strip's G checkbox"), 0);
+        assert_eq!(count("'grp' on their strips"), 0);
+        assert_eq!(
+            count("Record group: joined tracks arm and stop TOGETHER"),
+            0,
+            "the strip tooltip copy is retired with its widget"
+        );
+        // The head menu is the ONE caller of each direction.
+        assert_eq!(count(".rec_group_join(&"), 1, "single join caller");
+        assert_eq!(count(".rec_group_leave(&"), 1, "single leave caller");
+        // Goal 1: each membership button carries its own hover within the
+        // statement window.
+        let lines: Vec<&str> = prod.lines().collect();
+        for label in ["\"REC group (selection)\"", "\"Leave group\""] {
+            let at = lines
+                .iter()
+                .position(|l| l.contains(label))
+                .unwrap_or_else(|| panic!("{label} button missing from the prod slice"));
+            assert!(
+                lines[at..(at + 6).min(lines.len())]
+                    .iter()
+                    .any(|l| l.contains(".on_hover_text(")),
+                "{label} must carry its own hover text"
+            );
+        }
+    }
+
     /// AC2 (visual): every member paints its header selectable; the ACTIVE
     /// member additionally rides the kit accent on its label — color-only,
     /// so the strip-alignment pins cannot shift.
@@ -62007,8 +62218,10 @@ mod tests {
             6,
             "no new bypassing writes to App::selected"
         );
-        // Menu + checkbox share the ONE join seam.
-        assert_eq!(active(".rec_group_join(&"), 2);
+        // v171: the head menu is the ONE join caller (the strip "G"
+        // checkbox that shared the seam was retired — v171_* pins guard
+        // the absence + the new leave seam).
+        assert_eq!(active(".rec_group_join(&"), 1);
         // The join entry + the menu itself are the SHARED head menu.
         assert_eq!(active("track_head_menu(ui, app,"), 2);
         // Internal version rides the series (v91 single-home law; v108 MCP-02
