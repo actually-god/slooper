@@ -51441,8 +51441,12 @@ mod tests {
         let mut app = headless_app("v52rec1");
         let ctx = egui::Context::default();
         app.sample_rate = 48_000; // null audio never sends Evt::Ready
+        app.show_master = false; // v171: v94_strip_head band = master closed…
         clear_canvas(&mut app);
-        frame(&mut app, &ctx, vec![]);
+        for _ in 0..3 {
+            // …+ 3 settle frames before the strip-header read.
+            frame(&mut app, &ctx, vec![]);
+        }
         app.rec_src[0] = RecSrc {
             audio: false,
             preview: false,
@@ -51467,7 +51471,8 @@ mod tests {
             vec![0, 1],
             "track 1 (default) + ctrl-added track 2"
         );
-        rmb(&mut app, &ctx, v94_strip_head(&mut app, &ctx, 2));
+        let p = v94_strip_head(&mut app, &ctx, 2);
+        rmb(&mut app, &ctx, p);
         let item = galley_at_last(&mut app, &ctx, "REC group (selection)")
             .expect("join entry in the shared head menu");
         click_pt(&mut app, &ctx, item.center());
@@ -51500,14 +51505,18 @@ mod tests {
         let mut app = headless_app("v52reclink");
         let ctx = egui::Context::default();
         app.sample_rate = 48_000;
+        app.show_master = false; // v171: v94_strip_head band setup (see above)
         clear_canvas(&mut app);
-        frame(&mut app, &ctx, vec![]);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
         app.rec_src[0].loop_rec = true;
         // v171 retarget: join via selection + head menu (the strip "G"
         // checkbox is retired) — the inherit contract below is unchanged.
         let p = v94_strip_head(&mut app, &ctx, 2);
         v94_click_mod(&mut app, &ctx, p, v94_mods(true, false));
-        rmb(&mut app, &ctx, v94_strip_head(&mut app, &ctx, 2));
+        let p = v94_strip_head(&mut app, &ctx, 2);
+        rmb(&mut app, &ctx, p);
         let item = galley_at_last(&mut app, &ctx, "REC group (selection)")
             .expect("join entry in the shared head menu");
         click_pt(&mut app, &ctx, item.center());
