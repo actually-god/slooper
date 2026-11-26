@@ -65478,4 +65478,227 @@ mod tests {
             "the trail paint loop must not allocate per frame"
         );
     }
+
+    // ---- v170 (card t_3d0dfae8): child-track removal confirmation ----
+    //
+    // Full-stack pins drive the REAL mixer strip through frame(): the
+    // "−" button opens the standard modal; Cancel/Esc/checkbox/Remove,
+    // the empty-lane direct path and the persisted never-warn path all
+    // ride painted clicks. All click coords for the CENTER-anchored
+    // modal are read from the real 853-viewport (v50 trap (a): tall
+    // reads point clicks off-screen) and button hits match the galley
+    // text EXACTLY (a substring "-" would hit any hyphen in the tree).
+
+    /// Center of the LAST painted Text galley equal to `needle` exactly,
+    /// read from one extra 853-viewport frame (windows paint last, so a
+    /// modal's button beats any identically-labelled strip widget).
+    fn v170_click_target(app: &mut App, ctx: &egui::Context, needle: &str) -> egui::Pos2 {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let hit = out.shapes.iter().rev().find_map(|cs| {
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                if t.galley.text() == needle {
+                    let local = t.galley.rect;
+                    return Some(t.pos + (local.center() - local.min));
+                }
+            }
+            None
+        });
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hit.unwrap_or_else(|| panic!("v170: no painted galley exactly {needle:?}"))
+    }
+
+    /// True when some galley CONTAINS `needle` in the 853 viewport
+    /// (copy-presence asserts; the modal fits the viewport so tall reads
+    /// are not needed).
+    fn v170_text_painted(app: &mut App, ctx: &egui::Context, needle: &str) -> bool {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let hit = out.shapes.iter().any(|cs| {
+            matches!(&cs.shape, egui::epaint::Shape::Text(t) if t.galley.text().contains(needle))
+        });
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        hit
+    }
+
+    /// Track 0 gains a child lane holding ONE clip on a real rack asset.
+    fn v170_lane_with_clip(app: &mut App) {
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.add_lane(0);
+        app.arr.insert(0, 1, crate::arrange::Clip::new(a, 0));
+    }
+
+    #[test]
+    fn v170_lane_rm_modal_cancel_keeps_lane() {
+        // AC R1+R2: a NON-EMPTY child lane asks first; the modal states
+        // what is lost AND what survives; Cancel is the safe default.
+        let mut app = headless_app("v170cancel");
+        let ctx = egui::Context::default();
+        v170_lane_with_clip(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let minus = v170_click_target(&mut app, &ctx, "-");
+        click_pt(&mut app, &ctx, minus);
+        assert!(app.pending_confirm.is_some(), "non-empty child lane asks first");
+        assert_eq!(app.arr.tracks[0].lanes.len(), 2, "the lane waits while asked");
+        for needle in [
+            "Remove child track?",
+            "holds 1 clip",
+            "asset rack",
+            "Never warn again",
+            "Remove",
+            "Cancel",
+        ] {
+            assert!(
+                v170_text_painted(&mut app, &ctx, needle),
+                "the modal must paint {needle:?}"
+            );
+        }
+        let cancel = v170_click_target(&mut app, &ctx, "Cancel");
+        click_pt(&mut app, &ctx, cancel);
+        assert!(app.pending_confirm.is_none(), "Cancel closes the modal");
+        assert_eq!(app.arr.tracks[0].lanes.len(), 2, "Cancel keeps the lane");
+        assert!(!app.lane_rm_never_warn, "Cancel persists nothing");
+        assert!(app.status.contains("nothing was removed"), "cancel echoes into status");
+    }
+
+    #[test]
+    fn v170_lane_rm_esc_cancels() {
+        // AC R2: keyboard Esc = cancel, coordinate-free, same safety.
+        let mut app = headless_app("v170esc");
+        let ctx = egui::Context::default();
+        v170_lane_with_clip(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let minus = v170_click_target(&mut app, &ctx, "-");
+        click_pt(&mut app, &ctx, minus);
+        assert!(app.pending_confirm.is_some(), "modal opened");
+        frame(&mut app, &ctx, vec![key_ev(egui::Key::Escape, Default::default())]);
+        assert!(app.pending_confirm.is_none(), "Esc closes the modal");
+        assert_eq!(app.arr.tracks[0].lanes.len(), 2, "Esc keeps the lane");
+        assert!(!app.lane_rm_never_warn, "Esc persists nothing");
+    }
+
+    #[test]
+    fn v170_lane_rm_confirm_removes() {
+        // AC: Confirm (checkbox left OFF) removes the lane, keeps the
+        // asset, persists NOTHING extra, and echoes into the status line.
+        let mut app = headless_app("v170confirm");
+        let ctx = egui::Context::default();
+        v170_lane_with_clip(&mut app);
+        let assets_before = app.assets.len();
+        frame(&mut app, &ctx, vec![]);
+        let minus = v170_click_target(&mut app, &ctx, "-");
+        click_pt(&mut app, &ctx, minus);
+        let yes = v170_click_target(&mut app, &ctx, "Remove");
+        click_pt(&mut app, &ctx, yes);
+        assert_eq!(app.arr.tracks[0].lanes.len(), 1, "lane removed on confirm");
+        assert!(app.pending_confirm.is_none(), "modal resolved exactly once");
+        assert_eq!(app.assets.len(), assets_before, "the ASSET survives (rack keeps it)");
+        assert!(!app.lane_rm_never_warn, "unchecked box persists nothing");
+        assert!(app.status.contains("child lane removed"), "removal echoes into status");
+    }
+
+    #[test]
+    fn v170_lane_rm_never_warn_persists() {
+        // AC R3: checked + confirmed persists across restarts, and the
+        // NEXT non-empty removal goes direct without the popup.
+        let mut app = headless_app("v170never");
+        let ctx = egui::Context::default();
+        v170_lane_with_clip(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let minus = v170_click_target(&mut app, &ctx, "-");
+        click_pt(&mut app, &ctx, minus);
+        let box_pt = v170_click_target(&mut app, &ctx, "Never warn again");
+        click_pt(&mut app, &ctx, box_pt);
+        let yes = v170_click_target(&mut app, &ctx, "Remove");
+        click_pt(&mut app, &ctx, yes);
+        assert_eq!(app.arr.tracks[0].lanes.len(), 1, "lane removed");
+        assert!(app.lane_rm_never_warn, "checked+confirmed latches the flag");
+        assert!(app.status.contains("never warn again: ON"), "the latch echoes");
+        // Cross-restart proof: config.json (the sandbox pinned by
+        // headless_app) really carries the key on reload.
+        let cfg2 = crate::config::Config::load();
+        assert!(cfg2.lane_rm_never_warn, "the choice survives a restart");
+        // Next non-empty removal: direct, no modal.
+        v170_lane_with_clip(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let minus = v170_click_target(&mut app, &ctx, "-");
+        click_pt(&mut app, &ctx, minus);
+        assert!(app.pending_confirm.is_none(), "never-warn skips the popup");
+        assert_eq!(app.arr.tracks[0].lanes.len(), 1, "second removal went direct");
+    }
+
+    #[test]
+    fn v170_lane_rm_empty_direct() {
+        // AC R4: an EMPTY child lane never pops, flag or no flag.
+        let mut app = headless_app("v170empty");
+        let ctx = egui::Context::default();
+        app.arr.add_lane(0);
+        frame(&mut app, &ctx, vec![]);
+        let minus = v170_click_target(&mut app, &ctx, "-");
+        click_pt(&mut app, &ctx, minus);
+        assert!(app.pending_confirm.is_none(), "empty lane never asks");
+        assert_eq!(app.arr.tracks[0].lanes.len(), 1, "removed directly");
+    }
+
+    #[test]
+    fn v170_lane_rm_base_lane_guard() {
+        // The strip hides "−" at nl<=1 (no UI path) — the seam guard is
+        // unit-checked: a one-lane track ignores the request entirely.
+        let mut app = headless_app("v170base");
+        app.request_lane_removal(2);
+        assert_eq!(app.arr.tracks[2].lanes.len(), 1, "base lane is never removable");
+        assert!(app.pending_confirm.is_none(), "guard asks nothing");
+    }
+
+    #[test]
+    fn v170_confirm_seam_single_home() {
+        // Completeness audit (persona law #4): the v170 seam must not
+        // fork. Markers are concat-split so THIS pin never counts as a
+        // hit for its own needles (source-pin vacuity trap).
+        let src = include_str!("ui.rs");
+        let active = |marker: &str| -> usize {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("///") || t.starts_with("//!"))
+                })
+                .filter(|l| l.contains(marker))
+                .count()
+        };
+        // The ONLY live caller of `arr.remove_lane` is do_remove_lane.
+        assert_eq!(active(&concat!("self.a", "rr.remove_lane(")), 1, "remove_lane must live only in do_remove_lane");
+        // No ad-hoc arrange pokes via a App-binding (the pre-v170 shape).
+        assert_eq!(active(&concat!("app.arr.remove_l", "ane(")), 0, "no direct remove_lane outside the seam");
+        // kit::confirm renders from exactly ONE app site.
+        assert_eq!(active(&concat!("crate::kit::con", "firm(")), 1, "standard_confirm_window is the single render home");
+        // The strip "−" button routes through the gate seam.
+        let at = src
+            .find("Remove the last child lane")
+            .expect("strip minus-button hover marker vanished");
+        let win = &src[at..(at + 500).min(src.len())];
+        assert!(
+            win.lines()
+                .any(|l| l.trim_start().starts_with(&concat!("app.request_lane_remo", "val("))),
+            "the strip minus-button must live-call the gate seam"
+        );
+    }
 }

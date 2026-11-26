@@ -419,4 +419,113 @@ mod tests {
         assert!(v152_verdict(v152_click(near, egui::PointerButton::Primary), true, 4.0, true));
         assert!(!v152_verdict(v152_click(near, egui::PointerButton::Primary), true, 6.0, true));
     }
+
+    // ---- v170 (card t_3d0dfae8): the STANDARD confirm dialog ----
+    //
+    // Driven through a REAL egui Context like the v152 family: one frame
+    // per probe, FullOutput consumed, painted galleys read back. Button
+    // clicks (which need painted coordinates) are pinned end-to-end in
+    // ui::tests against the real mixer strip; here the coordinate-free
+    // contract — Escape, copy rendering, checkbox polarity — is frozen.
+
+    /// Host `confirm()` over three frames (warm-up + settle + read);
+    /// return (resolved?, painted galley strings of the LAST frame).
+    /// The multi-frame run is load-bearing twice: fonts install only on
+    /// the first `run` (0.36), and a Window spawned this frame paints its
+    /// CONTENT only from the NEXT frame (frame 0 shows zero window
+    /// galleys — the v82 settle family). Events feed the first real
+    /// frame; a verdict there (Escape) is still captured.
+    fn v170_probe(ask: &mut ConfirmAsk, events: Vec<egui::Event>) -> (bool, Vec<String>) {
+        let ctx = egui::Context::default();
+        // A RawInput WITHOUT screen_rect makes the viewport 0x0 and the
+        // whole Ui invisible — always feed a real screen_rect.
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 853.0));
+        let mut resolved = false;
+        let mut texts: Vec<String> = Vec::new();
+        for i in 0..3 {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                events: if i == 0 { events.clone() } else { vec![] },
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ctx| {
+                egui::Area::new(egui::Id::new("v170_host"))
+                    .fixed_pos(egui::pos2(4.0, 4.0))
+                    .show(ctx, |ui| match confirm(ui, ask) {
+                        Confirm::Yes | Confirm::No => resolved = true,
+                        Confirm::Open => {}
+                    });
+            });
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            out.textures_delta.clear();
+        }
+        (resolved, texts)
+    }
+
+    fn v170_ask(never_warn_label: Option<&'static str>) -> ConfirmAsk {
+        ConfirmAsk {
+            kind: "probe",
+            title: "Remove child track?",
+            body: "It holds 2 clips \u{2014} they are lost.".into(),
+            note: Some("The assets stay saved in the asset rack.".into()),
+            confirm_label: "Remove",
+            never_warn_label,
+            never_warn: false,
+        }
+    }
+
+    #[test]
+    fn v170_kit_confirm_esc_is_cancel() {
+        // AC R2: Escape anywhere resolves the modal as Cancel (safe
+        // default) — the verdict arrives in the SAME frame the key does.
+        let mut ask = v170_ask(Some("Never warn again"));
+        let (resolved, _) = v170_probe(
+            &mut ask,
+            vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(resolved, "Escape cancels the standard confirm");
+        assert!(!ask.never_warn, "cancelling never latches the checkbox");
+    }
+
+    #[test]
+    fn v170_kit_confirm_painted_contract() {
+        // AC R1/R5: every slot of the ask is painted — title (window
+        // chrome), body (what is lost), note (what survives), both button
+        // labels, and the checkbox ONLY when never_warn_label is Some.
+        let mut ask = v170_ask(Some("Never warn again"));
+        let (_, texts) = v170_probe(&mut ask, vec![]);
+        for needle in [
+            "Remove child track?",
+            "It holds 2 clips",
+            "asset rack",
+            "Remove",
+            "Cancel",
+            "Never warn again",
+        ] {
+            assert!(
+                texts.iter().any(|t| t.contains(needle)),
+                "standard confirm must paint {needle:?}, got {texts:?}"
+            );
+        }
+        // Negative polarity: no label => no checkbox galley.
+        let mut plain = v170_ask(None);
+        let (_, t2) = v170_probe(&mut plain, vec![]);
+        assert!(
+            !t2.iter().any(|t| t.contains("Never warn again")),
+            "checkbox must not paint without a label"
+        );
+    }
 }

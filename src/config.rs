@@ -2048,4 +2048,17 @@ mod tests {
             "pre-v164 file defaults to standard tuning"
         );
     }
+
+    #[test]
+    fn v170_cfg_lane_rm_never_warn_roundtrip() {
+        // AC R3 (config layer): serde-default = warn ON for old files;
+        // the latched choice round-trips through the real config schema.
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(!legacy.lane_rm_never_warn, "absence = warn (popup ON)");
+        let c = Config { lane_rm_never_warn: true, ..Config::default() };
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains("\"lane_rm_never_warn\":true"), "the key is written");
+        let back: Config = serde_json::from_str(&j).unwrap();
+        assert!(back.lane_rm_never_warn, "the choice survives save+reload");
+    }
 }
