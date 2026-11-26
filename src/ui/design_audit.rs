@@ -281,7 +281,7 @@ const COLOR_BASE: &[(&str, &str, usize)] = &[
     ("ui.rs", "2 => Color32::from_rgb(255, 120, 120),", 1), // rack kind data palette single home (v176)
     ("ui.rs", "3 => Color32::from_rgb(190, 150, 255),", 1), // rack kind data palette single home (v176)
     ("ui.rs", "Color32::from_gray(110)", 1), // drift filed to ts-026 follow-up (t_2076e182 audit)
-    ("ui.rs", "Color32::from_gray(110),", 3), // drift filed to ts-021 follow-up (t_2076e182 audit)
+    ("ui.rs", "Color32::from_gray(110),", 2), // drift filed to ts-021 follow-up (t_2076e182 audit); v175 adopted lane_row site to kit::MUTED
     ("ui.rs", "Color32::from_gray(120)", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_gray(120),", 2), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_gray(130),", 1), // drift filed to ts-024 follow-up (t_2076e182 audit)
@@ -304,12 +304,10 @@ const COLOR_BASE: &[(&str, &str, usize)] = &[
     ("ui.rs", "Color32::from_gray(95)", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(112, 122, 238),", 1), // track-hue data palette (kit.rs module doc)
     ("ui.rs", "Color32::from_rgb(120, 185, 255)", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
-    ("ui.rs", "Color32::from_rgb(120, 205, 255)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(136, 202, 96),", 1), // track-hue data palette (kit.rs module doc)
     ("ui.rs", "Color32::from_rgb(152, 162, 178),", 1), // track-hue data palette (kit.rs module doc)
     ("ui.rs", "Color32::from_rgb(170, 70, 74)", 1), // clip kind data color (clip_paint_color)
     ("ui.rs", "Color32::from_rgb(176, 112, 234),", 1), // track-hue data palette (kit.rs module doc)
-    ("ui.rs", "Color32::from_rgb(180, 235, 255)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(200, 200, 205)", 1), // drift filed to ts-026 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(210, 225, 250)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(220, 180, 120)", 2), // drift filed to ts-022 follow-up (t_2076e182 audit)
@@ -319,29 +317,21 @@ const COLOR_BASE: &[(&str, &str, usize)] = &[
     ("ui.rs", "Color32::from_rgb(228, 206, 84),", 1), // track-hue data palette (kit.rs module doc)
     ("ui.rs", "Color32::from_rgb(230, 104, 198),", 1), // track-hue data palette (kit.rs module doc)
     ("ui.rs", "Color32::from_rgb(230, 230, 170),", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
-    ("ui.rs", "Color32::from_rgb(235, 120, 120),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
-    ("ui.rs", "Color32::from_rgb(24, 24, 29)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(240, 156, 64),", 1), // track-hue data palette (kit.rs module doc)
-    ("ui.rs", "Color32::from_rgb(250, 200, 50)", 4), // drift filed to ts-021 follow-up (t_2076e182 audit)
-    ("ui.rs", "Color32::from_rgb(250, 200, 50),", 2), // drift filed to ts-021 follow-up (t_2076e182 audit)
-    ("ui.rs", "Color32::from_rgb(250, 200, 90),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
+    ("ui.rs", "Color32::from_rgb(250, 200, 50)", 3), // drift filed to ts-021 follow-up (t_2076e182 audit); v175 tokenized the corridor sites, remainder = roll_inner (ts-022)
+    ("ui.rs", "Color32::from_rgb(250, 200, 50),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit); remainder = roll_inner (ts-022)
     ("ui.rs", "Color32::from_rgb(255, 120, 120)", 1), // drift filed to ts-024 follow-up (t_2076e182 audit)
-    ("ui.rs", "Color32::from_rgb(255, 130, 130)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(255, 165, 160)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
-    ("ui.rs", "Color32::from_rgb(255, 190, 190)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(255, 200, 110)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(255, 210, 120)", 1), // drift filed to ts-024 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(255, 210, 120),", 1), // drift filed to ts-024 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(255, 210, 210),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(255, 220, 150),", 1), // drift filed to ts-024 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(255, 225, 130)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
-    ("ui.rs", "Color32::from_rgb(255, 235, 120)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(255, 90, 90)", 1), // drift filed to ts-026 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(28, 30, 38)", 1), // drift filed to ts-024 follow-up (t_2076e182 audit)
-    ("ui.rs", "Color32::from_rgb(34, 34, 40)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(40, 42, 54)", 1), // drift filed to ts-024 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(48, 52, 60),", 1), // drift filed to ts-026 follow-up (t_2076e182 audit)
-    ("ui.rs", "Color32::from_rgb(56, 56, 64)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(64, 196, 176),", 1), // track-hue data palette (kit.rs module doc)
     ("ui.rs", "Color32::from_rgb(70, 96, 128),", 1), // drift filed to ts-026 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(80, 150, 245)", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
@@ -349,23 +339,35 @@ const COLOR_BASE: &[(&str, &str, usize)] = &[
     ("ui.rs", "Color32::from_rgb(90, 160, 230)", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(90, 220, 170)", 2), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(96, 104, 132),", 2), // drift filed to v174/ts-022 filed (t_2076e182 audit)
-    ("ui.rs", "Color32::from_rgb(96, 96, 116)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgba_premultiplied(10, 10, 14, 160),", 2), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgba_premultiplied(90, 150, 230, 55),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgba_unmultiplied(196, 64, 64, 80),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "_ => Color32::from_rgb(210, 175, 120),", 1), // rack kind data palette single home (v176)
     ("ui.rs", "btn = btn.fill(Color32::from_rgb(60, 90, 120));", 2), // drift filed to v174/ts-022 filed (t_2076e182 audit)
+    ("ui.rs", "const COL_AUTO_CURVE: Color32 = Color32::from_rgb(255, 130, 130);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
+    ("ui.rs", "const COL_AUTO_CURVE_SEL: Color32 = Color32::from_rgb(255, 190, 190);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
     ("ui.rs", "const COL_BAR_LINE: Color32 = Color32::from_gray(135);", 1), // named palette home const (kit.rs module doc)
     ("ui.rs", "const COL_BEAT_LINE: Color32 = Color32::from_gray(78);", 1), // named palette home const (kit.rs module doc)
     ("ui.rs", "const COL_CLIP: Color32 = Color32::from_rgb(72, 118, 196);", 1), // named palette home const (kit.rs module doc)
+    ("ui.rs", "const COL_CLIP_NOTES: Color32 = Color32::from_rgb(120, 205, 255);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
+    ("ui.rs", "const COL_CLIP_NOTES_SEL: Color32 = Color32::from_rgb(180, 235, 255);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
     ("ui.rs", "const COL_CLIP_SEL: Color32 = Color32::from_rgb(128, 200, 255);", 1), // named palette home const (kit.rs module doc)
+    ("ui.rs", "const COL_DEL_HINT: Color32 = Color32::from_rgb(235, 120, 120);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
     ("ui.rs", "const COL_GHOST: Color32 = Color32::from_rgb(120, 160, 120);", 1), // named palette home const (kit.rs module doc)
+    ("ui.rs", "const COL_ORIG_LEN: Color32 = Color32::from_rgb(250, 200, 90);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
     ("ui.rs", "const COL_PLAYHEAD: Color32 = Color32::from_rgb(255, 95, 86);", 1), // named palette home const (kit.rs module doc)
+    ("ui.rs", "const COL_RESIZE_CAP: Color32 = Color32::from_rgb(250, 200, 50);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
+    ("ui.rs", "const COL_RESIZE_CAP_HELD: Color32 = Color32::from_rgb(255, 235, 120);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
+    ("ui.rs", "const COL_RULER_BG: Color32 = Color32::from_rgb(34, 34, 40);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
+    ("ui.rs", "const COL_SEP_BAR: Color32 = Color32::from_rgb(56, 56, 64);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
+    ("ui.rs", "const COL_SEP_BAR_HOT: Color32 = Color32::from_rgb(96, 96, 116);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
     ("ui.rs", "const COL_SE_BEND: egui::Color32 = egui::Color32::from_rgb(255, 200, 90);", 1), // named palette home const (kit.rs module doc)
     ("ui.rs", "const COL_SE_FI: egui::Color32 = egui::Color32::from_rgb(140, 230, 160);", 1), // named palette home const (kit.rs module doc)
     ("ui.rs", "const COL_SE_FO: egui::Color32 = egui::Color32::from_rgb(255, 150, 120);", 1), // named palette home const (kit.rs module doc)
     ("ui.rs", "const COL_SE_PITCH: egui::Color32 = egui::Color32::from_rgb(120, 255, 170);", 1), // named palette home const (kit.rs module doc)
     ("ui.rs", "const COL_SE_WAVE: egui::Color32 = egui::Color32::from_rgb(120, 205, 255);", 1), // named palette home const (kit.rs module doc)
+    ("ui.rs", "const COL_SKIP_FG: Color32 = Color32::from_rgb(205, 210, 226);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
+    ("ui.rs", "const COL_SKIP_FG_HOVER: Color32 = Color32::from_rgb(240, 244, 255);", 1), // arrangement data-palette single home (v175 ts-021; values pinned by v175_arrangement_tints_single_home)
     ("ui.rs", "const COL_SNAP_LINE: Color32 = Color32::from_gray(44);", 1), // named palette home const (kit.rs module doc)
     ("ui.rs", "egui::Color32::from_gray(105),", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Color32::from_gray(130)", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
@@ -377,10 +379,8 @@ const COLOR_BASE: &[(&str, &str, usize)] = &[
     ("ui.rs", "egui::Color32::from_rgb(110, 190, 120),", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Color32::from_rgb(160, 110, 200),", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Color32::from_rgb(200, 160, 90),", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
-    ("ui.rs", "egui::Color32::from_rgb(205, 210, 226)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Color32::from_rgb(220, 120, 90),", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Color32::from_rgb(24, 26, 32)", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
-    ("ui.rs", "egui::Color32::from_rgb(240, 244, 255)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Color32::from_rgb(255, 190, 60),", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Color32::from_rgb(28, 30, 38)", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Color32::from_rgb(46, 52, 72)", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
@@ -392,7 +392,6 @@ const COLOR_BASE: &[(&str, &str, usize)] = &[
     ("ui.rs", "egui::Stroke::new(1.0, Color32::from_gray(60)),", 1), // drift filed to ts-024 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.0, Color32::from_gray(70)),", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.0, Color32::from_gray(90)),", 2), // drift filed to ts-026 follow-up (t_2076e182 audit)
-    ("ui.rs", "egui::Stroke::new(1.0, Color32::from_rgb(250, 200, 90)),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.0, Color32::from_rgb(255, 150, 150)),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.0, Color32::from_rgb(255, 210, 120)),", 1), // drift filed to ts-024 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.0, egui::Color32::from_gray(120)),", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
@@ -403,7 +402,6 @@ const COLOR_BASE: &[(&str, &str, usize)] = &[
     ("ui.rs", "egui::Stroke::new(1.0f32, Color32::from_gray(10)),", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.2, Color32::from_gray(220)),", 1), // drift filed to ts-026 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.4f32, Color32::from_rgb(90, 220, 120)),", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
-    ("ui.rs", "egui::Stroke::new(1.5, Color32::from_rgb(255, 90, 90)),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.6, Color32::from_rgb(120, 190, 255)),", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.6, Color32::from_rgb(255, 120, 120)),", 1), // drift filed to ts-024 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.6f32, Color32::from_rgb(230, 180, 90)),", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
@@ -427,80 +425,70 @@ const COLOR_BASE: &[(&str, &str, usize)] = &[
 ];
 
 const GEOM_BASE: &[(&str, &str, usize)] = &[
-    ("assets.rs", "const MAX_DEPTH: usize = 4;", 1), // non-UI file assets.rs: ABI/plumbing const
-    ("audio/mod.rs", "const GAIN_MAX_LIN: f32 = 1.584_893_2;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
-    ("audio/mod.rs", "const MAX_AUD_VOICES: usize = 12;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
-    ("audio/mod.rs", "const MIDI_QUIET_BLOCKS: u32 = 6;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
-    ("audio/mod.rs", "const MIDI_SILENCE_FLOOR: f32 = 1e-4;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
-    ("audio/mod.rs", "pub const GAIN_MAX_DB: f32 = 12.0;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
-    ("audio/mod.rs", "pub const LOOP_CAP: u32 = 2_880_000;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
-    ("audio/mod.rs", "pub const MAX_LOOPS: usize = 128;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
-    ("audio/mod.rs", "pub const MAX_SLOTS: usize = 16;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
-    ("audio/rt_recovery.rs", "pub const FAULT_DEVICE: u32 = 2;", 1), // non-UI file audio/rt_recovery.rs: ABI/plumbing const
-    ("audio/rt_recovery.rs", "pub const FAULT_NONE: u32 = 0;", 1), // non-UI file audio/rt_recovery.rs: ABI/plumbing const
-    ("audio/rt_recovery.rs", "pub const FAULT_STREAM: u32 = 1;", 1), // non-UI file audio/rt_recovery.rs: ABI/plumbing const
-    ("audio/rt_recovery.rs", "pub const JACK_REBUILD_BUDGET: u32 = 3;", 1), // non-UI file audio/rt_recovery.rs: ABI/plumbing const
-    ("audio/rt_recovery.rs", "pub const RETRY_BUDGET: u32 = 2;", 1), // non-UI file audio/rt_recovery.rs: ABI/plumbing const
+    ("ui.rs", "const BEND_LANE_H: f32 = 46.0;", 1), // lane geometry home (filed to ts-022 follow-up)
+    ("ui.rs", "const BOT_DB: f32 = -60.0;", 1), // lane geometry home (filed to v174/ts-022 filed)
+    ("midiin.rs", "const CAP: usize = 1024;", 1), // non-UI file midiin.rs: ABI/plumbing const
+    ("vstedit/win32.rs", "const CLR_INVALID: u32 = 0xFFFF_FFFF;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
+    ("vstedit/win32.rs", "const CONTAINER_BG: u32 = 0x00B4_162A;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
+    ("vsthost.rs", "const CREATE_NO_WINDOW: u32 = 0x0800_0000;", 1), // non-UI file vsthost.rs: ABI/plumbing const
+    ("vstedit/win32.rs", "const DEAD_TICKS_PATIENCE: u32 = 8;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const DEAD_TICKS_PATIENCE: u32 = 8;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
     ("claphost.rs", "const DISCOVERY_MAX_FILES: usize = 512;", 1), // non-UI file claphost.rs: ABI/plumbing const
     ("claphost.rs", "const DISCOVERY_MAX_PRESETS: usize = 1024;", 1), // non-UI file claphost.rs: ABI/plumbing const
     ("claphost.rs", "const DISCOVERY_MAX_PROVIDERS: u32 = 8;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "const EV_POOL_CAP: usize = 2 * 1024;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "const OUT_RING: usize = 256;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "const RING_CAP: usize = 64 * 1024;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_LOG_DEBUG: u32 = 0;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_LOG_ERROR: u32 = 3;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_LOG_FATAL: u32 = 4;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_LOG_HOST_MISBEHAVING: u32 = 5;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_LOG_INFO: u32 = 1;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_LOG_PLUGIN_MISBEHAVING: u32 = 6;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_LOG_WARNING: u32 = 2;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_NAME_SIZE: usize = 256;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_PARAM_IS_ENUM: u32 = 1 << 4;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_PARAM_IS_HIDDEN: u32 = 1 << 2;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_PARAM_IS_READONLY: u32 = 1 << 3;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_PATH_SIZE: usize = 1024;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT: u32 = 1 << 0;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const CLAP_PROCESS_ERROR: i32 = 0;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("claphost.rs", "pub const EVENT_SLOT: usize = 64;", 1), // non-UI file claphost.rs: ABI/plumbing const
-    ("crash.rs", "pub const CRASH_KEEP: usize = 10;", 1), // non-UI file crash.rs: ABI/plumbing const
-    ("fx.rs", "pub const MAX_FX_PER_TRACK: usize = 8;", 1), // non-UI file fx.rs: ABI/plumbing const
-    ("lib.rs", "const SIGTRAP: i32 = 5;", 1), // non-UI file lib.rs: ABI/plumbing const
-    ("mcp/http.rs", "pub const MAX_BODY: usize = 1_000_000;", 1), // non-UI file mcp/http.rs: ABI/plumbing const
-    ("meter.rs", "const LUFS_OFFSET: f64 = -0.691;", 1), // non-UI file meter.rs: ABI/plumbing const
-    ("meter.rs", "pub const DISPLAY_POINTS: usize = 1024;", 1), // non-UI file meter.rs: ABI/plumbing const
-    ("meter.rs", "pub const FFT_WINDOW: usize = 16384;", 1), // non-UI file meter.rs: ABI/plumbing const
-    ("meter.rs", "pub const SPEC_F_MAX: f32 = 20_000.0;", 1), // non-UI file meter.rs: ABI/plumbing const
-    ("meter.rs", "pub const SPEC_F_MIN: f32 = 30.0;", 1), // non-UI file meter.rs: ABI/plumbing const
-    ("midiin.rs", "const CAP: usize = 1024;", 1), // non-UI file midiin.rs: ABI/plumbing const
-    ("midiin.rs", "pub const STALL_SKIP: u32 = 256;", 1), // non-UI file midiin.rs: ABI/plumbing const
-    ("midipat.rs", "pub const BEND_FULL_ST: f32 = 12.0;", 1), // non-UI file midipat.rs: ABI/plumbing const
-    ("midipat.rs", "pub const NB_MAX_CENTS: f32 = 2400.0;", 1), // non-UI file midipat.rs: ABI/plumbing const
-    ("midipat.rs", "pub const NB_MAX_PTS: usize = 16;", 1), // non-UI file midipat.rs: ABI/plumbing const
-    ("presetbar.rs", "pub const LABEL_COL: f32 = 72.0;", 1), // non-UI file presetbar.rs: ABI/plumbing const
-    ("project.rs", "pub const VERSION: u32 = 3;", 1), // non-UI file project.rs: ABI/plumbing const
-    ("quantize.rs", "pub const TRIM_FLOOR_DB: f32 = -60.0;", 1), // non-UI file quantize.rs: ABI/plumbing const
-    ("synth.rs", "pub const MAP_EXISTS: u32 = 0x8000_0000;", 1), // non-UI file synth.rs: ABI/plumbing const
-    ("synth.rs", "pub const MAX_MAP_SLOTS: usize = 64;", 1), // non-UI file synth.rs: ABI/plumbing const
-    ("tune.rs", "pub const EDO_DEFAULT_N: u32 = 12;", 1), // non-UI file tune.rs: ABI/plumbing const
-    ("tune.rs", "pub const EDO_MAX: u32 = 128;", 1), // non-UI file tune.rs: ABI/plumbing const
-    ("tune.rs", "pub const EDO_MIN: u32 = 1;", 1), // non-UI file tune.rs: ABI/plumbing const
-    ("ui.rs", "const BEND_LANE_H: f32 = 46.0;", 1), // lane geometry home (filed to ts-022 follow-up)
-    ("ui.rs", "const BOT_DB: f32 = -60.0;", 1), // lane geometry home (filed to v174/ts-022 filed)
     ("ui.rs", "const DRUM_MAX_PADS: usize = 16;", 1), // geometry single-home declaration
-    ("ui.rs", "const EDGE_PX: f32 = 6.0;", 1), // lane geometry home (filed to ts-022 follow-up)
-    ("ui.rs", "const EDGE_PX: f32 = 7.0;", 1), // lane geometry home (filed to ts-021 follow-up)
+    ("vstedit/win32.rs", "const EFF_EDIT_CAN_SIZE: i32 = 79;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EFF_EDIT_CAN_SIZE: i32 = 79;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/win32.rs", "const EFF_EDIT_CLOSE: i32 = 15;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EFF_EDIT_CLOSE: i32 = 15;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/win32.rs", "const EFF_EDIT_GET_RECT: i32 = 13;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EFF_EDIT_GET_RECT: i32 = 13;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/win32.rs", "const EFF_EDIT_IDLE: i32 = 19;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EFF_EDIT_IDLE: i32 = 19;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/win32.rs", "const EFF_EDIT_OPEN: i32 = 14;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EFF_EDIT_OPEN: i32 = 14;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EFF_EDIT_SIZE: i32 = 78;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/win32.rs", "const EFF_EDIT_SIZE: i32 = 80;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EVENT_CLIENT_MESSAGE: i32 = 33;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EVENT_CONFIGURE_NOTIFY: i32 = 22;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EVENT_DESTROY_NOTIFY: i32 = 17;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EVENT_EXPOSE: i32 = 12;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EVENT_FOCUS_IN: i32 = 9;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EVENT_FOCUS_OUT: i32 = 10;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EVENT_KEY_PRESS: i32 = 2;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EVENT_KEY_RELEASE: i32 = 3;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const EVENT_REPARENT_NOTIFY: i32 = 21;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
+    ("claphost.rs", "const EV_POOL_CAP: usize = 2 * 1024;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("audio/mod.rs", "const GAIN_MAX_LIN: f32 = 1.584_893_2;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
+    ("ui.rs", "const GRAB_EDGE_LANE: f32 = 7.0;", 1), // grab-edge tolerance single home (v175 ts-021; lane-vs-note divergence deliberate, documented at the declaration)
+    ("ui.rs", "const GRAB_EDGE_NOTE: f32 = 6.0;", 1), // grab-edge tolerance single home (v175 ts-021; aliased as EDGE_PX at roll_inner)
     ("ui.rs", "const HDR_W: f32 = 190.0;", 1), // lane geometry home (filed to ts-023 follow-up)
+    ("vstedit/win32.rs", "const IDM_CLOSE: usize = 0x5102;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
+    ("vstedit/win32.rs", "const IDM_REDOCK: usize = 0x5101;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
+    ("vstedit/x11.rs", "const IS_VIEWABLE: i32 = 2;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
     ("ui.rs", "const KEYS_W: f32 = 58.0;", 1), // lane geometry home (filed to ts-022 follow-up)
     ("ui.rs", "const KEY_H: f32 = 22.0;", 1), // lane geometry home (filed to ts-023 follow-up)
     ("ui.rs", "const LANE_H: f32 = 24.0;", 1), // lane geometry home (filed to ts-023 follow-up)
     ("ui.rs", "const LANE_H: f32 = 48.0;", 1), // lane geometry home (filed to ts-021 follow-up)
     ("ui.rs", "const LANE_MIN_H: f32 = 36.0;", 1), // lane geometry home (filed to ts-021 follow-up)
+    ("meter.rs", "const LUFS_OFFSET: f64 = -0.691;", 1), // non-UI file meter.rs: ABI/plumbing const
+    ("audio/mod.rs", "const MAX_AUD_VOICES: usize = 12;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
+    ("assets.rs", "const MAX_DEPTH: usize = 4;", 1), // non-UI file assets.rs: ABI/plumbing const
+    ("audio/mod.rs", "const MIDI_QUIET_BLOCKS: u32 = 6;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
+    ("audio/mod.rs", "const MIDI_SILENCE_FLOOR: f32 = 1e-4;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
+    ("ui/mcp_windows.rs", "const MIN_H: f32 = 80.0;", 1), // non-UI file ui/mcp_windows.rs: ABI/plumbing const
     ("ui.rs", "const MIN_SHARE: f32 = 56.0;", 2), // geometry single-home declaration
+    ("ui/mcp_windows.rs", "const MIN_VIS: f32 = 60.0;", 1), // non-UI file ui/mcp_windows.rs: ABI/plumbing const
+    ("ui/mcp_windows.rs", "const MIN_W: f32 = 120.0;", 1), // non-UI file ui/mcp_windows.rs: ABI/plumbing const
     ("ui.rs", "const MIX_COL_GAP: f32 = 8.0;", 1), // geometry single-home declaration
     ("ui.rs", "const MIX_COL_W: f32 = 130.0;", 1), // geometry single-home declaration
     ("ui.rs", "const NOTICE_FADE_SECS: f64 = 12.0;", 1), // lane geometry home (filed to ts-026 follow-up)
+    ("claphost.rs", "const OUT_RING: usize = 256;", 1), // non-UI file claphost.rs: ABI/plumbing const
     ("ui.rs", "const PAN_WHEEL_LINE: f32 = 80.0;", 1), // lane geometry home (filed to ts-021 follow-up)
+    ("vsthost.rs", "const RING_CAP: usize = 1 << 16;", 1), // non-UI file vsthost.rs: ABI/plumbing const
+    ("claphost.rs", "const RING_CAP: usize = 64 * 1024;", 1), // non-UI file claphost.rs: ABI/plumbing const
     ("ui.rs", "const RULER_HANDLE_HIT: f32 = 8.0;", 1), // lane geometry home (filed to ts-021 follow-up)
+    ("lib.rs", "const SIGTRAP: i32 = 5;", 1), // non-UI file lib.rs: ABI/plumbing const
     ("ui.rs", "const SMAP_BW: f32 = 14.0;", 1), // geometry single-home declaration
     ("ui.rs", "const SMAP_NW: usize = 128;", 1), // geometry single-home declaration
     ("ui.rs", "const SMAP_ROLL_W: f32 = 75.0 * SMAP_WW;", 1), // lane geometry home (filed to ts-023 follow-up)
@@ -522,41 +510,51 @@ const GEOM_BASE: &[(&str, &str, usize)] = &[
     ("ui.rs", "const ZOOM_MIN: f32 = 3.0;", 1), // lane geometry home (filed to ts-021 follow-up)
     ("ui.rs", "const ZOOM_WHEEL_LINE: f32 = 0.12;", 1), // lane geometry home (filed to ts-021 follow-up)
     ("ui.rs", "const ZOOM_WHEEL_PX: f32 = 0.01;", 1), // lane geometry home (filed to ts-021 follow-up)
-    ("ui/mcp_windows.rs", "const MIN_H: f32 = 80.0;", 1), // non-UI file ui/mcp_windows.rs: ABI/plumbing const
-    ("ui/mcp_windows.rs", "const MIN_VIS: f32 = 60.0;", 1), // non-UI file ui/mcp_windows.rs: ABI/plumbing const
-    ("ui/mcp_windows.rs", "const MIN_W: f32 = 120.0;", 1), // non-UI file ui/mcp_windows.rs: ABI/plumbing const
-    ("vstedit/win32.rs", "const CLR_INVALID: u32 = 0xFFFF_FFFF;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
-    ("vstedit/win32.rs", "const CONTAINER_BG: u32 = 0x00B4_162A;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
-    ("vstedit/win32.rs", "const DEAD_TICKS_PATIENCE: u32 = 8;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
-    ("vstedit/win32.rs", "const EFF_EDIT_CAN_SIZE: i32 = 79;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
-    ("vstedit/win32.rs", "const EFF_EDIT_CLOSE: i32 = 15;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
-    ("vstedit/win32.rs", "const EFF_EDIT_GET_RECT: i32 = 13;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
-    ("vstedit/win32.rs", "const EFF_EDIT_IDLE: i32 = 19;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
-    ("vstedit/win32.rs", "const EFF_EDIT_OPEN: i32 = 14;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
-    ("vstedit/win32.rs", "const EFF_EDIT_SIZE: i32 = 80;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
-    ("vstedit/win32.rs", "const IDM_CLOSE: usize = 0x5102;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
-    ("vstedit/win32.rs", "const IDM_REDOCK: usize = 0x5101;", 1), // non-UI file vstedit/win32.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const DEAD_TICKS_PATIENCE: u32 = 8;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EFF_EDIT_CAN_SIZE: i32 = 79;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EFF_EDIT_CLOSE: i32 = 15;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EFF_EDIT_GET_RECT: i32 = 13;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EFF_EDIT_IDLE: i32 = 19;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EFF_EDIT_OPEN: i32 = 14;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EFF_EDIT_SIZE: i32 = 78;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EVENT_CLIENT_MESSAGE: i32 = 33;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EVENT_CONFIGURE_NOTIFY: i32 = 22;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EVENT_DESTROY_NOTIFY: i32 = 17;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EVENT_EXPOSE: i32 = 12;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EVENT_FOCUS_IN: i32 = 9;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EVENT_FOCUS_OUT: i32 = 10;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EVENT_KEY_PRESS: i32 = 2;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EVENT_KEY_RELEASE: i32 = 3;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const EVENT_REPARENT_NOTIFY: i32 = 21;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vstedit/x11.rs", "const IS_VIEWABLE: i32 = 2;", 1), // non-UI file vstedit/x11.rs: ABI/plumbing const
-    ("vsthost.rs", "const CREATE_NO_WINDOW: u32 = 0x0800_0000;", 1), // non-UI file vsthost.rs: ABI/plumbing const
-    ("vsthost.rs", "const RING_CAP: usize = 1 << 16;", 1), // non-UI file vsthost.rs: ABI/plumbing const
+    ("midipat.rs", "pub const BEND_FULL_ST: f32 = 12.0;", 1), // non-UI file midipat.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_LOG_DEBUG: u32 = 0;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_LOG_ERROR: u32 = 3;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_LOG_FATAL: u32 = 4;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_LOG_HOST_MISBEHAVING: u32 = 5;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_LOG_INFO: u32 = 1;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_LOG_PLUGIN_MISBEHAVING: u32 = 6;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_LOG_WARNING: u32 = 2;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_NAME_SIZE: usize = 256;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_PARAM_IS_ENUM: u32 = 1 << 4;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_PARAM_IS_HIDDEN: u32 = 1 << 2;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_PARAM_IS_READONLY: u32 = 1 << 3;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_PATH_SIZE: usize = 1024;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_PRESET_DISCOVERY_IS_FACTORY_CONTENT: u32 = 1 << 0;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("claphost.rs", "pub const CLAP_PROCESS_ERROR: i32 = 0;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("crash.rs", "pub const CRASH_KEEP: usize = 10;", 1), // non-UI file crash.rs: ABI/plumbing const
+    ("meter.rs", "pub const DISPLAY_POINTS: usize = 1024;", 1), // non-UI file meter.rs: ABI/plumbing const
+    ("tune.rs", "pub const EDO_DEFAULT_N: u32 = 12;", 1), // non-UI file tune.rs: ABI/plumbing const
+    ("tune.rs", "pub const EDO_MAX: u32 = 128;", 1), // non-UI file tune.rs: ABI/plumbing const
+    ("tune.rs", "pub const EDO_MIN: u32 = 1;", 1), // non-UI file tune.rs: ABI/plumbing const
+    ("claphost.rs", "pub const EVENT_SLOT: usize = 64;", 1), // non-UI file claphost.rs: ABI/plumbing const
+    ("audio/rt_recovery.rs", "pub const FAULT_DEVICE: u32 = 2;", 1), // non-UI file audio/rt_recovery.rs: ABI/plumbing const
+    ("audio/rt_recovery.rs", "pub const FAULT_NONE: u32 = 0;", 1), // non-UI file audio/rt_recovery.rs: ABI/plumbing const
+    ("audio/rt_recovery.rs", "pub const FAULT_STREAM: u32 = 1;", 1), // non-UI file audio/rt_recovery.rs: ABI/plumbing const
+    ("meter.rs", "pub const FFT_WINDOW: usize = 16384;", 1), // non-UI file meter.rs: ABI/plumbing const
+    ("audio/mod.rs", "pub const GAIN_MAX_DB: f32 = 12.0;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
+    ("audio/rt_recovery.rs", "pub const JACK_REBUILD_BUDGET: u32 = 3;", 1), // non-UI file audio/rt_recovery.rs: ABI/plumbing const
+    ("presetbar.rs", "pub const LABEL_COL: f32 = 72.0;", 1), // non-UI file presetbar.rs: ABI/plumbing const
+    ("audio/mod.rs", "pub const LOOP_CAP: u32 = 2_880_000;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
+    ("synth.rs", "pub const MAP_EXISTS: u32 = 0x8000_0000;", 1), // non-UI file synth.rs: ABI/plumbing const
+    ("mcp/http.rs", "pub const MAX_BODY: usize = 1_000_000;", 1), // non-UI file mcp/http.rs: ABI/plumbing const
+    ("fx.rs", "pub const MAX_FX_PER_TRACK: usize = 8;", 1), // non-UI file fx.rs: ABI/plumbing const
+    ("audio/mod.rs", "pub const MAX_LOOPS: usize = 128;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
+    ("synth.rs", "pub const MAX_MAP_SLOTS: usize = 64;", 1), // non-UI file synth.rs: ABI/plumbing const
+    ("audio/mod.rs", "pub const MAX_SLOTS: usize = 16;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
+    ("midipat.rs", "pub const NB_MAX_CENTS: f32 = 2400.0;", 1), // non-UI file midipat.rs: ABI/plumbing const
+    ("midipat.rs", "pub const NB_MAX_PTS: usize = 16;", 1), // non-UI file midipat.rs: ABI/plumbing const
     ("vsthost.rs", "pub const PRESET_KIND_FILE: u32 = 0;", 1), // non-UI file vsthost.rs: ABI/plumbing const
     ("vsthost.rs", "pub const PRESET_KIND_PLUGIN: u32 = 1;", 1), // non-UI file vsthost.rs: ABI/plumbing const
+    ("audio/rt_recovery.rs", "pub const RETRY_BUDGET: u32 = 2;", 1), // non-UI file audio/rt_recovery.rs: ABI/plumbing const
+    ("meter.rs", "pub const SPEC_F_MAX: f32 = 20_000.0;", 1), // non-UI file meter.rs: ABI/plumbing const
+    ("meter.rs", "pub const SPEC_F_MIN: f32 = 30.0;", 1), // non-UI file meter.rs: ABI/plumbing const
+    ("midiin.rs", "pub const STALL_SKIP: u32 = 256;", 1), // non-UI file midiin.rs: ABI/plumbing const
+    ("quantize.rs", "pub const TRIM_FLOOR_DB: f32 = -60.0;", 1), // non-UI file quantize.rs: ABI/plumbing const
+    ("project.rs", "pub const VERSION: u32 = 3;", 1), // non-UI file project.rs: ABI/plumbing const
     ("vsthost.rs", "pub const VST_BLOCK: usize = 512;", 1), // non-UI file vsthost.rs: ABI/plumbing const
     ("vsthost.rs", "pub const VST_MAX_PARAMS: usize = 8192;", 1), // non-UI file vsthost.rs: ABI/plumbing const
     ("vsthost.rs", "pub(crate) const MIDI_QUEUE_CAP: usize = 8192;", 1), // non-UI file vsthost.rs: ABI/plumbing const
