@@ -2703,6 +2703,14 @@ impl Drop for Engine {
         for p in self.rec_bufs.iter() {
             unsafe { dealloc(*p as *mut u8, layout) };
         }
+        // v172: the fan buffers are allocated lazily — free only what
+        // `ensure_dev_bufs` ever published (dealloc of null is UB).
+        for p in self.dev_bufs.iter() {
+            let p = p.load(Ordering::Relaxed);
+            if !p.is_null() {
+                unsafe { dealloc(p as *mut u8, layout) };
+            }
+        }
     }
 }
 

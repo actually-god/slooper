@@ -458,6 +458,20 @@ JACK for app startup (`SLOOPER_NULL_AUDIO=1` in `test_app`).
   self-disarm — never re-arms; `v42_preview_take_arming_snapshots_and_clears`),
   while a loop take RE-ARMS every pass
   (`v42_loop_take_flags_survive_pass_restarts`).
+- Per-device fan-out (v172): a PLAIN audio take records ONE clip per
+  ticked INPUTS slot. RT captures each connected slot into
+  `dev_bufs[slot]` under one shared cursor (`dev_len`; run set snapshotted
+  into `fan_mask` at record start — selection is locked for the run),
+  each take remembering `fan_start[t]` (+ latency skip); plain takes skip
+  the summed `rec_sample` capture. Buffers are published manager-side
+  (`ensure_dev_bufs` before arm — never allocate in RT).
+  `ship_take` fans one `Evt::Take { device: Some(port-name) }` per slot
+  (`input_names()` on `ManagerBackend`), zero slots = one silent clip
+  (slot 0 rides the summed dry). `take_pipeline` names the asset
+  `[project]-[device]-Track N` (`take_asset_name`, every component
+  sanitized, empty parts skipped) with the folder's `-2` unique suffix.
+  PREVIEW and LOOP takes keep the summed per-track path untouched. The
+  live ghost (v169) streams the primary (lowest) slot for fan takes.
 - Selective project import (v42): `do_load` = full import; the picker
   parks the parsed file in `pending_proj` and `load_opts_window` picks
   the slices (`LoadSel`: instruments / synth_setup / bindings / mixer /
