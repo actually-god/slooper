@@ -544,7 +544,7 @@ mod tests {
         assert!(label_pitch(12, 60, 60, 1200.0).anchor);
         assert_eq!(label_pitch(12, 60, 60, 2400.0).text, "C6");
         assert_eq!(label_pitch(12, 60, 60, -2400.0).text, "C2");
-        assert_eq!(label_pitch(12, 60, 60, 300.0).text, "F4");
+        assert_eq!(label_pitch(12, 60, 60, 300.0).text, "D#4", "the name table spells 63 D#");
         assert_eq!(label_pitch(12, 60, 60, 1235.0).text, "C5+35c");
         assert!(!label_pitch(12, 60, 60, 1235.0).anchor);
         assert_eq!(label_pitch(12, 60, 60, -50.0).text, "B3+50c", "tie → LOWER row");

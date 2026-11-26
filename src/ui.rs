@@ -12926,29 +12926,28 @@ impl App {
         // resize handles, same language as the loop-area handles)
         const EDGE_PX: f32 = 6.0;
         // v105 (pb-3, spec docs/SAMPLER-PITCH.md § 4 VISUAL): per-note
-        // pitch-curve trail geometry. The trail box rides the note's ROW:
-        // ±trail_half px around the row center; ±1200 ¢ fills it, and a
-        // bigger curve auto-scales (rounded up to 600 ¢ steps, cap ±2400)
-        // so everything drawn stays visible. Drawing sensitivity follows
-        // the same map — the stroke under the pointer IS the painted curve.
+        // pitch-curve trail geometry. The trail rides the note's ROW:
+        // ±trail_half px around the row center = ±1200 ¢.
+        // v168 (pbc-2-gui): the 600¢-step compressing auto-scale is
+        // RETIRED — px-per-cent is CONSTANT (1200 ¢ = trail_half =
+        // max(2·row_h,24) px, v105-identical for any curve within ±1200 ¢)
+        // and beyond that the trail EXTENDS with the curve: a ±2400 ¢ swing
+        // paints ±2·trail_half and drags with the same sensitivity, up to
+        // the model cap NB_MAX_CENTS. Unlimited range, constant aiming
+        // precision, and "zoom rows" (Alt+wheel) doubles as the curve-zoom
+        // knob (row_h grows → trail_half grows → cents-per-pixel shrink).
         let trail_half = (2.0 * roll.row_h).max(24.0);
+        let px_per_cent = trail_half / 1200.0;
         let nb_of = |n: &crate::midipat::Note| -> Option<&crate::midipat::NoteBend> {
             n.bend
                 .and_then(|i| roll.pat.note_bends.get(i as usize))
                 .filter(|nb| nb.active())
         };
-        let nb_disp = |pts: &[(f32, f32)]| -> f32 {
-            let mx = pts.iter().fold(0f32, |a, p| a.max(p.1.abs()));
-            if mx <= 1200.0 {
-                1200.0
-            } else {
-                (mx.ceil() / 600.0 * 600.0).min(2400.0)
-            }
-        };
         let row_c = |n: i32| y_of(n) + roll.row_h * 0.5;
-        let y_of_c = |n: i32, disp: f32, c: f32| row_c(n) - c / disp * trail_half;
-        let c_at_y = |n: i32, disp: f32, y: f32| {
-            ((row_c(n) - y) / trail_half * disp).clamp(-2400.0, 2400.0)
+        let y_of_c = |n: i32, c: f32| row_c(n) - c * px_per_cent;
+        let c_at_y = |n: i32, y: f32| {
+            ((row_c(n) - y) / px_per_cent)
+                .clamp(-crate::midipat::NB_MAX_CENTS, crate::midipat::NB_MAX_CENTS)
         };
         let hover = ui.input(|i| i.pointer.hover_pos());
         for (idx, note) in roll.pat.notes.iter().enumerate() {
@@ -12999,7 +12998,6 @@ impl App {
             // endpoint-drag targets).
             if let Some(nb) = nb_of(note) {
                 let dur = dur.max(1e-6);
-                let disp = nb_disp(&nb.pts);
                 let tcol = if is_sel {
                     Color32::from_rgb(250, 200, 50)
                 } else {
@@ -13009,7 +13007,7 @@ impl App {
                 let mut tx = x0.max(grid_x0);
                 while tx <= x1 {
                     let t = ((sec_at(tx) - s0) / dur).clamp(0.0, 1.0);
-                    let q = egui::pos2(tx, y_of_c(n, disp, nb.cents_at(t as f32)));
+                    let q = egui::pos2(tx, y_of_c(n, nb.cents_at(t as f32)));
                     if let Some(p) = prev {
                         painter.line_segment([p, q], egui::Stroke::new(1.6f32, tcol));
                     }
@@ -13021,7 +13019,7 @@ impl App {
                         let endp = k == 0 || k + 1 == nb.pts.len();
                         let q = egui::pos2(
                             x_of(s0 + *pt_t as f64 * dur),
-                            y_of_c(n, disp, *pt_c),
+                            y_of_c(n, *pt_c),
                         );
                         painter.circle_filled(q, if endp { 4.0 } else { 3.0 }, tcol);
                     }
@@ -13031,12 +13029,11 @@ impl App {
             if matches!(roll.gesture, RollGesture::NbDraw { idx: d } if d == idx)
                 && roll.nb_live.len() >= 2
             {
-                let disp = nb_disp(&roll.nb_live);
                 let mut prev: Option<egui::Pos2> = None;
                 for (pt_t, pt_c) in roll.nb_live.iter() {
                     let q = egui::pos2(
                         x_of(s0 + *pt_t as f64 * dur),
-                        y_of_c(n, disp, *pt_c),
+                        y_of_c(n, *pt_c),
                     );
                     if let Some(p) = prev {
                         painter.line_segment(
@@ -13294,11 +13291,10 @@ impl App {
                 if pt.x < x0 - 8.0 || pt.x > x1 + 8.0 {
                     continue;
                 }
-                let disp = nb_disp(&nb.pts);
                 for (pi, (pt_t, pt_c)) in nb.pts.iter().enumerate() {
                     let q = egui::pos2(
                         x_of(s0 + *pt_t as f64 * dur),
-                        y_of_c(n.note as i32, disp, *pt_c),
+                        y_of_c(n.note as i32, *pt_c),
                     );
                     if (pt - q).length() <= 8.0 {
                         return Some((ni, pi));
@@ -13343,18 +13339,49 @@ impl App {
                     // v105: the readout says whether THIS note has a curve
                     // and what the next gesture would be (discoverability).
                     let curve = nb_of(n).is_some();
+                    // v168 (pbc-2): hovering a curve DOT reads out that
+                    // point's live pitch — the EDO-aware label on the
+                    // canvas, same status-echo channel (v71/v72 law).
+                    let mut dot_txt = String::new();
+                    if curve {
+                        if let (Some(ci), Some((_, pi))) = (
+                            n.bend,
+                            nb_dot_hit(
+                                &roll.pat.notes,
+                                &roll.sel_notes,
+                                &roll.pat.note_bends,
+                                hp,
+                            )
+                            .filter(|(ni, _)| *ni == i),
+                        ) {
+                            let pt = roll
+                                .pat
+                                .note_bends
+                                .get(ci as usize)
+                                .and_then(|nb| nb.pts.get(pi))
+                                .copied();
+                            if let Some((_, c)) = pt {
+                                dot_txt = format!(
+                                    " \u{b7} dot {} ({:+.0} cents)",
+                                    crate::tune::label_pitch_text_live(n.note as i32, c),
+                                    c
+                                );
+                            }
+                        }
+                    }
                     painter.text(
                         hp + egui::vec2(14.0, 14.0),
                         egui::Align2::LEFT_TOP,
                         format!(
-                            "{} \u{b7} vel {} \u{b7} wheel to change \u{b7} RMB: length{}",
+                            "{} \u{b7} vel {} \u{b7} wheel to change \u{b7} RMB: length{}{}",
                             note_name(n.note),
                             n.vel,
                             if curve {
                                 " \u{b7} curve: drag dots \u{b7} Shift+RMB removes it"
                             } else {
                                 " \u{b7} Z+drag: draw pitch curve"
-                            }
+                            },
+                            dot_txt
                         ),
                         egui::FontId::proportional(9.0),
                         Color32::from_rgb(230, 230, 170),
@@ -13556,8 +13583,7 @@ impl App {
                         if let Some(ci) = cur.map(|c| c as usize) {
                             if let Some(nb) = roll.pat.note_bends.get(ci).filter(|nb| nb.active())
                             {
-                                let disp = nb_disp(&nb.pts);
-                                let c0 = c_at_y(row, disp, pt.y);
+                                let c0 = c_at_y(row, pt.y);
                                 roll.nb_base = nb.pts.clone();
                                 roll.gesture = RollGesture::NbWarp { idx, c0 };
                                 warping = true;
@@ -13797,16 +13823,24 @@ impl App {
                     RollGesture::NbDraw { idx } => {
                         // Freehand stroke: append the pointer to nb_live with
                         // strictly increasing t (back-strokes just update the
-                        // last sample). Drawing scale = 1200 ¢ per trail half,
+                        // last sample). Scale = 1200 ¢ per trail half,
                         // identical to the paint (WYSIWYG under the pointer).
                         if in_grid(pt) {
+                            let mut echo: Option<String> = None;
                             if let Some(n) = roll.pat.notes.get(idx) {
                                 let s0 = t_of(n.start);
                                 let dur = t_of(n.len.max(1)).max(1e-6);
                                 let row = n.note as i32;
                                 let t =
                                     ((sec_at(pt.x) - s0) / dur).clamp(0.0, 1.0) as f32;
-                                let c = c_at_y(row, 1200.0, pt.y);
+                                let c = c_at_y(row, pt.y);
+                                // v168 (pbc-2): the LIVE pitch under the pen
+                                // — EDO-aware label + cents, every frame.
+                                echo = Some(format!(
+                                    "drawing \u{b7} {} \u{b7} {:+.0} cents",
+                                    crate::tune::label_pitch_text_live(row, c),
+                                    c
+                                ));
                                 let live = &mut roll.nb_live;
                                 let extend = live.last().is_some_and(|lp| t - lp.0 >= 1e-4);
                                 if extend {
@@ -13816,6 +13850,9 @@ impl App {
                                 } else {
                                     live.push((t, c));
                                 }
+                            }
+                            if let Some(e) = echo {
+                                self.status = e;
                             }
                         }
                     }
@@ -13831,20 +13868,27 @@ impl App {
                             .get(idx)
                             .map(|n| (n.note as i32, t_of(n.start), t_of(n.len.max(1)).max(1e-6)));
                         let mut edited = false;
+                        let mut echo: Option<String> = None;
                         if let (Some(ci), Some((row, s0, dur))) = (ci, geo) {
                             if let Some(nb) = roll.pat.note_bends.get_mut(ci as usize) {
                                 if pi < nb.pts.len() {
-                                    let disp = nb_disp(&nb.pts);
                                     let sec = sec_at(pt.x);
                                     let t = if mods.shift {
                                         (snap(sec) - s0) / dur
                                     } else {
                                         (sec - s0) / dur
                                     };
-                                    let mut c = c_at_y(row, disp, pt.y);
+                                    let mut c = c_at_y(row, pt.y);
                                     if mods.ctrl {
                                         c = (c / 100.0).round() * 100.0;
                                     }
+                                    // v168 (pbc-2): the dragged point's live
+                                    // pitch — EDO-aware label + cents.
+                                    echo = Some(format!(
+                                        "curve point \u{b7} {} \u{b7} {:+.0} cents",
+                                        crate::tune::label_pitch_text_live(row, c),
+                                        c
+                                    ));
                                     let last = nb.pts.len() - 1;
                                     if pi == 0 || pi == last {
                                         nb.pts[pi].1 = c;
@@ -13859,6 +13903,9 @@ impl App {
                                 }
                             }
                         }
+                        if let Some(e) = echo {
+                            self.status = e;
+                        }
                         if edited {
                             roll.pat.bake_bends();
                             roll.changed = true;
@@ -13870,6 +13917,7 @@ impl App {
                         // compounding drag would runaway).
                         let ci = roll.pat.notes.get(idx).and_then(|n| n.bend);
                         let mut edited = false;
+                        let mut echo: Option<String> = None;
                         if let Some(ci) = ci {
                             if !roll.nb_base.is_empty() {
                                 let row = match roll.pat.notes.get(idx) {
@@ -13877,8 +13925,13 @@ impl App {
                                     None => 0,
                                 };
                                 if roll.pat.notes.get(idx).is_some() {
-                                    let disp = nb_disp(&roll.nb_base);
-                                    let c = c_at_y(row, disp, pt.y);
+                                    let c = c_at_y(row, pt.y);
+                                    // v168 (pbc-2): pitch under the warp pen.
+                                    echo = Some(format!(
+                                        "warping \u{b7} {} \u{b7} {:+.0} cents",
+                                        crate::tune::label_pitch_text_live(row, c),
+                                        c
+                                    ));
                                     // Near-zero anchor cannot carry a ratio —
                                     // warp additively over an octave instead.
                                     let f = if c0.abs() > 24.0 {
@@ -13895,13 +13948,22 @@ impl App {
                                             .nb_base
                                             .iter()
                                             .map(|(t, v)| {
-                                                (*t, (v * f).clamp(-2400.0, 2400.0))
+                                                (
+                                                    *t,
+                                                    (v * f).clamp(
+                                                        -crate::midipat::NB_MAX_CENTS,
+                                                        crate::midipat::NB_MAX_CENTS,
+                                                    ),
+                                                )
                                             })
                                             .collect();
                                         edited = true;
                                     }
                                 }
                             }
+                        }
+                        if let Some(e) = echo {
+                            self.status = e;
                         }
                         if edited {
                             roll.pat.bake_bends();
@@ -14006,7 +14068,7 @@ impl App {
                         });
                         let end_c = land
                             .map(|tn| (tn.note as i32 - srcrow) as f32 * 100.0)
-                            .unwrap_or_else(|| c_at_y(srcrow, 1200.0, pt.y));
+                            .unwrap_or_else(|| c_at_y(srcrow, pt.y));
                         let mut pts: Vec<(f32, f32)> =
                             live.into_iter().filter(|p| p.0 < 0.995).collect();
                         pts.push((1.0, end_c));
@@ -14029,8 +14091,9 @@ impl App {
                         roll.changed = true;
                         *preview = true;
                         *curve_echo = Some(format!(
-                            "pitch curve on {} \u{b7} {npts} pts \u{b7} ends {end_c:+.0} cents \u{b7} drag a dot to edit",
-                            note_name(roll.pat.notes[idx].note)
+                            "pitch curve on {} \u{b7} {npts} pts \u{b7} ends {end_c:+.0} cents ({}) \u{b7} drag a dot to edit",
+                            note_name(roll.pat.notes[idx].note),
+                            crate::tune::label_pitch_text_live(srcrow, end_c)
                         ));
                     } else if !live.is_empty() {
                         self.status = "curve too short \u{b7} drag a longer stroke across the note".into();
@@ -14052,8 +14115,15 @@ impl App {
                         roll.changed = true;
                         *preview = true;
                         if let Some((t, c)) = echo {
-                            *curve_echo =
-                                Some(format!("curve point \u{b7} t {t:.2} at {c:+.0} cents"));
+                            let row = roll.pat.notes.get(idx).map(|n| n.note as i32);
+                            *curve_echo = Some(match row {
+                                Some(row) => format!(
+                                    "curve point \u{b7} t {t:.2} at {c:+.0} cents ({})",
+                                    crate::tune::label_pitch_text_live(row, c)
+                                ),
+                                None =>
+                                    format!("curve point \u{b7} t {t:.2} at {c:+.0} cents"),
+                            });
                         }
                     }
                 } else if let RollGesture::NbWarp { idx, .. } = roll.gesture {
@@ -14071,7 +14141,14 @@ impl App {
                         roll.changed = true;
                         *preview = true;
                         if let Some(c) = end_c {
-                            *curve_echo = Some(format!("curve warped \u{b7} ends {c:+.0} cents"));
+                            let row = roll.pat.notes.get(idx).map(|n| n.note as i32);
+                            *curve_echo = Some(match row {
+                                Some(row) => format!(
+                                    "curve warped \u{b7} ends {c:+.0} cents ({})",
+                                    crate::tune::label_pitch_text_live(row, c)
+                                ),
+                                None => format!("curve warped \u{b7} ends {c:+.0} cents"),
+                            });
                         }
                     }
                 } else if was_move && roll.changed {
