@@ -109,6 +109,9 @@ pub const LIVE: &[&str] = &[
     // v164 (card t_0c73850c): EDO tuning — apply republishes the atomic.
     "edo_n",
     "edo_root",
+    // v172 (card t_7ca820d3): notation font-pack bindings — a UI-side
+    // lookup table; applying it republishes the tune registry live.
+    "edo_packs",
     "n_tracks",
     "show_rack",
     "show_mixer",
