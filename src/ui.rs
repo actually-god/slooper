@@ -855,6 +855,31 @@ const COL_SNAP_LINE: Color32 = Color32::from_gray(44);
 /// Takes the table + sample rate as plain args so callers can pass
 /// `&arr_alen(&self.assets, self.sample_rate)` even while the receiver
 /// `&mut self.arr` is borrowed (disjoint field captures only).
+/// v172: default asset/clip name for a plain recording:
+/// `[project]-[input device]-Track N`. Every non-empty component goes
+/// through `sanitize_name` (Windows-illegal characters fold to `-`), and
+/// components that sanitize away to nothing are skipped — so a missing
+/// project name or a punctuation-only device can never produce a
+/// `--Track 3` double separator or a leading dash.
+fn take_asset_name(proj: &str, device: Option<&str>, track: usize) -> String {
+    let mut segs: Vec<String> = Vec::new();
+    for raw in [Some(proj), device].into_iter().flatten() {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let seg = crate::project::sanitize_name(raw);
+        // A component that sanitizes to pure separator noise (`":"` → `-`)
+        // is as good as absent; drop it rather than seam it in.
+        let seg = seg.trim_matches('-').to_string();
+        if !seg.is_empty() {
+            segs.push(seg);
+        }
+    }
+    segs.push(format!("Track {}", track + 1));
+    segs.join("-")
+}
+
 fn arr_alen<'a>(assets: &'a [Asset], sr: u32) -> impl Fn(u32) -> u64 + 'a {
     move |id| {
         assets
@@ -17535,7 +17560,14 @@ impl App {
     /// A finished take becomes: optional content quantize → WAV into the
     /// primary rack folder (when set) → asset → clip placed at the take's
     /// start position, snapped to the snap grid.
-    fn take_pipeline(&mut self, track: usize, at: u64, data: Arc<[f32]>, preview: bool) {
+    fn take_pipeline(
+        &mut self,
+        track: usize,
+        at: u64,
+        data: Arc<[f32]>,
+        preview: bool,
+        device: Option<String>,
+    ) {
         if track >= MAX_LOOPS {
             return;
         }
@@ -17547,25 +17579,48 @@ impl App {
         } else {
             data
         };
+        // v172: plain recordings are named `[project]-[device]-Track N`
+        // (every component sanitized); preview takes keep the old
+        // timestamped bounce name. The file gets the folder's unique-name
+        // convention ("name", "name-2", … — the MIDI-take loop's pattern),
+        // so re-recording the same device never overwrites the last take.
+        let base = if preview {
+            format!("preview-t{}-{}", track + 1, Self::fstamp())
+        } else {
+            take_asset_name(&self.proj_name, device.as_deref(), track)
+        };
+        let mut name = base.clone();
         let mut path = PathBuf::new();
         let mut dirty = true;
-        let stem = if preview { "preview" } else { "rec" };
-        let name = format!("{}-t{}-{}", stem, track + 1, Self::fstamp());
         if let Some(f) = self.rack.first_mut() {
             let dir = PathBuf::from(f.path.trim());
             if !dir.as_os_str().is_empty() {
-                let p = dir.join(format!("{name}.wav"));
-                if std::fs::create_dir_all(&dir).is_ok()
-                    && crate::audio_io::export(
-                        &p,
-                        self.sample_rate,
-                        &data,
-                        crate::audio_io::ExportFormat::Wav,
-                    )
-                    .is_ok()
-                {
-                    path = p;
-                    dirty = false;
+                if std::fs::create_dir_all(&dir).is_ok() {
+                    let mut n = 1u32;
+                    loop {
+                        name = if n == 1 {
+                            base.clone()
+                        } else {
+                            format!("{base}-{n}")
+                        };
+                        let p = dir.join(format!("{name}.wav"));
+                        if p.exists() {
+                            n += 1;
+                            continue;
+                        }
+                        if crate::audio_io::export(
+                            &p,
+                            self.sample_rate,
+                            &data,
+                            crate::audio_io::ExportFormat::Wav,
+                        )
+                        .is_ok()
+                        {
+                            path = p;
+                            dirty = false;
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -19100,13 +19155,16 @@ impl App {
                 at,
                 data,
                 preview,
+                device,
             } => {
                 // v169: the final asset clip replaces the live ghost —
                 // clear BEFORE the pipeline so no frame ever shows both.
+                // v172: a fan-out take arrives once per device; the first
+                // clears the ghost, the rest simply follow with their clips.
                 if let Some(slot) = self.live_takes.get_mut(track) {
                     *slot = None;
                 }
-                self.take_pipeline(track, at, data, preview);
+                self.take_pipeline(track, at, data, preview, device);
             }
             // v169: live partial take — grow (or restart, on a new pass /
             // new track) the ghost for this take.
@@ -45730,6 +45788,7 @@ mod tests {
             at: 9000,
             data: Arc::from(vec![0.25f32; 480]),
             preview: false,
+            device: None,
         });
         assert!(app.live_takes[0].is_none(), "final take leaves no ghost");
         assert_eq!(app.assets.len(), n_assets0 + 1, "one asset materialized");
@@ -45832,6 +45891,7 @@ mod tests {
             at: 0,
             data: Arc::from(vec![0.25f32; 48_000]),
             preview: false,
+            device: None,
         });
         assert!(scan_ghost(&mut app, &ctx).is_none(), "no ghost survives the final take");
     }

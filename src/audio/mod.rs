@@ -31,7 +31,7 @@
 //! recording captures raw input into a take buffer and hands the finished
 //! take back to the GUI (as an asset + clip placement) when stopped.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 
@@ -586,6 +586,11 @@ pub enum Evt {
         at: u64,
         data: Arc<[f32]>,
         preview: bool,
+        /// v172: the input port name this take was captured from (Some for
+        /// the per-device fan-out path; None = summed legacy path, no
+        /// device ticked, or preview/loop take). Drives the asset name
+        /// `[project]-[device]-Track N`.
+        device: Option<String>,
     },
     /// v169: live partial-take publish. While a take is rolling, the
     /// manager's idle tick ships the frames captured since the last event
@@ -771,6 +776,13 @@ trait ManagerBackend {
     /// W9: open exactly these WinMM MIDI devices. The JACK backend never
     /// overrides this — auto-connected JACK MIDI is the Linux contract.
     fn set_midi_inputs(&mut self, _sel: &[String], _tx: &SyncSender<Evt>) {}
+    /// v172: the port name currently mapped onto each input slot
+    /// (slot-major, `None` = slot unused). The manager labels the
+    /// per-device take fan-out with these; the parked session honestly
+    /// reports nothing (takes then carry no device segment).
+    fn input_names(&self) -> Vec<Option<String>> {
+        Vec::new()
+    }
 }
 
 /// Device-less [`ManagerBackend`] for the W12g PARKED state: the chosen
@@ -966,6 +978,36 @@ pub struct Engine {
     /// capacity. The manager polls + clears it (it owns the event channel)
     /// and ships those takes to the GUI like any other finished take.
     take_pending: [AtomicU64; 2],
+
+    // ---- v172 per-device take fan-out --------------------------------------
+    //
+    // A plain audio take (NOT a preview take, which captures the track bus,
+    // and NOT a loop take, whose per-pass commits ride the per-track buffer)
+    // records ONE clip per ticked input slot instead of the summed mix. The
+    // RT captures each connected slot into its own buffer under ONE shared
+    // cursor `dev_len`; every fan take on any track shares the run (they all
+    // record the same interface anyway), each remembering its own start
+    // offset `fan_start[t]` (+ the latency-compensation skip). Writers: RT
+    // only (cursor, slot buffers, run snapshot); the manager reads them
+    // quiesced like `rec_len`. Buffers are published by `ensure_dev_bufs`
+    // on the MANAGER before arming — the RT never allocates.
+    /// Per-slot fan capture buffers (null until `ensure_dev_bufs` ran;
+    /// leaked like `rec_bufs`, never freed).
+    dev_bufs: [AtomicPtr<f32>; MAX_SLOTS],
+    /// Shared capture cursor (samples written this run; frozen when the
+    /// last fan take ends, reset at the next run start).
+    dev_len: AtomicU32,
+    /// Cursor value where track i's take started (already includes the
+    /// latency skip). Written by the RT at the arm transition.
+    fan_start: [AtomicU32; MAX_LOOPS],
+    /// 1 = track i's current take is a fan take. The RT sets it at the arm
+    /// transition (and clears it for a preview/loop arm); the manager reads
+    /// it after the stop to decide which copy path ships the take.
+    fan_live: [AtomicBool; MAX_LOOPS],
+    /// Connected input slots snapshotted when the run started (bit s =
+    /// slot s captured; 0 = nothing ticked: slot 0 still advances on the
+    /// summed dry input so a no-device take stays ONE sane silent clip).
+    fan_mask: AtomicU64,
 
     // ---- global transport ------------------------------------------------
     /// 1 = running (timeline advances), 0 = stopped (playhead holds).
@@ -1214,6 +1256,11 @@ impl Engine {
             latency: AtomicU32::new(0),
             rec_skip: core::array::from_fn(|_| AtomicU32::new(0)),
             take_pending: [AtomicU64::new(0), AtomicU64::new(0)],
+            dev_bufs: core::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
+            dev_len: AtomicU32::new(0),
+            fan_start: core::array::from_fn(|_| AtomicU32::new(0)),
+            fan_live: core::array::from_fn(|_| AtomicBool::new(false)),
+            fan_mask: AtomicU64::new(0),
             transport_on: AtomicU8::new(0),
             loop_tl: AtomicU8::new(1),
             loop_start: AtomicU64::new(0),
@@ -1328,6 +1375,17 @@ impl Engine {
     #[inline]
     pub fn mark_take_pending(&self, i: usize) {
         self.take_pending[i / 64].fetch_or(1u64 << (i % 64), Ordering::SeqCst);
+    }
+
+    /// v172 fix: CLEAR the capacity-pending bit. The v0.10 128-track
+    /// widening replaced toggle_record's hand-written
+    /// `fetch_and(!(1 << i))` with `mark_take_pending` — the bit direction
+    /// inverted, so every user-stopped take got flagged pending again and
+    /// the manager's next idle claim shipped the SAME take a second time
+    /// (the "recording always makes 2 clips" report, card t_627ee9f3).
+    #[inline]
+    pub fn clear_take_pending(&self, i: usize) {
+        self.take_pending[i / 64].fetch_and(!(1u64 << (i % 64)), Ordering::SeqCst);
     }
 
     /// Manager: claim every flagged take (returns a bitmask; bit `i` =
@@ -1469,6 +1527,77 @@ impl Engine {
         let from = from.min(n);
         let data = unsafe { std::slice::from_raw_parts(self.rec_bufs[i].add(from), n - from) };
         Arc::from(data)
+    }
+
+    // ---- v172 per-device fan capture (manager-side API) --------------------
+
+    /// v172: allocate the fan capture buffers. Called by the MANAGER at the
+    /// record arm (never on the RT thread — this allocates). Idempotent;
+    /// the pointer publish is a Release store the RT sees with Acquire
+    /// before any fresh arm can write through it.
+    pub fn ensure_dev_bufs(&self) {
+        for slot in self.dev_bufs.iter() {
+            if slot.load(Ordering::Relaxed).is_null() {
+                let mut v = vec![0f32; LOOP_CAP as usize];
+                let p = v.as_mut_ptr();
+                std::mem::forget(v); // ownership transfers to the engine
+                slot.store(p, Ordering::Release);
+            }
+        }
+    }
+
+    /// RT: write one sample into slot `s` at the shared cursor offset.
+    /// A null slot buffer (arm raced the alloc — never after
+    /// `ensure_dev_bufs`) silently skips the write.
+    #[inline]
+    pub fn dev_write(&self, s: usize, off: u32, v: f32) {
+        let p = self.dev_bufs[s].load(Ordering::Relaxed);
+        if !p.is_null() {
+            unsafe { p.add(off as usize).write(v) };
+        }
+    }
+
+    pub fn dev_len_of(&self) -> u32 {
+        self.dev_len.load(Ordering::Relaxed).min(LOOP_CAP)
+    }
+    pub fn fan_live_of(&self, i: usize) -> bool {
+        self.fan_live[i].load(Ordering::Relaxed)
+    }
+    pub fn fan_start_of(&self, i: usize) -> u32 {
+        self.fan_start[i].load(Ordering::Relaxed)
+    }
+    pub fn fan_mask_of(&self) -> u64 {
+        self.fan_mask.load(Ordering::Relaxed)
+    }
+    /// Frames captured so far for track i's fan take (0 before the run
+    /// passes its start offset).
+    pub fn fan_frames_of(&self, i: usize) -> u32 {
+        self.dev_len_of().saturating_sub(self.fan_start_of(i) as usize as u32)
+    }
+
+    /// v172: manager-thread copy of track i's fan take frames for slot
+    /// `slot`, from this take's start to the committed cursor. Quiesce
+    /// follows `copy_take`: the caller stopped this take and slept past a
+    /// block; frames below the snapshot cursor were committed before the
+    /// read even while another fan take keeps the run rolling (RT writes
+    /// at the cursor only).
+    pub fn copy_dev_take(&self, i: usize, slot: usize) -> Arc<[f32]> {
+        self.copy_dev_take_delta(i, slot, 0)
+    }
+
+    /// v172: partial variant for the live-ghost pump — skip `base` frames
+    /// past the take start (never touches state).
+    pub fn copy_dev_take_delta(&self, i: usize, slot: usize, base: usize) -> Arc<[f32]> {
+        let start = (self.fan_start_of(i) as usize + base).min(self.dev_len_of() as usize);
+        let end = self.dev_len_of() as usize;
+        if slot >= MAX_SLOTS || end <= start {
+            return Arc::from(Vec::new());
+        }
+        let p = self.dev_bufs[slot].load(Ordering::Acquire);
+        if p.is_null() {
+            return Arc::from(Vec::new());
+        }
+        unsafe { Arc::from(std::slice::from_raw_parts(p.add(start), end - start)) }
     }
 
     // ---- global transport ---------------------------------------------------
@@ -2583,33 +2712,98 @@ impl Drop for Engine {
 unsafe impl Send for Engine {}
 unsafe impl Sync for Engine {}
 
-/// Manager-side record toggle: start a fresh capture, or stop the take and
-/// hand it to the GUI. Stopping always leaves the engine ready for the next
-/// take; empty stops (button mashing) are silently dropped.
-fn toggle_record(engine: &Engine, i: usize, tx: &SyncSender<Evt>) {
+/// v172: Ship track `i`'s stopped take to the GUI. A plain-audio take was
+/// captured per device (the fan table): ship ONE `Evt::Take` per captured
+/// slot, each carrying that slot's frames and its port name so the GUI
+/// names the clip `[project]-[device]-Track N`. Every other take kind
+/// (preview = per-track bus audio, loop = per-pass summed commits, and a
+/// fan run whose slots all came back empty) ships the single per-track
+/// buffer like always. The caller must have stopped the RT writes for this
+/// track and slept past a block (quiesce) before the buffer reads.
+fn ship_take(engine: &Engine, i: usize, session: &dyn ManagerBackend, tx: &SyncSender<Evt>) {
     if engine.rec_state_of(i) == TR_REC {
         engine.rec_state[i].store(TR_IDLE, Ordering::Relaxed);
-        // The GUI owns this take now; drop any capacity-stop flag so the
-        // manager poll doesn't ship the same take twice.
-        engine.mark_take_pending(i);
+        // Let the RT thread quiesce first (a block already in flight may
+        // still land a capacity mark), THEN drop any capacity-stop flag so
+        // the manager poll doesn't ship the same take twice (v172: the old
+        // code SET the flag here — see `clear_take_pending`).
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let (at, data, preview) = engine.copy_take(i);
-        if data.is_empty() {
+        engine.clear_take_pending(i);
+    }
+    if engine.fan_live_of(i) {
+        let at = engine.rec_at(i);
+        if engine.fan_frames_of(i) == 0 {
             let _ = tx.try_send(Evt::Notice(format!(
                 "track {}: empty take discarded",
                 i + 1
             )));
             // v169: any live ghost for this track must vanish with it.
             let _ = tx.try_send(Evt::TakeDiscarded { track: i });
-        } else {
+            return;
+        }
+        let mask = engine.fan_mask_of();
+        let names = session.input_names();
+        let mut slots: Vec<usize> = (0..MAX_SLOTS).filter(|s| mask >> s & 1 != 0).collect();
+        if slots.is_empty() {
+            // Nothing was ticked when the take armed: the run still advanced
+            // slot 0 on the summed (silent) input — one clip, no device label.
+            slots.push(0);
+        }
+        for s in slots {
+            let data = engine.copy_dev_take(i, s);
+            if data.is_empty() {
+                continue;
+            }
+            let device = if mask != 0 {
+                names.get(s).cloned().flatten()
+            } else {
+                None
+            };
             let _ = tx.try_send(Evt::Take {
                 track: i,
                 at,
                 data,
-                preview,
+                preview: false,
+                device,
             });
         }
+        return;
+    }
+    let (at, data, preview) = engine.copy_take(i);
+    if data.is_empty() {
+        let _ = tx.try_send(Evt::Notice(format!(
+            "track {}: empty take discarded",
+            i + 1
+        )));
+        // v169: any live ghost for this track must vanish with it.
+        let _ = tx.try_send(Evt::TakeDiscarded { track: i });
     } else {
+        let _ = tx.try_send(Evt::Take {
+            track: i,
+            at,
+            data,
+            preview,
+            device: None,
+        });
+    }
+}
+
+/// Manager-side record toggle: start a fresh capture, or stop the take and
+/// hand it to the GUI. Stopping always leaves the engine ready for the next
+/// take; empty stops (button mashing) are silently dropped.
+fn toggle_record(
+    engine: &Engine,
+    i: usize,
+    session: &dyn ManagerBackend,
+    tx: &SyncSender<Evt>,
+) {
+    if engine.rec_state_of(i) == TR_REC {
+        ship_take(engine, i, session, tx);
+    } else {
+        // v172: publish the fan capture buffers BEFORE arming (allocation
+        // lives here, on the manager thread; the RT only ever writes
+        // through already-published pointers).
+        engine.ensure_dev_bufs();
         engine.start_rec(i);
     }
 }
@@ -2631,6 +2825,33 @@ fn pump_live_takes(engine: &Engine, tx: &SyncSender<Evt>, sent: &mut [(u64, u64)
         let at = engine.rec_at(t);
         let (pass_at, pass_len) = *st;
         let base = if pass_at == at { pass_len } else { 0 };
+        // v172: a rolling fan take stores frames in the device table, not
+        // the per-track buffer — the ghost follows the primary (lowest
+        // ticked) slot, i.e. the first device of the user's selection.
+        if engine.fan_live_of(t) {
+            let have = engine.fan_frames_of(t) as u64;
+            if have <= base {
+                *st = (at, base.min(have));
+                continue;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(6));
+            let mask = engine.fan_mask_of();
+            let slot = if mask != 0 {
+                mask.trailing_zeros() as usize
+            } else {
+                0
+            };
+            let frames = engine.copy_dev_take_delta(t, slot, base as usize);
+            if !frames.is_empty() {
+                *st = (at, base + frames.len() as u64);
+                let _ = tx.try_send(Evt::TakeProgress {
+                    track: t,
+                    at,
+                    frames,
+                });
+            }
+            continue;
+        }
         let len = engine.rec_len_of(t) as u64;
         if len <= base {
             *st = (at, base.min(len));
@@ -2689,7 +2910,7 @@ fn manager_loop(
                 return ManagerExit::Switch(kind);
             }
             Ok(Cmd::ToggleRecord { i }) => {
-                toggle_record(engine, i.min(MAX_LOOPS - 1), evt_tx);
+                toggle_record(engine, i.min(MAX_LOOPS - 1), &*session, evt_tx);
             }
             Ok(Cmd::SetTrackOn { i, on }) => {
                 engine.set_track_on(i.min(MAX_LOOPS - 1), on);
@@ -2837,19 +3058,8 @@ fn manager_loop(
                     let i = pend.trailing_zeros() as usize;
                     pend &= !(1u128 << i);
                     std::thread::sleep(std::time::Duration::from_millis(25));
-                    let (at, data, preview) = engine.copy_take(i);
-                    if data.is_empty() {
-                        // v169: nothing shipped → drop any live ghost so it
-                        // does not linger over an empty take.
-                        let _ = evt_tx.try_send(Evt::TakeDiscarded { track: i });
-                    } else {
-                        let _ = evt_tx.try_send(Evt::Take {
-                            track: i,
-                            at,
-                            data,
-                            preview,
-                        });
-                    }
+                    // v172: same fan/legacy branch as the stop path.
+                    ship_take(engine, i, &*session, evt_tx);
                 }
                 // v169: live partial takes — grows the ghost clips in the
                 // arrangement while the takes roll (after claims, so a
@@ -4548,6 +4758,11 @@ struct Proc {
     /// state store from re-firing on every remaining sample of the block.
     /// Cleared on the track's next state edge.
     rec_full: u128,
+    /// v172: a fan capture run is live this cycle (shared cursor advancing).
+    dev_run: bool,
+    /// v172: per-track bit of "armed as a fan take last cycle" — the
+    /// edge detector for run start + per-take start offset.
+    prev_fan: [bool; MAX_LOOPS],
     /// RT-local playhead (the engine atomic is the published copy).
     pos: u64,
     /// Last transport flag; the falling edge publishes an auto-stop event.
@@ -4808,6 +5023,8 @@ fn new_proc(
         engine: engine.clone(),
         prev_rec: [TR_IDLE; MAX_LOOPS],
         rec_full: 0,
+        dev_run: false,
+        prev_fan: [false; MAX_LOOPS],
         pv_seen: false,
         lr_restart: [u64::MAX; MAX_LOOPS],
         pos: 0,
@@ -5576,6 +5793,10 @@ impl Proc {
         let mut pv_mask: u128 = 0;
         // v42: tracks whose live take is a loop take (pass commits on wrap).
         let mut loop_mask: u128 = 0;
+        // v172: tracks whose live take is a PLAIN audio take: they capture
+        // per DEVICE in the fan table (one shared cursor for one run)
+        // instead of the summed dry input into their per-track buffer.
+        let mut fan_now: u128 = 0;
         for (t, &s) in st_now.iter().enumerate() {
             if s != self.prev_rec[t] {
                 self.rec_full &= !(1u128 << t);
@@ -5593,9 +5814,57 @@ impl Proc {
                     nrec += 1;
                     if self.engine.rec_is_loop(t) {
                         loop_mask |= 1u128 << t;
+                        // v172: preview/loop takes ride the legacy per-track
+                        // path — this flag is what makes the manager stop
+                        // path copy the per-track buffer for them.
+                        self.engine.fan_live[t].store(false, Ordering::Relaxed);
+                    } else {
+                        fan_now |= 1u128 << t;
                     }
                 }
             }
+        }
+        // v172: shared fan-run bookkeeping. A run starts with the first fan
+        // arm after an idle gap (cursor at 0, connected slots snapshotted —
+        // the INPUTS selection is LOCKED for the whole run). Every arm
+        // takes its own start offset (+ the latency-compensation skip, same
+        // contract as rec_sample's per-take skip). All RT-written.
+        for t in 0..MAX_LOOPS {
+            let on = fan_now & (1u128 << t) != 0;
+            if on && !self.prev_fan[t] {
+                if !self.dev_run {
+                    self.dev_run = true;
+                    self.engine.dev_len.store(0, Ordering::Relaxed);
+                    self.engine
+                        .fan_mask
+                        .store(in_mask & ((1u64 << MAX_SLOTS) - 1), Ordering::Relaxed);
+                }
+                let skip = self.engine.latency_samples().min(LOOP_CAP);
+                self.engine.fan_start[t].store(
+                    self.engine.dev_len_of().saturating_add(skip).min(LOOP_CAP),
+                    Ordering::Relaxed,
+                );
+                self.engine.fan_live[t].store(true, Ordering::Relaxed);
+            }
+            self.prev_fan[t] = on;
+        }
+        // v172: the shared cursor hit capacity — end every rolling fan take
+        // (parity with rec_sample's per-track capacity stop). The claim ship
+        // path reads the frozen cursor behind this.
+        if self.dev_run && self.engine.dev_len_of() >= LOOP_CAP {
+            for t in 0..MAX_LOOPS {
+                if fan_now & (1u128 << t) != 0 {
+                    self.engine.rec_state[t].store(TR_IDLE, Ordering::Relaxed);
+                    self.engine.mark_take_pending(t);
+                }
+            }
+            self.dev_run = false;
+            fan_now = 0;
+        }
+        // v172: the last fan take ended (manager stop) — freeze the cursor
+        // for the quiesced copy.
+        if self.dev_run && fan_now == 0 {
+            self.dev_run = false;
         }
         let any_rec = nrec > 0;
         // v42: a loop take ends with the transport — the last pass commits
@@ -6362,6 +6631,13 @@ impl Proc {
             }
         }
 
+        // v172: the fan capture set is locked for the whole run — read the
+        // snapshot once per block (RT-stable across the sample loop).
+        let fan_mask_run = if self.dev_run {
+            self.engine.fan_mask_of()
+        } else {
+            0
+        };
         let mut peak_val: u32 = 0;
         let mut mon_pre = (0.0f32, 0.0f32);
         let mut pos_now = self.pos;
@@ -6388,6 +6664,11 @@ impl Proc {
             if any_rec {
                 for &ti in &rec_tracks[..nrec] {
                     let t = ti as usize;
+                    // v172: plain audio takes capture per-device below;
+                    // only loop takes still take the summed dry input.
+                    if fan_now & (1u128 << t) != 0 {
+                        continue;
+                    }
                     if self.engine.rec_sample(t, src_in) && self.rec_full & (1u128 << t) == 0 {
                         // Capacity reached: stop capturing into this track;
                         // the manager still hasn't been told, so finish the
@@ -6400,6 +6681,33 @@ impl Proc {
                             self.engine.stop_rec_loop(t);
                             self.lr_restart[t] = u64::MAX;
                         }
+                    }
+                }
+                // v172: per-device fan capture — every connected slot of the
+                // run's snapshotted set written under ONE shared cursor (a
+                // slot disconnected mid-run honestly reads as silence).
+                // Nothing ticked: slot 0 advances on the summed (silent) dry
+                // input, so a no-device take stays one sane silent clip.
+                if self.dev_run {
+                    let off = self.engine.dev_len_of();
+                    if off < LOOP_CAP {
+                        if fan_mask_run == 0 {
+                            self.engine.dev_write(0, off, src_in);
+                        } else {
+                            for s in 0..MAX_SLOTS {
+                                if fan_mask_run >> s & 1 == 0 {
+                                    continue;
+                                }
+                                let b = io.in_buf(s);
+                                let v = if b.is_null() {
+                                    0.0
+                                } else {
+                                    unsafe { *b.add(i) }
+                                };
+                                self.engine.dev_write(s, off, v);
+                            }
+                        }
+                        self.engine.dev_len.store(off + 1, Ordering::Relaxed);
                     }
                 }
             }

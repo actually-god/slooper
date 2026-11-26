@@ -698,6 +698,10 @@ impl JackSession {
 }
 
 impl ManagerBackend for JackSession {
+    /// v172: slot-major port names for the per-device take fan-out labels.
+    fn input_names(&self) -> Vec<Option<String>> {
+        self.cur_in.clone()
+    }
     fn refresh(&mut self, tx: &SyncSender<Evt>) {
         // Dead-safe (v118): while the server is gone there is nothing to
         // enumerate; the live list returns with `announce_live` after a
