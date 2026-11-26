@@ -17594,33 +17594,31 @@ impl App {
         let mut dirty = true;
         if let Some(f) = self.rack.first_mut() {
             let dir = PathBuf::from(f.path.trim());
-            if !dir.as_os_str().is_empty() {
-                if std::fs::create_dir_all(&dir).is_ok() {
-                    let mut n = 1u32;
-                    loop {
-                        name = if n == 1 {
-                            base.clone()
-                        } else {
-                            format!("{base}-{n}")
-                        };
-                        let p = dir.join(format!("{name}.wav"));
-                        if p.exists() {
-                            n += 1;
-                            continue;
-                        }
-                        if crate::audio_io::export(
-                            &p,
-                            self.sample_rate,
-                            &data,
-                            crate::audio_io::ExportFormat::Wav,
-                        )
-                        .is_ok()
-                        {
-                            path = p;
-                            dirty = false;
-                        }
-                        break;
+            if !dir.as_os_str().is_empty() && std::fs::create_dir_all(&dir).is_ok() {
+                let mut n = 1u32;
+                loop {
+                    name = if n == 1 {
+                        base.clone()
+                    } else {
+                        format!("{base}-{n}")
+                    };
+                    let p = dir.join(format!("{name}.wav"));
+                    if p.exists() {
+                        n += 1;
+                        continue;
                     }
+                    if crate::audio_io::export(
+                        &p,
+                        self.sample_rate,
+                        &data,
+                        crate::audio_io::ExportFormat::Wav,
+                    )
+                    .is_ok()
+                    {
+                        path = p;
+                        dirty = false;
+                    }
+                    break;
                 }
             }
         }

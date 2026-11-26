@@ -181,6 +181,9 @@ struct SrcCap {
     ring: Arc<Vec<AtomicU32>>,
     widx: Arc<AtomicU64>,
     const_val: Arc<AtomicU32>,
+    /// v172: the resolved client name (JACK may suffix a requested tag),
+    /// so tests can name `name:out_a` in a multi-source layout.
+    src_name: String,
     active: AsyncClient<(), LoopSrcProc>,
 }
 
@@ -218,6 +221,7 @@ fn e2e_capture_src(b: &Backend, tag: &str, seed: u32, src_in: bool, gain: u8) ->
         ring,
         widx,
         const_val,
+        src_name,
         active,
     }
 }
@@ -978,37 +982,22 @@ fn v172_e2e_two_devices_two_takes() {
         return; // no audio server: skip
     };
 
-    struct Cst {
-        out: Port<AudioOut>,
-        val: Arc<AtomicU32>,
-    }
-    impl ProcessHandler for Cst {
-        fn process(&mut self, _c: &Client, ps: &ProcessScope) -> Control {
-            let c = f32::from_bits(self.val.load(Ordering::Relaxed));
-            for s in self.out.as_mut_slice(ps) {
-                *s = c;
-            }
-            Control::Continue
-        }
-    }
-
-    // Two constant sources: slot 0 = +0.25, slot 1 = -0.5 (distinct so a
-    // summed take could never pass for either).
-    let (ca, _s1) =
-        Client::new("v172srcA", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let oa = ca.register_port("out_a", AudioOut::default()).unwrap();
-    let va = Arc::new(AtomicU32::new(0.25f32.to_bits()));
-    let _a = ca.activate_async((), Cst { out: oa, val: va }).unwrap();
-    let (cb, _s2) =
-        Client::new("v172srcB", ClientOptions::NO_START_SERVER).expect("no JACK server");
-    let ob = cb.register_port("out_a", AudioOut::default()).unwrap();
-    let vb = Arc::new(AtomicU32::new((-0.5f32).to_bits()));
-    let _b2 = cb.activate_async((), Cst { out: ob, val: vb }).unwrap();
+    // Two constant sources (fixture-built): slot 0 = +0.25, slot 1 = -0.5
+    // (distinct so a summed take could never pass for either).
+    let a = e2e_capture_src(&b, "v172srcA", 0xA5A5, true, 3);
+    a.const_val.store(0.25f32.to_bits(), Ordering::Relaxed);
+    let bsrc = e2e_capture_src(&b, "v172srcB", 0x5A5A, true, 3);
+    bsrc.const_val.store((-0.5f32).to_bits(), Ordering::Relaxed);
     e2e_apply(
         &b,
-        vec!["v172srcA:out_a".into(), "v172srcB:out_a".into()],
+        vec![
+            format!("{}:out_a", a.src_name),
+            format!("{}:out_a", bsrc.src_name),
+        ],
         vec![],
     );
+    let _keep_a = a.active;
+    let _keep_b = bsrc.active;
 
     b.cmd(Cmd::ToggleRecord { i: 0 });
     std::thread::sleep(Duration::from_millis(400));
