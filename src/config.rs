@@ -763,6 +763,12 @@ pub struct Config {
     /// pitch and the ladder fans out from it; inert at N = 12.
     #[serde(default = "default_edo_root")]
     pub edo_root: u8,
+    /// v172 (card t_7ca820d3, edo-3): EDO -> notation font pack bindings
+    /// (pack = folder or loose font under `<data_dir>/edo-fonts`; see
+    /// `crate::tune`'s pack section). Absent keys — and ALL of 12-EDO —
+    /// render the default v166 labels (Settings ▸ Tuning).
+    #[serde(default)]
+    pub edo_packs: std::collections::BTreeMap<u32, String>,
     /// Number of tracks the program exposes (clamped 1..=16). Per-track
     /// levels and bindings are kept for ALL 16 slots regardless, so raising
     /// the count again restores everything that was configured while a
@@ -945,6 +951,7 @@ impl Default for Config {
             track_bend_ranges: Vec::new(),
             edo_n: crate::tune::EDO_DEFAULT_N,
             edo_root: crate::tune::EDO_DEFAULT_ROOT,
+            edo_packs: std::collections::BTreeMap::new(),
             show_rack: true,
             show_mixer: true,
             mixer_follow_tracks: true,
@@ -2060,5 +2067,21 @@ mod tests {
         assert!(j.contains("\"lane_rm_never_warn\":true"), "the key is written");
         let back: Config = serde_json::from_str(&j).unwrap();
         assert!(back.lane_rm_never_warn, "the choice survives save+reload");
+    }
+
+    #[test]
+    fn v172_cfg_edo_packs_roundtrip_and_legacy_default() {
+        // AC R3 (config layer): the EDO -> pack-name bindings persist with
+        // settings; pre-v172 files (no key) simply have no bindings.
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(legacy.edo_packs.is_empty(), "absence = no pack anywhere");
+        let mut packs = std::collections::BTreeMap::new();
+        packs.insert(24u32, "Half-Tones".to_owned());
+        packs.insert(53u32, "bos-12".to_owned());
+        let c = Config { edo_packs: packs.clone(), ..Config::default() };
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains("\"edo_packs\""), "the key is written");
+        let back: Config = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.edo_packs, packs, "integer keys survive the JSON string-key round-trip");
     }
 }

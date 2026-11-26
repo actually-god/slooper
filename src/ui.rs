@@ -2151,6 +2151,20 @@ pub struct App {
     /// runtime truth), and both persist to Config AND the saved project.
     edo_n: u32,
     edo_root: u8,
+    /// v172 (card t_7ca820d3, edo-3): notation font packs. `edo_packs` =
+    /// persisted EDO -> pack-name bindings (Config mirror);
+    /// `edo_pack_infos` mirrors the tune registry (Settings list);
+    /// `edo_pack_note` carries the last scan's skip lines; the font-gen
+    /// pair (re)installs the egui families from the ui_root top hook.
+    edo_packs: std::collections::BTreeMap<u32, String>,
+    edo_pack_infos: Vec<crate::tune::PackInfo>,
+    edo_pack_note: String,
+    edo_fonts_gen: u64,
+    edo_fonts_installed_gen: u64,
+    /// False on every pass that QUEUED new font definitions (egui applies
+    /// them at the START of the NEXT pass) — pack parts only paint when
+    /// true, so a family-FontId is never referenced one pass early.
+    edo_packs_active: bool,
     /// v23: (id, normalized) lists harvested from synth-binding editor
     /// closures, consumed once by `rebuild_track_synth` (the VST3 patch's
     /// parameter half — chunks alone may omit exactly the moved knobs).
@@ -2328,6 +2342,16 @@ impl App {
         // script host callback and the Settings widgets all read this ONE
         // runtime truth (clamped by tune::set).
         crate::tune::set(cfg.edo_n, cfg.edo_root);
+        // v172 (edo-3): boot-scan the notation font packs and publish the
+        // registry now — the egui families are installed by the ui_root top
+        // hook on the FIRST frame (App::new has no ctx), which runs before
+        // anything can paint a pack family (edo-3 law: install before
+        // publish, per frame).
+        let edo_scan = crate::tune::scan_packs();
+        crate::tune::set_packs(edo_scan.packs.clone());
+        crate::tune::set_pack_bindings(cfg.edo_packs.clone());
+        let edo_pack_note = edo_scan.errors.join("; ");
+        let edo_pack_infos = edo_scan.packs;
         // Effects framework: open (creating/seeding when needed) the folder
         // and compile+load every script; chains rebuild once the engine
         // sample rate is known (Evt::Ready).
@@ -2814,6 +2838,14 @@ impl App {
                 .collect(),
             edo_n: cfg.edo_n.clamp(crate::tune::EDO_MIN, crate::tune::EDO_MAX),
             edo_root: cfg.edo_root,
+            edo_packs: cfg.edo_packs.clone(),
+            edo_pack_infos,
+            edo_pack_note,
+            // Boot scan pending: the first ui_root installs gen 1 (hook
+            // fires when installed != gen), so no manual install here.
+            edo_fonts_gen: 1,
+            edo_fonts_installed_gen: 0,
+            edo_packs_active: false,
             auto_press_pt: None,
             auto_click_pt: None,
             export_fmt: 0,
@@ -6765,6 +6797,7 @@ impl App {
             track_bend_ranges: self.track_bend_range.clone(),
             edo_n: self.edo_n,
             edo_root: self.edo_root,
+            edo_packs: self.edo_packs.clone(),
         }
     }
 
@@ -7001,6 +7034,13 @@ impl App {
             "edo_root" => {
                 self.edo_root = cfg.edo_root;
                 crate::tune::set(self.edo_n, self.edo_root);
+            }
+            // v172 (card t_7ca820d3): font-pack bindings — re-publish the
+            // tune registry lookup (all valid packs are font-installed
+            // already, so no atlas work here).
+            "edo_packs" => {
+                self.edo_packs = cfg.edo_packs.clone();
+                crate::tune::set_pack_bindings(self.edo_packs.clone());
             }
             "n_tracks" => {
                 self.n_tracks = cfg.n_tracks.clamp(1, 16);
@@ -13006,16 +13046,22 @@ impl App {
             } else {
                 let lab = crate::tune::label(edo_n, edo_root, n.clamp(0, 127) as u8);
                 if lab.anchor || roll.row_h >= 6.0 {
-                    painter.text(
+                    // v172: paint through the single EDO-label seam (a
+                    // bound font pack composes glyph parts there; the
+                    // anchor/intermediate tint stays the v166 law).
+                    let col = if lab.anchor {
+                        Color32::from_gray(225)
+                    } else {
+                        crate::kit::MUTED
+                    };
+                    paint_edo_label(
+                        &painter,
                         egui::pos2(rect.min.x + 4.0, y + roll.row_h * 0.5),
                         egui::Align2::LEFT_CENTER,
-                        lab.text,
-                        egui::FontId::proportional(8.0),
-                        if lab.anchor {
-                            Color32::from_gray(225)
-                        } else {
-                            crate::kit::MUTED
-                        },
+                        &lab,
+                        8.0,
+                        col,
+                        self.edo_packs_active,
                     );
                 }
             }
@@ -16040,17 +16086,21 @@ impl App {
                 if wn.is_multiple_of(12) {
                     // edo-2: label via the single home — standard C names
                     // where the step anchors, relative+dims otherwise.
+                    // v172: paint via the single seam (font-pack aware).
                     let lab = crate::tune::label_live(wn);
-                    ui.painter().text(
+                    let col = if lab.anchor {
+                        egui::Color32::from_gray(60)
+                    } else {
+                        crate::kit::MUTED
+                    };
+                    paint_edo_label(
+                        ui.painter(),
                         egui::pos2(x + 2.0, kr.max.y - 4.0),
                         egui::Align2::LEFT_BOTTOM,
-                        lab.text,
-                        egui::FontId::proportional(8.0),
-                        if lab.anchor {
-                            egui::Color32::from_gray(60)
-                        } else {
-                            crate::kit::MUTED
-                        },
+                        &lab,
+                        8.0,
+                        col,
+                        self.edo_packs_active,
                     );
                 }
             }
@@ -19511,6 +19561,116 @@ impl App {
     }
 }
 
+/// v172 (edo-3, card t_7ca820d3): merge the validated notation font packs
+/// into egui's font definitions. Each pack becomes a STANDALONE named
+/// family (never appended to Proportional — that would make the pack font
+/// the global fallback). The bytes have already passed the exact skrifa
+/// parse epaint performs (`tune::validate_font_bytes`), so this can never
+/// trip egui's `Error parsing … font file` panic; and because every pack
+/// in the tune registry passes through here FIRST, a registry family is
+/// always a bound family (egui's other font panic, `not bound to any
+/// fonts`, is unreachable by construction — see the edo-3 law block).
+fn apply_edo_fonts(ctx: &egui::Context, packs: &[crate::tune::PackInfo]) {
+    let mut fd = egui::FontDefinitions::default();
+    for p in packs {
+        let family = egui::FontFamily::Name(p.family.clone().into());
+        fd.font_data.insert(
+            p.family.clone(),
+            std::sync::Arc::new(egui::FontData::from_owned(p.font_bytes.clone())),
+        );
+        // 0.36 shape: family -> list of font_data KEYS (strings).
+        fd.families.insert(family, vec![p.family.clone()]);
+    }
+    ctx.set_fonts(fd);
+}
+
+/// v172 (edo-3): re-read `<data_dir>/edo-fonts` and publish — fonts FIRST
+/// into egui, then the tune registry (the edo-3 ordering law), so a
+/// family-FontId can never be referenced before it exists. Status echo:
+/// loaded count plus the first skip reason (a bad file is never fatal).
+fn rescan_edo_packs(app: &mut App, ctx: &egui::Context) {
+    let scan = crate::tune::scan_packs();
+    apply_edo_fonts(ctx, &scan.packs);
+    crate::tune::set_packs(scan.packs.clone());
+    app.edo_pack_infos = scan.packs;
+    app.edo_fonts_gen = app.edo_fonts_gen.wrapping_add(1);
+    app.edo_fonts_installed_gen = app.edo_fonts_gen;
+    app.edo_pack_note = scan.errors.join("; ");
+    let loaded = app.edo_pack_infos.len();
+    let skipped = scan.errors.len();
+    app.status = if skipped == 0 {
+        format!("edo packs: {loaded} loaded \u{2014} bind one to a non-12 EDO in Settings")
+    } else {
+        format!("edo packs: {loaded} loaded, {skipped} skipped \u{2014} {}", scan.errors[0])
+    };
+}
+
+/// v172 (edo-3): the ONE paint seam for EDO key-row labels — piano-roll
+/// rows and the sampler-map strip go through here, so pack composition
+/// exists exactly once. All NAMING comes from the tune label home (`lab`);
+/// this function only draws: default text in the default family, or the
+/// pack composition (base name in the default family, then the glyph —
+/// or the whole label — in the pack family). Call sites keep computing the
+/// v166 brightness/MUTED tint so the paint decisions stay local.
+fn paint_edo_label(
+    p: &egui::Painter,
+    pos: egui::Pos2,
+    align: egui::Align2,
+    lab: &crate::tune::NoteLabel,
+    size: f32,
+    color: egui::Color32,
+    packs_ready: bool,
+) {
+    // Until the queued font definitions activate (one pass, see the
+    // ui_root hook), pack families do not exist yet — paint the default
+    // spelling instead of referencing an unbound family.
+    let pack = if packs_ready { lab.pack.as_ref() } else { None };
+    match pack {
+        Some(crate::tune::PackPart::Glyph { base, glyph, family }) => {
+            let fid = egui::FontId {
+                size,
+                family: egui::FontFamily::Proportional,
+            };
+            let w = p.layout_no_wrap(base.clone(), fid.clone(), color).size().x;
+            p.text(pos, align, base.clone(), fid, color);
+            p.text(
+                egui::pos2(pos.x + w, pos.y),
+                align,
+                glyph.clone(),
+                egui::FontId {
+                    size,
+                    family: egui::FontFamily::Name(family.clone().into()),
+                },
+                color,
+            );
+        }
+        Some(crate::tune::PackPart::Whole { text, family }) => {
+            p.text(
+                pos,
+                align,
+                text.clone(),
+                egui::FontId {
+                    size,
+                    family: egui::FontFamily::Name(family.clone().into()),
+                },
+                color,
+            );
+        }
+        None => {
+            p.text(
+                pos,
+                align,
+                lab.text.clone(),
+                egui::FontId {
+                    size,
+                    family: egui::FontFamily::Proportional,
+                },
+                color,
+            );
+        }
+    }
+}
+
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         // W8b (Windows): remember the main window's HWND — this thread
@@ -19745,6 +19905,17 @@ impl App {
     /// headless tests can drive the real widget tree (panels, DnD, mixer)
     /// through `egui::Context::run` without an eframe frame.
     pub fn ui_root(&mut self, ui: &mut egui::Ui) {
+        // v172 (edo-3): install pending notation font packs BEFORE anything
+        // in this frame can lay out text — a pack family FontId may only be
+        // referenced once egui knows the family (edo-3 ordering law; both
+        // publish points keep this hook as the single install seam).
+        if self.edo_fonts_gen != self.edo_fonts_installed_gen {
+            self.edo_fonts_installed_gen = self.edo_fonts_gen;
+            self.edo_packs_active = false; // queued definitions activate at the START of the next pass
+            apply_edo_fonts(ui.ctx(), &self.edo_pack_infos);
+        } else {
+            self.edo_packs_active = true;
+        }
         // v39: FREEZE wheel-scroll while a context menu is open. The
         // reported symptom: right-click a volume slider (the value menu
         // appears), wheel over the panel → the panel scrolls out from
@@ -32608,7 +32779,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 ui,
                 &app.sett_filter,
                 "Tuning",
-                "tuning edo microtonal divisions octave root scale",
+                "tuning edo microtonal divisions octave root scale font pack notation glyph",
             ) {
                 any = true;
                 let n_before = app.edo_n;
@@ -32664,6 +32835,110 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                         .small(),
                     );
                 }
+                // v172 (card t_7ca820d3, edo-3): bind a notation font pack
+                // to THIS EDO. Packs are folders (font + optional pack.toml)
+                // or loose fonts under <data-dir>/edo-fonts; the pack paints
+                // its glyphs for intermediate steps, anchors and unbound
+                // EDOs keep the default names (label home: crate::tune).
+                let bound_now = app.edo_packs.get(&app.edo_n).cloned();
+                let pack_infos = app.edo_pack_infos.clone();
+                let mut pack_pick: Option<Option<String>> = None;
+                ui.horizontal(|ui| {
+                    ui.label("notation font pack:");
+                    egui::ComboBox::from_id_salt("edo_pack_pick")
+                        .selected_text(bound_now.clone().unwrap_or_else(|| "(default)".to_owned()))
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(bound_now.is_none(), "(default) \u{2014} text labels")
+                                .clicked()
+                            {
+                                pack_pick = Some(None);
+                            }
+                            for p in &pack_infos {
+                                let gw = if p.glyphs.len() == 1 { "glyph" } else { "glyphs" };
+                                let meta = if let Some(h) = p.edo_hint {
+                                    format!("{} {gw} \u{00b7} for {h}-EDO", p.glyphs.len())
+                                } else if p.glyphs.is_empty() {
+                                    "whole-label font".to_owned()
+                                } else {
+                                    format!("{} {gw}", p.glyphs.len())
+                                };
+                                let txt = format!("{} \u{00b7} {}", p.name, meta);
+                                if ui
+                                    .selectable_label(bound_now.as_deref() == Some(p.name.as_str()), txt)
+                                    .clicked()
+                                {
+                                    pack_pick = Some(Some(p.name.clone()));
+                                }
+                            }
+                        });
+                    if ui
+                        .button("rescan packs")
+                        .on_hover_text(
+                            "re-read <data-dir>/edo-fonts: one folder per pack \
+                             (a .ttf/.otf/.ttc font + optional pack.toml glyph table) \
+                             or a loose font file; bindings are kept by name",
+                        )
+                        .clicked()
+                    {
+                        rescan_edo_packs(app, ui.ctx());
+                    }
+                });
+                if let Some(pick) = pack_pick {
+                    match pick {
+                        Some(name) => {
+                            app.edo_packs.insert(app.edo_n, name);
+                        }
+                        None => {
+                            app.edo_packs.remove(&app.edo_n);
+                        }
+                    }
+                    crate::tune::set_pack_bindings(app.edo_packs.clone());
+                    app.save_config();
+                    app.status = match app.edo_packs.get(&app.edo_n) {
+                        Some(name) => {
+                            let g = app
+                                .edo_pack_infos
+                                .iter()
+                                .find(|pi| &pi.name == name)
+                                .map_or(0usize, |pi| pi.glyphs.len());
+                            let gw = if g == 1 { "glyph" } else { "glyphs" };
+                            format!(
+                                "edo pack '{name}' bound to {}-EDO ({g} {gw}) \u{2014} saved",
+                                app.edo_n
+                            )
+                        }
+                        None => format!(
+                            "edo pack: default labels restored for {}-EDO \u{2014} saved",
+                            app.edo_n
+                        ),
+                    };
+                }
+                ui.horizontal(|ui| {
+                    if let Some(b) = app.edo_packs.get(&app.edo_n) {
+                        if !app.edo_pack_infos.iter().any(|p| &p.name == b) {
+                            ui.label(
+                                RichText::new(
+                                    "bound pack not found on disk \u{2014} default labels",
+                                )
+                                .weak()
+                                .small(),
+                            );
+                        }
+                    }
+                });
+                if !app.edo_pack_note.is_empty() {
+                    ui.label(RichText::new(format!("pack scan: {}", app.edo_pack_note)).weak().small());
+                }
+                ui.label(
+                    RichText::new(
+                        "a pack paints its glyphs for the intermediate steps of this \
+                         EDO; standard anchor names and every unbound EDO keep the \
+                         default text labels",
+                    )
+                    .weak()
+                    .small(),
+                );
                 if app.edo_n != n_before || app.edo_root != root_before {
                     app.edo_n = app.edo_n.clamp(crate::tune::EDO_MIN, crate::tune::EDO_MAX);
                     crate::tune::set(app.edo_n, app.edo_root);
@@ -66169,5 +66444,317 @@ mod tests {
                 .any(|l| l.trim_start().starts_with(concat!("app.request_lane_remo", "val("))),
             "the strip minus-button must live-call the gate seam"
         );
+    }
+
+    // ============ v172 (card t_7ca820d3, edo-3): notation font packs ============
+    //
+    // User font packs under <data-dir>/edo-fonts bind per EDO; the label
+    // home (tune.rs) composes pack parts and ONE paint seam draws them.
+    // Pins drive the real Settings widgets (rescan button, pack ComboBox)
+    // and the real roll paint; every scenario writes its own DATA_DIR
+    // fixtures, so the same code paths run on the Windows runner.
+
+    /// Real egui-parseable font bytes (the default Hack face) — fixtures
+    /// the scanner's skrifa gate ACCEPTS, on any OS.
+    fn v172_real_font() -> Vec<u8> {
+        let fd = egui::FontDefinitions::default();
+        fd.font_data["Hack"].font.to_vec()
+    }
+
+    /// Write a `half` pack fixture under the headless app's DATA_DIR
+    /// (the exact user gesture: drop a folder into edo-fonts).
+    fn v172_write_half_pack() {
+        let dir = crate::paths::data_dir().join("edo-fonts").join("half");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("font.ttf"), v172_real_font()).unwrap();
+        std::fs::write(dir.join("pack.toml"), "edo = 24\nglyph = 50 \u{03A6}\n").unwrap();
+    }
+
+    /// Registry wipe for the ui pins (the suite shares one process).
+    fn v172_registry_reset() {
+        crate::tune::set_packs(vec![]);
+        crate::tune::set_pack_bindings(std::collections::BTreeMap::new());
+    }
+
+    fn v172_click(app: &mut App, ctx: &egui::Context, at: egui::Pos2) {
+        frame(app, ctx, vec![btn(at, egui::PointerButton::Primary, true)]);
+        frame(app, ctx, vec![btn(at, egui::PointerButton::Primary, false)]);
+    }
+
+    /// Painted (text, font-family) pairs — the pack-family identity probe.
+    fn v172_text_families(app: &mut App, ctx: &egui::Context) -> Vec<(String, String)> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let v: Vec<(String, String)> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Text(t) => t.galley.job.sections.first().map(|s| {
+                    let fam = match &s.format.font_id.family {
+                        egui::FontFamily::Name(n) => n.to_string(),
+                        other => format!("{other:?}"),
+                    };
+                    (t.galley.text().trim().to_string(), fam)
+                }),
+                _ => None,
+            })
+            .collect();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        v
+    }
+
+    #[test]
+    fn v172_settings_pack_row_paints() {
+        // The row exists under the Tuning filter with its (default)
+        // selector, a rescan button, and the honest explanation; the pack
+        // home resolves through the DATA_DIR helpers (R3 parity shape).
+        let mut app = headless_app("v172row");
+        v172_registry_reset();
+        app.show_settings = true;
+        app.sett_filter = "tuning".into();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(galley_at(&mut app, &ctx, "notation font pack:").is_some());
+        assert!(galley_at(&mut app, &ctx, "rescan packs").is_some());
+        assert!(galley_at(&mut app, &ctx, "(default)").is_some());
+        assert!(galley_at(
+            &mut app,
+            &ctx,
+            "a pack paints its glyphs for the intermediate steps of this"
+        )
+        .is_some());
+        // R3: the scan root rides the DATA_DIR seam headless_app pins.
+        assert!(crate::tune::packs_dir()
+            .starts_with(std::env::temp_dir().join("sp-uity-v172row")));
+        v172_registry_reset();
+    }
+
+    #[test]
+    fn v172_settings_rescan_then_bind_via_combo() {
+        // THE acceptance gesture, through real widgets: drop the pack on
+        // disk -> rescan click -> ComboBox pick -> registry + Config +
+        // status echo. (Unbinding's paint effect is pinned by
+        // v172_roll_pack_glyph_paints; the mcp arm by
+        // v172_mcp_apply_and_clear_edo_packs.)
+        let mut app = headless_app("v172cmb");
+        v172_registry_reset();
+        v172_write_half_pack();
+        app.edo_n = 24;
+        app.show_settings = true;
+        app.sett_filter = "tuning".into();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        // The app booted BEFORE the fixture existed: a rescan finds it.
+        let at = galley_at(&mut app, &ctx, "rescan packs").expect("rescan button");
+        v172_click(&mut app, &ctx, at.center());
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.status.contains("edo packs: 1 loaded"), "{}", app.status);
+        assert!(app.edo_pack_note.is_empty(), "clean scan note: {:?}", app.edo_pack_note);
+        // Open the selector (first and only popup open this session),
+        // pick the pack: its item spells name + glyph count + EDO hint.
+        let at = galley_at(&mut app, &ctx, "(default)").expect("combo anchor");
+        v172_click(&mut app, &ctx, at.center());
+        frame(&mut app, &ctx, vec![]);
+        let at = galley_at_last(&mut app, &ctx, "half \u{00b7} 1 glyph \u{00b7} for 24-EDO")
+            .expect("pack item (name, glyph count, hint)");
+        v172_click(&mut app, &ctx, at.center());
+        frame(&mut app, &ctx, vec![]);
+        let want: std::collections::BTreeMap<u32, String> =
+            [(24u32, "half".to_string())].into_iter().collect();
+        assert_eq!(crate::tune::pack_bindings(), want, "registry bound live");
+        assert_eq!(app.edo_packs, want, "app mirror bound");
+        assert!(app.status.contains("bound to 24-EDO (1 glyph)"), "{}", app.status);
+        assert!(!app.status.contains('\u{03A6}'), "echoes carry NO pack glyphs: {}", app.status);
+        // Persisted with settings (the real config.json).
+        let cfg_src = std::fs::read_to_string(crate::config::Config::path()).unwrap();
+        assert!(cfg_src.contains("\"edo_packs\"") && cfg_src.contains("half"), "{cfg_src}");
+        v172_registry_reset();
+    }
+
+    #[test]
+    fn v172_roll_pack_glyph_paints_and_unbind_restores() {
+        // AC R1 paint half: with the pack bound, the 24-EDO intermediate
+        // row paints the PACK GLYPH in the pack FAMILY (MUTED like the
+        // v166 intermediate it replaces) and the default "C4+50c" text is
+        // GONE; unbinding brings it straight back. Roll via v166_open_roll.
+        let (mut app, ctx) = v166_open_roll("v172roll");
+        v172_registry_reset();
+        let back = crate::tune::get();
+        crate::tune::set(24, 60);
+        let info = crate::tune::PackInfo {
+            name: "half".into(),
+            family: crate::tune::pack_family_name("half"),
+            edo_hint: Some(24),
+            glyphs: [(50i64, "\u{03A6}".to_string())].into_iter().collect(),
+            font_bytes: v172_real_font(),
+        };
+        // Publish through the prod order: infos + fonts gen bump FIRST,
+        // then the registry — the ui_root hook installs before this frame
+        // paints anything.
+        app.edo_pack_infos = vec![info.clone()];
+        app.edo_fonts_gen += 1;
+        crate::tune::set_packs(vec![info]);
+        crate::tune::set_pack_bindings([(24u32, "half".to_string())].into_iter().collect());
+        frame(&mut app, &ctx, vec![]);
+        let items = v166_text_colors(&mut app, &ctx);
+        let fams = v172_text_families(&mut app, &ctx);
+        let has = |s: &str, c: egui::Color32| items.iter().any(|(t, x)| t == s && *x == c);
+        let mut muted = false;
+        for (t, f) in &fams {
+            if t == "\u{03A6}" {
+                assert_eq!(f, "slooper-edo-half", "glyph painted in the PACK family");
+                muted = true;
+            }
+        }
+        assert!(muted, "pack glyph painted at all: {fams:?}");
+        assert!(has("\u{03A6}", crate::kit::MUTED), "glyph keeps the intermediate MUTED tint");
+        assert!(has("C4", crate::kit::MUTED), "composed base name (row k61)");
+        assert!(has("C4", egui::Color32::from_gray(225)), "the real C4 anchor row still paints");
+        assert!(!items.iter().any(|(t, _)| t == "C4+50c"), "default text replaced while bound");
+        // Unbind: the default v166 spelling returns, family paint gone.
+        crate::tune::set_pack_bindings(std::collections::BTreeMap::new());
+        frame(&mut app, &ctx, vec![]);
+        let items = v166_text_colors(&mut app, &ctx);
+        assert!(items.iter().any(|(t, c)| t == "C4+50c" && *c == crate::kit::MUTED),
+            "default label restored: {:?}", v166_labelish(&items));
+        assert!(!items.iter().any(|(t, _)| t == "\u{03A6}"), "glyph gone after unbind");
+        crate::tune::set(back.0, back.1);
+        v172_registry_reset();
+    }
+
+    #[test]
+    fn v172_malformed_pack_rescan_echoes_and_never_panics() {
+        // AC R2: a garbage font file under edo-fonts is SKIPPED with an
+        // echo line (settings note + status), never reaches the registry,
+        // and a binding that names it falls back to default labels.
+        let mut app = headless_app("v172bad");
+        v172_registry_reset();
+        let dir = crate::paths::data_dir().join("edo-fonts").join("broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("evil.ttf"), vec![0xABu8; 4096]).unwrap();
+        app.show_settings = true;
+        app.sett_filter = "tuning".into();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let at = galley_at(&mut app, &ctx, "rescan packs").expect("rescan button");
+        v172_click(&mut app, &ctx, at.center());
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.status.contains("1 skipped") && app.status.contains("broken"),
+            "status echo names the skip: {}", app.status);
+        assert!(app.edo_pack_note.contains("rejected"), "scan note: {}", app.edo_pack_note);
+        assert!(crate::tune::packs().is_empty(), "rejected font never reaches the registry");
+        // A binding that names the broken pack degrades to defaults.
+        crate::tune::set_pack_bindings([(24u32, "broken".to_string())].into_iter().collect());
+        assert!(crate::tune::label(24, 60, 61).pack.is_none());
+        assert_eq!(crate::tune::label(24, 60, 61).text, "C4+50c");
+        // The settings row says so out loud on the next paint — and only
+        // for the EDO the row currently shows (bind key = app.edo_n).
+        app.edo_n = 24;
+        frame(&mut app, &ctx, vec![]);
+        // (edits land via mcp so app.edo_packs mirrors, like any live path)
+        let mut cfg = app.config_snapshot();
+        cfg.edo_packs = [(24u32, "broken".to_string())].into_iter().collect();
+        app.mcp_apply_setting("edo_packs", &cfg).expect("edo_packs is live-listed");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at(&mut app, &ctx, "bound pack not found on disk").is_some(),
+            "missing bound pack echoes in Settings"
+        );
+        v172_registry_reset();
+    }
+
+    #[test]
+    fn v172_mcp_apply_and_clear_edo_packs() {
+        // The MCP/apply seam is the SAME truth as the widgets: applying
+        // bindings republishes the tune registry (live-listed), clearing
+        // them restores the default label law.
+        let mut app = headless_app("v172mcp");
+        v172_registry_reset();
+        let mut cfg = app.config_snapshot();
+        cfg.edo_packs = [(24u32, "ghost".to_string())].into_iter().collect();
+        app.mcp_apply_setting("edo_packs", &cfg).expect("edo_packs is live-listed");
+        assert_eq!(
+            crate::tune::pack_bindings(),
+            cfg.edo_packs,
+            "registry republished"
+        );
+        assert_eq!(app.edo_packs, cfg.edo_packs, "app mirror synced");
+        cfg.edo_packs.clear();
+        app.mcp_apply_setting("edo_packs", &cfg).unwrap();
+        assert!(crate::tune::pack_bindings().is_empty());
+        v172_registry_reset();
+    }
+
+    #[test]
+    fn v172_single_home_pack_source_scan() {
+        // v172 completeness audit (v54/v166 pattern): ONE paint seam for
+        // EDO labels, pack-part CONSTRUCTION only in the tune home, the
+        // scan home only via the paths helpers. Split literals per the
+        // source-pin self-match law.
+        let ui_src = include_str!("ui.rs");
+        let tune_src = include_str!("tune.rs");
+        let midi_src = include_str!("midi.rs");
+        // The CONSTRUCTION law covers the PRODUCTION span only (the tune
+        // test module legitimately matches the enum in its own pins).
+        let tune_prod = &tune_src[..tune_src.find("#[cfg(test)]").expect("test mod marker")];
+        let seam = concat!("paint_edo_", "label(");
+        assert_eq!(
+            ui_src.matches(seam).count(),
+            3,
+            "exactly one fn + two call sites (roll + smap strip)"
+        );
+        // ui.rs may CONSUME the pack type only at the seam's two match
+        // arms; CONSTRUCTION (the unqualified shape the home uses) is a
+        // fork. Split literals per the self-match law.
+        let qualified = concat!("crate::tune::Pack", "Part::");
+        assert_eq!(
+            ui_src.matches(qualified).count(),
+            2,
+            "the seam consumes the pack parts at exactly its two match arms"
+        );
+        assert!(
+            !ui_src.contains(concat!("Some(", "PackPart::")),
+            "pack parts must not be CONSTRUCTED in ui.rs"
+        );
+        assert!(!midi_src.contains("PackPart"), "midi.rs must not touch pack parts");
+        assert_eq!(
+            tune_prod.matches(concat!("Some(PackPart", "::")).count(),
+            2,
+            "the home constructs exactly Glyph + Whole (once, in the lookup)"
+        );
+        // Both EDO surfaces paint through the seam.
+        let grab = |src: &str, a: &str, b: &str| -> String {
+            let i = src.find(a).expect("anchor a");
+            let j = i + src[i..].find(b).expect("anchor b");
+            src[i..j].to_string()
+        };
+        let roll = grab(
+            ui_src,
+            "let (edo_n, edo_root) = crate::tune::get();",
+            "// pattern end + playhead",
+        );
+        assert!(roll.contains(seam), "roll rows paint via the seam");
+        let strip = grab(ui_src, "let lab = crate::tune::label_live(wn);", "// Black keys straddle");
+        assert!(strip.contains(seam), "smap strip paints via the seam");
+        // R3: discovery resolves ONLY through the paths home (no XDG/HOME
+        // forks in the tune scanner) and through the skrifa load gate.
+        assert!(tune_src.contains("crate::paths::data_dir().join(PACKS_DIR)"));
+        assert!(!tune_src.contains(concat!("XDG_", "DATA_HOME")), "no path-resolution fork in tune.rs");
+        assert!(!tune_src.contains(concat!("HOME", "_DIR")), "no home literal in tune.rs");
+        let skrifa_gate = concat!("skrifa::FontRef::from", "_index");
+        assert!(tune_src.contains(skrifa_gate), "the scanner validates with egui's own parser");
+        // v108 parity: the new Config field is classified LIVE.
+        assert!(include_str!("mcp_settings/mod.rs").contains("\"edo_packs\""));
     }
 }

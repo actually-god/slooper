@@ -35,7 +35,10 @@
 //! Persistence lives in Config/Project (`edo_n`/`edo_root`); whoever loads
 //! state calls [`set`] — the atomics are the single runtime truth.
 
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::RwLock;
 
 /// Inclusive clamp bounds for the divisions-per-octave setting.
 pub const EDO_MIN: u32 = 1;
@@ -136,11 +139,38 @@ pub fn std_name(midi: i32) -> String {
 pub struct NoteLabel {
     /// Anchor: the standard name (`"C#4"`); intermediate: the nearest
     /// standard name plus an explicit-signed residual in cents
-    /// (`"C4+50c"`).
+    /// (`"C4+50c"`). Always the DEFAULT naming — status/MIDI echoes read
+    /// this even when a font pack decorates the painted rows.
     pub text: String,
     /// True when the step's pitch is an exact integer number of semitones
     /// from A4 — i.e. it coincides with the 12-EDO row the name says.
     pub anchor: bool,
+    /// v172 (edo-3, card t_7ca820d3): the font-pack decoration for this
+    /// step, `Some` only when a pack is bound to this EDO and the step is
+    /// an intermediate. Painted surfaces compose it; text-only consumers
+    /// keep using [`Self::text`] (the pack NEVER rewrites the default).
+    pub pack: Option<PackPart>,
+}
+
+/// v172 (edo-3, card t_7ca820d3): how a bound notation font pack decorates
+/// one intermediate label. Anchors NEVER get a pack part — the standard
+/// names are the pack-free floor of the notation (the manifest keys glyph
+/// tables by residual cents, and an anchor's cents is 0 by law).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackPart {
+    /// The pack's manifest has a glyph for this step's residual cents:
+    /// paint `base` (the standard nearest-row name, e.g. `"C4"`) in the
+    /// default family, then `glyph` in family `family` (e.g. a half-sharp
+    /// sign). The `+50c` text suffix is REPLACED by the glyph.
+    Glyph {
+        base: String,
+        glyph: String,
+        family: String,
+    },
+    /// The bound pack ships NO manifest glyph table: paint the whole
+    /// default text `text` in family `family` (fonts that re-draw the
+    /// digits and signs of the plain `C4+50c` spelling).
+    Whole { text: String, family: String },
 }
 
 /// Anchor law: key `k` lands on an exact 12-EDO row iff its EDO offset from
@@ -173,9 +203,10 @@ pub fn label(n: u32, root: u8, k: u8) -> NoteLabel {
         return NoteLabel {
             text: std_name(tk.round() as i32 + 69),
             anchor: true,
+            pack: None,
         };
     }
-    nearest_row_label(tk)
+    nearest_row_label(n, tk)
 }
 
 /// The label for an ARBITRARY sounding pitch in semitones-relative-to-A4:
@@ -185,7 +216,7 @@ pub fn label(n: u32, root: u8, k: u8) -> NoteLabel {
 /// A pitch that lands (after cent-rounding) on a standard row reads as
 /// the plain anchor name. Shared by [`label`]'s intermediate path and the
 /// v168 continuous-pitch labelers — ONE tie law in the repo.
-fn nearest_row_label(tk: f64) -> NoteLabel {
+fn nearest_row_label(n: u32, tk: f64) -> NoteLabel {
     // f64 equality is safe here: a true tie is a binary-exact .5, and no
     // true non-tie is within 1e-12 of one for n ≤ 128 (and mouse-derived
     // curve cents are never expected to fabricate an exact .5).
@@ -199,12 +230,13 @@ fn nearest_row_label(tk: f64) -> NoteLabel {
         return NoteLabel {
             text: std_name(nearest as i32 + 69),
             anchor: true,
+            pack: None,
         };
     }
-    NoteLabel {
-        text: format!("{}{:+}c", std_name(nearest as i32 + 69), cents),
-        anchor: false,
-    }
+    let name = std_name(nearest as i32 + 69);
+    let text = format!("{name}{cents:+}c");
+    let pack = pack_part_for(n, cents, &name, &text);
+    NoteLabel { text, anchor: false, pack }
 }
 
 /// [`label`] at the live tuning (the packed atomic).
@@ -236,7 +268,7 @@ pub fn label_text_live(k: u8) -> String {
 /// matches_label`).
 #[inline]
 pub fn label_pitch(n: u32, root: u8, k: i32, cents_off: f32) -> NoteLabel {
-    nearest_row_label(key(n, root, k) + f64::from(cents_off) / 100.0)
+    nearest_row_label(n, key(n, root, k) + f64::from(cents_off) / 100.0)
 }
 
 /// [`label_pitch`] at the live tuning (the packed atomic).
@@ -250,6 +282,347 @@ pub fn label_pitch_live(k: i32, cents_off: f32) -> NoteLabel {
 #[inline]
 pub fn label_pitch_text_live(k: i32, cents_off: f32) -> String {
     label_pitch_live(k, cents_off).text
+}
+
+// ---------------------------------------------------------------------------
+// edo-3 (v172, card t_7ca820d3): NOTATION FONT PACKS — user fonts bound per
+// EDO number. A pack is a folder (or a loose font file) under
+// `<data_dir>/edo-fonts/` (paths::data_dir — the DATA_DIR parity home, so
+// `%LOCALAPPDATA%\slooper\edo-fonts` on Windows): a .ttf/.otf/.ttc font plus
+// an OPTIONAL `pack.toml` manifest (tiny key=value subset — the repo carries
+// no TOML crate; see [`parse_pack_manifest`]).
+//
+// Law, in order:
+// * A pack's font bytes are validated with the EXACT parser egui builds its
+//   atlas with (`skrifa::FontRef::from_index`, epaint 0.36) — egui PANICS on
+//   undecodable FontData, so anything the scanner accepts structurally
+//   cannot panic the atlas; anything it rejects degrades to a status echo.
+// * The registry here is the runtime truth (the packed TUNE atomic's
+//   pattern): consumers never re-read the disk. Config owns persistence.
+// * Callers MUST install the egui families (ctx.set_fonts) BEFORE publishing
+//   a pack here — an unbound family FontId is an egui-internal panic
+//   (`FontFamily::... is not bound to any fonts`). ui.rs enforces the order
+//   at both publish points (first-frame hook, settings rescan).
+// * Only intermediates get decorated; the default `NoteLabel::text` is
+//   NEVER rewritten, so echoes and every non-bound EDO keep v166 names.
+// ---------------------------------------------------------------------------
+
+/// A discovered, font-validated notation pack (see the module's edo-3 law).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackInfo {
+    /// Display/binding name: the pack folder name, or a loose font file's
+    /// stem. Unique inside a scan.
+    pub name: String,
+    /// The egui `FontFamily::Name` this pack installs under
+    /// ([`pack_family_name`] of `name`).
+    pub family: String,
+    /// The manifest's `edo = N` suggestion (UI hint only — bindings are
+    /// ALWAYS the user's explicit choice in Settings).
+    pub edo_hint: Option<u32>,
+    /// Residual cents -> glyph string (may be multiple chars). Empty =
+    /// whole-family mode ([`PackPart::Whole`]).
+    pub glyphs: BTreeMap<i64, String>,
+    /// The validated font bytes (installed into egui at publish time).
+    pub font_bytes: Vec<u8>,
+}
+
+/// Result of a pack scan: usable packs plus one line per skipped
+/// candidate (the status echo; a bad file is NEVER fatal).
+#[derive(Clone, Debug, Default)]
+pub struct PackScan {
+    pub packs: Vec<PackInfo>,
+    pub errors: Vec<String>,
+}
+
+/// Registry state (replaced whole on every scan — the disk listing IS the
+/// truth; a failed read is skipped with an echo).
+static PACKS: RwLock<BTreeMap<String, PackInfo>> = RwLock::new(BTreeMap::new());
+/// EDO number -> pack name. Empty key = unbound (v166 default labels).
+static PACK_BINDINGS: RwLock<BTreeMap<u32, String>> = RwLock::new(BTreeMap::new());
+
+/// Poison never panics a paint: the lock bodies are plain data, so the
+/// inner value of a poisoned lock is always still valid to use.
+fn rd<T>(l: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Publish the discovered packs (callers MUST install the egui families
+/// first — see the edo-3 law block above).
+pub fn set_packs(packs: Vec<PackInfo>) {
+    let mut w = PACKS.write().unwrap_or_else(|p| p.into_inner());
+    *w = packs.into_iter().map(|p| (p.name.clone(), p)).collect();
+}
+
+/// The discovered packs, sorted by name.
+pub fn packs() -> Vec<PackInfo> {
+    rd(&PACKS).values().cloned().collect()
+}
+
+/// Publish the EDO -> pack-name bindings (Config is the persistent copy).
+pub fn set_pack_bindings(map: BTreeMap<u32, String>) {
+    let mut w = PACK_BINDINGS.write().unwrap_or_else(|p| p.into_inner());
+    *w = map;
+}
+
+/// The live bindings (UI list, settings echo, pins).
+pub fn pack_bindings() -> BTreeMap<u32, String> {
+    rd(&PACK_BINDINGS).clone()
+}
+
+/// The egui font family a pack name installs under: `slooper-edo-` plus the
+/// name lowercased with non-alphanumerics collapsed to single `-`.
+/// Sanitized names colliding across different pack names is a scan error
+/// (only the first pack with a family survives).
+pub fn pack_family_name(name: &str) -> String {
+    let mut s = String::from("slooper-edo-");
+    let mut prev_dash = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            s.push('-');
+            prev_dash = true;
+        }
+    }
+    s.trim_end_matches('-').to_owned()
+}
+
+/// The pack decoration for ONE intermediate step (called only from the
+/// label builder — the single home). `None` (=> default text) when nothing
+/// is bound to `n`, the bound name is not (or no longer) on disk, or the
+/// pack's glyph table has no entry for these exact cents.
+fn pack_part_for(n: u32, cents: i64, base: &str, text: &str) -> Option<PackPart> {
+    let name = rd(&PACK_BINDINGS).get(&n).cloned()?;
+    let p = rd(&PACKS).get(&name).cloned()?;
+    if p.glyphs.is_empty() {
+        return Some(PackPart::Whole {
+            text: text.to_owned(),
+            family: p.family,
+        });
+    }
+    let glyph = p.glyphs.get(&cents)?.clone();
+    Some(PackPart::Glyph {
+        base: base.to_owned(),
+        glyph,
+        family: p.family,
+    })
+}
+
+/// Folder name under [`crate::paths::data_dir`] holding the notation packs.
+pub const PACKS_DIR: &str = "edo-fonts";
+/// Manifest file name inside a pack folder (optional).
+pub const PACK_MANIFEST: &str = "pack.toml";
+
+/// `<data_dir>/edo-fonts` — chained single-component join (the mixed-
+/// separator Windows law: every app-state-compared path is scan-form).
+pub fn packs_dir() -> PathBuf {
+    crate::paths::data_dir().join(PACKS_DIR)
+}
+
+/// Scan the user pack folder; missing/unreadable folder = EMPTY scan, zero
+/// errors (the default state, not a failure).
+pub fn scan_packs() -> PackScan {
+    scan_packs_at(&packs_dir())
+}
+
+/// The scanner body over an explicit root (pins point this at a sandbox
+/// without touching env). A pack = `<root>/<name>/` with a font file +
+/// optional [`PACK_MANIFEST`], or a loose `<root>/<stem>.<ext>` font file
+/// (stem = name, whole-family mode). Hidden entries are ignored.
+pub fn scan_packs_at(root: &Path) -> PackScan {
+    let mut scan = PackScan::default();
+    let mut map: BTreeMap<String, PackInfo> = BTreeMap::new();
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return scan,
+    };
+    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
+    let mut loose: Vec<PathBuf> = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let p = e.path();
+        if p.is_dir() {
+            dirs.push((name, p));
+        } else if is_font_file(&p) {
+            loose.push(p);
+        }
+    }
+    dirs.sort();
+    for (name, dir) in &dirs {
+        let mut notes: Vec<String> = Vec::new();
+        let mut hint = None;
+        let mut glyphs = BTreeMap::new();
+        let mp = dir.join(PACK_MANIFEST);
+        if mp.is_file() {
+            match std::fs::read_to_string(&mp) {
+                Ok(t) => parse_pack_manifest(&t, &mut hint, &mut glyphs, &mut notes),
+                Err(e) => notes.push(format!("manifest unreadable: {e}")),
+            }
+        }
+        // The font is the alphabetically-first font file in the folder.
+        let mut font: Option<PathBuf> = None;
+        if let Ok(rd2) = std::fs::read_dir(dir) {
+            let mut cands: Vec<PathBuf> = rd2
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && is_font_file(p))
+                .collect();
+            cands.sort();
+            font = cands.into_iter().next();
+        }
+        let Some(fp) = font else {
+            scan.errors.push(format!("pack {name}: no .ttf/.otf/.ttc font file"));
+            scan.errors.extend(notes.iter().map(|n| format!("pack {name}: {n}")));
+            continue;
+        };
+        match std::fs::read(&fp)
+            .map_err(|e| format!("pack {name}: font unreadable: {e}"))
+            .and_then(|b| validate_font_bytes(&b).map_err(|m| format!("pack {name}: {m}")))
+        {
+            Ok(()) => {}
+            Err(msg) => {
+                scan.errors.push(msg);
+                scan.errors.extend(notes.iter().map(|n| format!("pack {name}: {n}")));
+                continue;
+            }
+        }
+        let bytes = std::fs::read(&fp).unwrap_or_default();
+        let fam = pack_family_name(name);
+        if map.contains_key(name) {
+            scan.errors.push(format!("pack {name}: name skipped (duplicate)"));
+        } else if map.values().any(|p| p.family == fam) {
+            scan.errors.push(format!("pack {name}: family {fam} taken by another pack"));
+        } else {
+            map.insert(
+                name.clone(),
+                PackInfo {
+                    name: name.clone(),
+                    family: fam,
+                    edo_hint: hint,
+                    glyphs,
+                    font_bytes: bytes,
+                },
+            );
+        }
+        scan.errors.extend(notes.iter().map(|n| format!("pack {name}: {n}")));
+    }
+    loose.sort();
+    for p in loose {
+        let stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match std::fs::read(&p)
+            .map_err(|e| format!("pack {stem}: font unreadable: {e}"))
+            .and_then(|b| validate_font_bytes(&b).map_err(|m| format!("pack {stem}: {m}")))
+        {
+            Ok(()) => {}
+            Err(msg) => {
+                scan.errors.push(msg);
+                continue;
+            }
+        }
+        let bytes = std::fs::read(&p).unwrap_or_default();
+        let fam = pack_family_name(&stem);
+        if map.contains_key(&stem) {
+            scan.errors.push(format!("pack {stem}: name skipped (duplicate)"));
+        } else if map.values().any(|p| p.family == fam) {
+            scan.errors.push(format!("pack {stem}: family {fam} taken by another pack"));
+        } else {
+            map.insert(
+                stem.clone(),
+                PackInfo {
+                    name: stem,
+                    family: fam,
+                    edo_hint: None,
+                    glyphs: BTreeMap::new(),
+                    font_bytes: bytes,
+                },
+            );
+        }
+    }
+    scan.packs = map.into_values().collect();
+    scan
+}
+
+fn is_font_file(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "ttf" | "otf" | "ttc"))
+}
+
+/// The load gate: parse the font with the SAME skrifa entry point epaint
+/// uses for every FontData (`FontRef::from_index`, panic at fonts.rs:990 on
+/// failure). Accepting here is a proof egui can install the bytes.
+fn validate_font_bytes(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < 32 {
+        return Err("file too small to be a font".to_owned());
+    }
+    skrifa::FontRef::from_index(bytes, 0)
+        .map(|_| ())
+        .map_err(|e| format!("font file rejected by the font engine ({e})"))
+}
+
+/// `pack.toml` parser: a line-based key = value subset (NO TOML crate in the
+/// repo, and nothing here needs more):
+/// * `edo = 24` — the target-EDO suggestion (one u32).
+/// * `glyph = 50 𝄪` — residual cents, then the glyph string to its end
+///   (one pair of surrounding double quotes is stripped). Negative cents
+///   and multi-char glyphs are fine; keys may repeat.
+/// * `#` comments and blank lines are skipped; anything else is a NOTE
+///   (echoed, never fatal) and the line is skipped.
+fn parse_pack_manifest(
+    text: &str,
+    hint: &mut Option<u32>,
+    glyphs: &mut BTreeMap<i64, String>,
+    notes: &mut Vec<String>,
+) {
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let (key, val) = match t.split_once('=') {
+            Some(kv) => kv,
+            None => {
+                notes.push(format!("line {}: expected key = value", i + 1));
+                continue;
+            }
+        };
+        match key.trim().to_ascii_lowercase().as_str() {
+            "edo" => match val.trim().parse::<u32>() {
+                Ok(n) => *hint = Some(n),
+                Err(_) => notes.push(format!("line {}: edo must be a number", i + 1)),
+            },
+            "glyph" => {
+                let v = val.trim();
+                let sp = v.find(char::is_whitespace);
+                let (cs, g) = match sp {
+                    Some(i2) => (&v[..i2], v[i2..].trim()),
+                    None => {
+                        notes.push(format!("line {}: glyph needs '<cents> <chars>'", i + 1));
+                        continue;
+                    }
+                };
+                let g = g
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+                    .unwrap_or(g);
+                match cs.parse::<i64>() {
+                    Ok(c) if !g.is_empty() => {
+                        glyphs.insert(c, g.to_owned());
+                    }
+                    Ok(_) => notes.push(format!("line {}: glyph string is empty", i + 1)),
+                    Err(_) => notes.push(format!("line {}: glyph cents is not a number", i + 1)),
+                }
+            }
+            other => notes.push(format!("line {}: unknown key {other:?}", i + 1)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -583,5 +956,243 @@ mod tests {
         assert_eq!(label_pitch_text_live(61, 0.0), "C4+50c");
         assert!(label_pitch_live(61, 650.0).anchor);
         set(back.0, back.1);
+    }
+
+    // ---- v172 (card t_7ca820d3, edo-3): notation font packs ----
+
+    /// Snapshot/reset guard for the pack registry statics: the suite runs
+    /// ONE process, so leaked bindings would poison the v166 label law.
+    struct PackGuard {
+        packs: Vec<PackInfo>,
+        bindings: BTreeMap<u32, String>,
+    }
+    impl PackGuard {
+        fn new() -> Self {
+            let g = Self {
+                packs: packs(),
+                bindings: pack_bindings(),
+            };
+            set_packs(vec![]);
+            set_pack_bindings(BTreeMap::new());
+            g
+        }
+    }
+    impl Drop for PackGuard {
+        fn drop(&mut self) {
+            set_packs(std::mem::take(&mut self.packs));
+            set_pack_bindings(std::mem::take(&mut self.bindings));
+        }
+    }
+
+    fn v172_pack(name: &str, glyphs: &[(i64, &str)], hint: Option<u32>) -> PackInfo {
+        PackInfo {
+            name: name.to_owned(),
+            family: pack_family_name(name),
+            edo_hint: hint,
+            glyphs: glyphs.iter().map(|(c, g)| (*c, (*g).to_owned())).collect(),
+            // Registry-only pins: bytes never touch egui here.
+            font_bytes: vec![7; 64],
+        }
+    }
+
+    /// Real, egui-parseable font bytes (the default Hack face): scan pins
+    /// must ship files the scanner's skrifa gate ACCEPTS, on any OS.
+    fn v172_real_font() -> Vec<u8> {
+        let fd = egui::FontDefinitions::default();
+        fd.font_data["Hack"].font.to_vec()
+    }
+
+    #[test]
+    fn v172_pack_label_glyph_lookup() {
+        let _g = PackGuard::new();
+        set_packs(vec![v172_pack("half", &[(50, "\u{03A6}")], Some(24))]);
+        set_pack_bindings([
+            (24, "half".to_owned()),
+            (19, "half".to_owned()),
+        ]
+        .into_iter()
+        .collect());
+        let l = label(24, 60, 61);
+        assert_eq!(l.text, "C4+50c", "default text is NEVER rewritten");
+        assert_eq!(
+            l.pack,
+            Some(PackPart::Glyph {
+                base: "C4".to_owned(),
+                glyph: "\u{03A6}".to_owned(),
+                family: "slooper-edo-half".to_owned(),
+            })
+        );
+        // Anchors NEVER get decorated, bound pack or not.
+        assert!(label(24, 60, 60).pack.is_none());
+        assert!(label(24, 60, 62).pack.is_none());
+        // A glyph table keys by the EXACT label cents: 19-EDO steps sit at
+        // -37/+26 (v166 pins), which the table does not carry -> fallback.
+        assert_eq!(label(19, 60, 61).text, "C#4-37c");
+        assert!(label(19, 60, 61).pack.is_none(), "no glyph for -37");
+        // Unbinding restores the default paint decision.
+        set_pack_bindings(BTreeMap::new());
+        assert!(label(24, 60, 61).pack.is_none());
+    }
+
+    #[test]
+    fn v172_pack_label_whole_family_no_manifest() {
+        let _g = PackGuard::new();
+        set_packs(vec![v172_pack("redraw", &[], None)]);
+        set_pack_bindings([(24, "redraw".to_owned())].into_iter().collect());
+        assert_eq!(
+            label(24, 60, 61).pack,
+            Some(PackPart::Whole {
+                text: "C4+50c".to_owned(),
+                family: "slooper-edo-redraw".to_owned(),
+            })
+        );
+        assert!(label(24, 60, 60).pack.is_none(), "anchors stay free");
+    }
+
+    #[test]
+    fn v172_pack_label_stale_binding_falls_back() {
+        // Bound name not in the registry (pack removed from disk / boot
+        // config before rescan): labels degrade to the defaults, no panic.
+        let _g = PackGuard::new();
+        set_packs(vec![]);
+        set_pack_bindings([(24, "ghost".to_owned())].into_iter().collect());
+        assert!(label(24, 60, 61).pack.is_none());
+        assert_eq!(label(24, 60, 61).text, "C4+50c");
+    }
+
+    #[test]
+    fn v172_pack_label_n12_never_decorated() {
+        // 12-EDO is all anchors: binding even a glyph-for-everything pack
+        // decorates NOTHING (the standard keyboard world is pack-free).
+        let _g = PackGuard::new();
+        let all: Vec<(i64, String)> = (0..100)
+            .flat_map(|c| [(c, "x".to_string()), (-c, "y".to_string())])
+            .collect();
+        let mut glyphs = BTreeMap::new();
+        for (c, g) in all {
+            glyphs.insert(c, g);
+        }
+        set_packs(vec![PackInfo {
+            name: "all".into(),
+            family: pack_family_name("all"),
+            edo_hint: None,
+            glyphs,
+            font_bytes: vec![7; 64],
+        }]);
+        set_pack_bindings([(12, "all".to_owned())].into_iter().collect());
+        for k in 0..=127u8 {
+            assert!(label(12, 60, k).pack.is_none(), "N=12 k={k}");
+        }
+    }
+
+    #[test]
+    fn v172_pack_label_pitch_shares_the_law() {
+        // The v168 continuous-pitch builder shares ONE tie/nearest/pack law:
+        // a grid point bends identically to `label`, and a curve point bent
+        // onto the +50 tie takes the LOWER row — whose cents the glyph keys.
+        let _g = PackGuard::new();
+        set_packs(vec![v172_pack("half", &[(50, "\u{03A6}")], None)]);
+        set_pack_bindings([(24, "half".to_owned())].into_iter().collect());
+        assert_eq!(label_pitch(24, 60, 61, 0.0).pack, label(24, 60, 61).pack);
+        let bent = label_pitch(24, 60, 60, -50.0);
+        assert_eq!(bent.text, "B3+50c", "tie goes to the LOWER row (v166 law)");
+        assert_eq!(
+            bent.pack,
+            Some(PackPart::Glyph {
+                base: "B3".to_owned(),
+                glyph: "\u{03A6}".to_owned(),
+                family: "slooper-edo-half".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn v172_pack_family_name_sanitize() {
+        assert_eq!(pack_family_name("Half-Tones X"), "slooper-edo-half-tones-x");
+        assert_eq!(pack_family_name("A  B"), "slooper-edo-a-b");
+        assert_eq!(pack_family_name("!!!"), "slooper-edo");
+        // Non-ASCII names survive as their ASCII skeleton (families are
+        // debuggability aids; the DISPLAY name stays the exact folder name).
+        assert_eq!(pack_family_name("K\u{f6}ln"), "slooper-edo-k-ln");
+    }
+
+    #[test]
+    fn v172_pack_manifest_parser() {
+        let src = "# a comment\n\
+                   edo = 24\n\
+                   glyph = 50 \u{03A6}\n\
+                   glyph =-50 '\u{03A8}'\n\
+                   glyph = 50 \"\u{03A6}2\"\n\
+                   broken line\n\
+                   nope = 3\n\
+                   glyph = 26\n\
+                   glyph = 60 \"\"\n";
+        let mut hint = None;
+        let mut glyphs = BTreeMap::new();
+        let mut notes = Vec::new();
+        parse_pack_manifest(src, &mut hint, &mut glyphs, &mut notes);
+        assert_eq!(hint, Some(24));
+        assert_eq!(glyphs.get(&50).map(String::as_str), Some("\u{03A6}2"), "repeat overwrites");
+        assert_eq!(glyphs.get(&-50).map(String::as_str), Some("'\u{03A8}'"));
+        assert_eq!(glyphs.len(), 2);
+        // Every malformed line is a NOTE (echoed), never a crash: 4 here
+        // (broken line, unknown key, missing glyph chars, empty string).
+        assert_eq!(notes.len(), 4, "notes: {notes:?}");
+    }
+
+    #[test]
+    fn v172_pack_scan_tree_and_malformed() {
+        // The DATA_DIR-shaped sandbox (chained joins, OS-neutral): a good
+        // pack dir (real font + manifest), a loose font file, a folder
+        // without a font, a folder with a REJECTED font, and two names that
+        // sanitize to the same family. The frame never panics and every
+        // skip is one echoed line.
+        let root = std::env::temp_dir().join(format!("v172-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let hack = v172_real_font();
+        let mk = |dir: &str, font: Option<&str>, bytes: &[u8], manifest: Option<&str>| {
+            let d = root.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            if let Some(f) = font {
+                std::fs::write(d.join(f), bytes).unwrap();
+            } else {
+                std::fs::write(d.join("README.md"), b"no font here").unwrap();
+            }
+            if let Some(m) = manifest {
+                std::fs::write(d.join("pack.toml"), m.as_bytes()).unwrap();
+            }
+        };
+        mk("good", Some("font.ttf"), &hack, Some("edo = 24\nglyph = 50 \u{03A6}\n"));
+        mk("nofont", None, &[], None);
+        mk("bad", Some("broken.ttf"), &[0xABu8; 4096], None);
+        mk("sp ace", Some("f.ttf"), &hack, None);
+        mk("sp-ace", Some("f.ttf"), &hack, None);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("loose.ttf"), &hack).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join(".hidden").join("x.ttf"), &hack).unwrap();
+        let scan = scan_packs_at(&root);
+        let names: Vec<&str> = scan.packs.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["good", "loose", "sp ace"], "sorted usable packs: {names:?}, errors: {:?}", scan.errors);
+        let good = scan.packs.iter().find(|p| p.name == "good").unwrap();
+        assert_eq!(good.family, "slooper-edo-good");
+        assert_eq!(good.edo_hint, Some(24));
+        assert_eq!(good.glyphs.get(&50).map(String::as_str), Some("\u{03A6}"));
+        assert_eq!(good.font_bytes, hack, "bytes ride the registry");
+        let loose = scan.packs.iter().find(|p| p.name == "loose").unwrap();
+        assert!(loose.glyphs.is_empty() && loose.edo_hint.is_none(), "loose = whole-family mode");
+        // Three echo classes: missing font, engine-rejected font, and the
+        // family collision — all non-fatal, each names its pack.
+        assert!(scan.errors.iter().any(|e| e.contains("nofont") && e.contains("no .ttf")), "{:?}", scan.errors);
+        assert!(scan.errors.iter().any(|e| e.contains("bad") && e.contains("rejected")), "{:?}", scan.errors);
+        assert!(scan.errors.iter().any(|e| e.contains("sp-ace") && e.contains("family")), "{:?}", scan.errors);
+        assert_eq!(scan.errors.len(), 3, "{:?}", scan.errors);
+        // Idempotent (the disk listing is the truth, order-stable).
+        let again = scan_packs_at(&root);
+        assert_eq!(again.packs, scan.packs);
+        // Missing root = empty quiet scan (the default state).
+        let none = scan_packs_at(&root.join("no-such-dir"));
+        assert!(none.packs.is_empty() && none.errors.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
