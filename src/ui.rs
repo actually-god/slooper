@@ -468,6 +468,16 @@ struct RecSrc {
     auto: bool,
 }
 
+/// v169: a live partial take shown while a take rolls. `at` is the playhead
+/// position the current pass armed at; `frames` the samples captured so far
+/// (deltas appended per `Evt::TakeProgress`; a pass with a different `at` —
+/// loop record — restarts the buffer).
+#[derive(Clone, Default)]
+struct LiveTake {
+    at: u64,
+    frames: Vec<f32>,
+}
+
 /// v0.11 R5: the automation manager window's editing state.
 struct AutoEdit {
     /// Existing asset being edited in place (None = unsaved new curve).
@@ -1897,6 +1907,11 @@ pub struct App {
     auto_rec: Vec<AutoRecState>,
     /// v29: per-track sources armed by the single REC button.
     rec_src: Vec<RecSrc>,
+    /// v169: rolling partial takes — one per track currently recording an
+    /// audio/preview/loop take. Grows from `Evt::TakeProgress` deltas, is
+    /// replaced by the final `Evt::Take` (or dropped by `Evt::TakeDiscarded`),
+    /// and paints as a live "ghost" clip on the track's last lane.
+    live_takes: Vec<Option<LiveTake>>,
     /// v52 R4: tracks joined to the RECORD GROUP, in JOIN ORDER (front =
     /// oldest). The top-bar "REC GROUP" master arms/stops every member at
     /// once; the loop ("l") selector is LINKED across members (a joining
@@ -2607,6 +2622,7 @@ impl App {
             chrome_closing: std::collections::HashSet::new(),
             midi_rec: vec![MidiRecState::default(); MAX_LOOPS],
             auto_rec: vec![AutoRecState::default(); MAX_LOOPS],
+            live_takes: (0..MAX_LOOPS).map(|_| None).collect(),
             rec_src: (0..MAX_LOOPS)
                 .map(|t| {
                     let a = cfg.rec_src.get(t).copied().unwrap_or([true, false, false]);
@@ -8276,9 +8292,8 @@ impl App {
                 start: self.backend.engine.pos(),
                 caps: Vec::new(),
             };
-            if !self.backend.engine.transport_on() {
-                self.backend.cmd(Cmd::PlayAll);
-            }
+            // v169: one transport-start seam for every recorder.
+            self.start_transport_now();
             self.status = format!(
                 "track {}: automation recording \u{2014} MOVE the control you want to capture",
                 i + 1
@@ -11112,9 +11127,10 @@ impl App {
             // v32: the live feed must cover armed tracks (the player hears
             // the take they are laying down) — RT reads this mirror.
             self.backend.engine.set_midi_rec_arm(i, true);
-            if !self.backend.engine.transport_on() {
-                self.backend.cmd(Cmd::PlayAll);
-            }
+            // v169: one transport-start seam for every recorder (was a
+            // Cmd::PlayAll round trip — same engine effect, now synchronous
+            // and headless-observable like the rest of the arm).
+            self.start_transport_now();
             self.status = format!("track {}: MIDI recording…", i + 1);
         }
     }
@@ -17390,6 +17406,27 @@ impl App {
         self.save_config();
     }
 
+    /// v169: start the transport straight from the GUI thread, exactly
+    /// mirroring `Cmd::PlayAll`'s engine semantics (play at/past the end
+    /// restarts at the top; auditions clear before a real take). The engine
+    /// atomics are the single transport truth the GUI mirrors, so a direct
+    /// poke needs no manager round trip — the record buttons arm synchronously
+    /// (v29 doctrine) and the take's `rec_at` snapshot lands on the running
+    /// position. Shared by the audio, MIDI and automation record arms so no
+    /// recorder can drift from the "recording starts playback" contract.
+    fn start_transport_now(&mut self) {
+        if self.sample_rate == 0 || self.backend.engine.transport_on() {
+            return;
+        }
+        let e = &self.backend.engine;
+        if e.pos() >= e.proj_len() {
+            e.seek_to(0);
+        }
+        e.stop_preview();
+        e.stop_audition();
+        e.set_transport(true);
+    }
+
     fn toggle_record(&mut self, i: usize) {
         if self.sample_rate == 0 {
             self.status = "record: wait for the audio engine".into();
@@ -17433,6 +17470,12 @@ impl App {
             );
             return;
         }
+        // v169: recording means playback — the transport starts right now
+        // from the current position (both guards above unchanged). The echo
+        // goes first so the arm paths' own messages ('a' wins / LOOP hint)
+        // still get the last word.
+        self.start_transport_now();
+        self.status = format!("track {}: recording…", i + 1);
         // v42 "p": the preview take rides the SAME take buffer as the audio
         // take — arm it via the engine's preview flag (snapshotted by
         // start_rec). 'a' wins if both are ticked; the clash is announced.
@@ -19036,7 +19079,37 @@ impl App {
                 at,
                 data,
                 preview,
-            } => self.take_pipeline(track, at, data, preview),
+            } => {
+                // v169: the final asset clip replaces the live ghost —
+                // clear BEFORE the pipeline so no frame ever shows both.
+                if let Some(slot) = self.live_takes.get_mut(track) {
+                    *slot = None;
+                }
+                self.take_pipeline(track, at, data, preview);
+            }
+            // v169: live partial take — grow (or restart, on a new pass /
+            // new track) the ghost for this take.
+            Evt::TakeProgress { track, at, frames } => {
+                if let Some(slot) = self.live_takes.get_mut(track) {
+                    match slot.as_mut() {
+                        Some(live) if live.at == at => {
+                            live.frames.extend_from_slice(&frames);
+                        }
+                        _ => {
+                            *slot = Some(LiveTake {
+                                at,
+                                frames: frames.to_vec(),
+                            });
+                        }
+                    }
+                }
+            }
+            // v169: take discarded (empty stop / empty claim) — ghost gone.
+            Evt::TakeDiscarded { track } => {
+                if let Some(slot) = self.live_takes.get_mut(track) {
+                    *slot = None;
+                }
+            }
 
             Evt::Midi(raw) => {
                 if let Some(msg) = MidiMsg::parse(&raw.bytes) {
@@ -28353,6 +28426,77 @@ fn lane_row(
             egui::Stroke::new(2.0, COL_GHOST),
             egui::StrokeKind::Inside,
         );
+    }
+    // v169: live take ghost — a rolling audio/preview/loop take paints on
+    // the track's LAST lane: a red grow-rect whose extent grows with every
+    // Evt::TakeProgress batch, a peak-column waveform, and a "REC s" read.
+    // The final Evt::Take clears the ghost in handle_evt BEFORE take_pipeline
+    // places the real clip, so ghost and result never coexist (and a
+    // discarded take clears it too).
+    if k + 1 == app.arr.tracks[t].lanes.len().max(1) {
+        if let Some(live) = app.live_takes.get(t).and_then(|o| o.as_ref()) {
+            let lx0 = x_of(x0, live.at, sr, px);
+            let lx1 = x_of(x0, live.at + live.frames.len() as u64, sr, px);
+            if lx1 > rect.min.x && lx0 < rect.max.x {
+                let gres = egui::Rect::from_min_max(
+                    egui::pos2(lx0.max(rect.min.x), rect.min.y + 1.0),
+                    egui::pos2(lx1.min(rect.max.x), rect.max.y - 1.0),
+                );
+                ui.painter().rect_filled(
+                    gres,
+                    2.0,
+                    Color32::from_rgba_unmultiplied(196, 64, 64, 80),
+                );
+                ui.painter().rect_stroke(
+                    gres,
+                    2.0,
+                    egui::Stroke::new(1.5, Color32::from_rgb(255, 90, 90)),
+                    egui::StrokeKind::Inside,
+                );
+                // Peak columns: a bounded scan (>=1 sample per column,
+                // striding up to ~64 samples/column) keeps the per-frame
+                // cost trivial even near the ~60 s buffer cap.
+                let n = live.frames.len();
+                let cols = ((gres.width() / 2.0).floor() as usize).clamp(1, 4096);
+                if n > 0 && gres.width() > 3.0 {
+                    let per = n.div_ceil(cols).max(1);
+                    let step = (per / 64).max(1);
+                    let mid = gres.center().y;
+                    let half = (gres.height() / 2.0 * 0.8).max(1.0);
+                    let mut col = 0usize;
+                    let mut a = 0usize;
+                    let colw = gres.width() / cols as f32;
+                    while col < cols && a < n {
+                        let b = (a + per).min(n);
+                        let mut p = 0.0f32;
+                        let mut j = a;
+                        while j < b {
+                            let v = live.frames[j].abs();
+                            if v > p {
+                                p = v;
+                            }
+                            j += step;
+                        }
+                        let gx = gres.min.x + (col as f32 + 0.5) * colw;
+                        let hh = (p.min(2.0) / 2.0 * half).max(0.8);
+                        ui.painter().line_segment(
+                            [egui::pos2(gx, mid - hh), egui::pos2(gx, mid + hh)],
+                            egui::Stroke::new(1.0, Color32::from_rgb(255, 150, 150)),
+                        );
+                        col += 1;
+                        a = b;
+                    }
+                    let secs = live.frames.len() as f64 / sr.max(1.0);
+                    ui.painter().text(
+                        gres.min + egui::vec2(3.0, 1.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("REC {secs:.1}s"),
+                        egui::FontId::proportional(9.0),
+                        Color32::from_rgb(255, 210, 210),
+                    );
+                }
+            }
+        }
     }
     ui.set_clip_rect(old_clip);
 
@@ -45285,6 +45429,267 @@ mod tests {
             !app.backend.engine.rec_loop_armed(0),
             "STOP clears the loop"
         );
+    }
+
+    /// v169 AC1: pressing the track REC button starts the transport right
+    /// away from the current position — no separate Play. Both classic
+    /// guards keep their veto, a MIDI-only arm shares the same seam, and
+    /// STOP must leave playback running ("playback behaves as normal").
+    #[test]
+    fn v169_record_toggle_starts_transport() {
+        let mut app = headless_app("v169tplay");
+        app.rec_src[0] = RecSrc {
+            audio: true,
+            preview: false,
+            loop_rec: false,
+            midi: false,
+            auto: false,
+        };
+        // Guard 1: no engine yet -> classic wait echo, transport stays parked.
+        app.sample_rate = 0;
+        app.toggle_record_all(0);
+        assert!(
+            !app.backend.engine.transport_on(),
+            "no engine: transport stays parked"
+        );
+        assert!(app.status.contains("wait for the audio engine"));
+        app.sample_rate = 48_000;
+        // Guard 2: nothing ticked -> hint, transport stays parked.
+        app.rec_src[1] = RecSrc {
+            audio: false,
+            preview: false,
+            loop_rec: false,
+            midi: false,
+            auto: false,
+        };
+        app.toggle_record_all(1);
+        assert!(
+            !app.backend.engine.transport_on(),
+            "no source: transport stays parked"
+        );
+        assert!(app.status.contains("tick a source"), "{}", app.status);
+        // Audio-take arm: transport runs from the CURRENT position.
+        app.backend.engine
+            .set_project(Arc::new(vec![]), Arc::new(crate::arrange::Arrangement::new()), 100_000);
+        app.backend.engine.force_pos(12345);
+        app.toggle_record_all(0);
+        assert!(
+            app.backend.engine.transport_on(),
+            "REC must start the transport"
+        );
+        assert_eq!(
+            app.backend.engine.pos(),
+            12345,
+            "starts from the current position, not the top"
+        );
+        assert!(app.status.contains("recording"), "arm echo: {}", app.status);
+        // A past-the-end position restarts at the top — PlayAll semantics.
+        app.backend.engine.force_pos(100_000);
+        app.backend.engine.set_transport(false);
+        app.backend.engine.set_rec_loop(0, false);
+        // (the arm on track 2 below reaches start_transport_now again)
+        // MIDI-only track: same contract through the shared seam.
+        app.rec_src[2] = RecSrc {
+            audio: false,
+            preview: false,
+            loop_rec: false,
+            midi: true,
+            auto: false,
+        };
+        app.toggle_record_all(2);
+        assert!(app.midi_rec[2].armed, "MIDI armed");
+        assert!(
+            app.backend.engine.transport_on() && app.backend.engine.pos() == 0,
+            "MIDI arm also plays, past-the-end restarts at the top"
+        );
+        // STOP (GUI-visible MIDI arm): playback continues — record stop is
+        // NOT a transport stop.
+        app.toggle_record_all(2);
+        assert!(!app.midi_rec[2].armed, "stop disarms");
+        assert!(
+            app.backend.engine.transport_on(),
+            "stop does NOT stop playback"
+        );
+        // Audio-take STOP via a directly armed engine take (NULL_AUDIO has
+        // no manager to run the Cmd path, so arm the engine the way the
+        // manager would): the stop branch must also leave the transport on.
+        app.backend.engine.start_rec(0);
+        app.toggle_record_all(0);
+        assert!(
+            app.backend.engine.transport_on(),
+            "audio-take stop leaves playback running"
+        );
+        assert!(app.status.contains("recording stopped"), "{}", app.status);
+    }
+
+    /// v169 AC2/3/4 (GUI half): TakeProgress deltas grow the ghost; group
+    /// tracks stay independent; a new pass replaces (loop record); the
+    /// final Evt::Take replaces the ghost with the real asset clip; and a
+    /// discarded take leaves no stale ghost.
+    #[test]
+    fn v169_ghost_grows_take_replaces() {
+        let mut app = headless_app("v169ghost");
+        app.sample_rate = 48_000;
+        let chunk: Vec<f32> = (0..400).map(|k| k as f32 * 0.001).collect();
+        let chunk2: Vec<f32> = vec![0.5f32; 200];
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 0,
+            at: 1000,
+            frames: Arc::from(chunk.clone()),
+        });
+        {
+            let g = app
+                .live_takes
+                .first()
+                .and_then(|o| o.as_ref())
+                .expect("ghost after the first progress event");
+            assert_eq!((g.at, g.frames.len()), (1000, 400));
+        }
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 0,
+            at: 1000,
+            frames: Arc::from(chunk2.clone()),
+        });
+        assert_eq!(
+            app.live_takes[0].as_ref().unwrap().frames.len(),
+            600,
+            "the same pass accumulates"
+        );
+        // Group recording: a second track's stream is fully independent.
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 3,
+            at: 2500,
+            frames: Arc::from(chunk.clone()),
+        });
+        assert_eq!(app.live_takes[3].as_ref().unwrap().frames.len(), 400);
+        assert_eq!(
+            app.live_takes[0].as_ref().unwrap().frames.len(),
+            600,
+            "group tracks do not cross-talk"
+        );
+        // New pass (loop record re-armed elsewhere): replace, not append.
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 0,
+            at: 9000,
+            frames: Arc::from(chunk2.clone()),
+        });
+        let g = app.live_takes[0].as_ref().unwrap();
+        assert_eq!((g.at, g.frames.len()), (9000, 200), "new pass restarts");
+        // The final take replaces the live view: ghost cleared, real asset
+        // + clip in place, and NO other take-clip anywhere (no double paint).
+        // (Quantize OFF here: this pin is about the REPLACE contract; the
+        // quantize branch of take_pipeline is already pinned by v41.)
+        app.auto_quantize = false;
+        let n_assets0 = app.assets.len();
+        app.handle_evt(crate::audio::Evt::Take {
+            track: 0,
+            at: 9000,
+            data: Arc::from(vec![0.25f32; 480]),
+            preview: false,
+        });
+        assert!(app.live_takes[0].is_none(), "final take leaves no ghost");
+        assert_eq!(app.assets.len(), n_assets0 + 1, "one asset materialized");
+        let a = app.assets.last().unwrap();
+        assert_eq!(a.data.len(), 480);
+        let n_clips: usize = app.arr.tracks[0]
+            .lanes
+            .iter()
+            .map(|l| l.clips.len())
+            .sum();
+        assert_eq!(n_clips, 1, "exactly one clip — the ghost is not a second");
+        // A discarded take clears any rolling ghost.
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 1,
+            at: 12000,
+            frames: Arc::from(chunk2.clone()),
+        });
+        assert!(app.live_takes[1].is_some(), "ghost rolled on track 2");
+        app.handle_evt(crate::audio::Evt::TakeDiscarded { track: 1 });
+        assert!(app.live_takes[1].is_none(), "discarded: no stale ghost");
+    }
+
+    /// v169 AC5: the rolling take PAINTS — red grow-rect on the track's
+    /// last lane + a "REC" readout galley — after a progress event lands.
+    #[test]
+    fn v169_ghost_paints() {
+        let mut app = headless_app("v169paint");
+        app.sample_rate = 48_000;
+        let ctx = egui::Context::default();
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        frame(&mut app, &ctx, vec![]);
+        // Half a second of signal at the top of the timeline.
+        let chunk: Vec<f32> = (0..24_000)
+            .map(|k| ((k as f32) * 0.05).sin() * 0.6)
+            .collect();
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 0,
+            at: 0,
+            frames: Arc::from(chunk),
+        });
+        // Custom scan (the shared painted_rect only matches opaque fills;
+        // the ghost fill is deliberately translucent). egui stores the
+        // translucent fill PREMULTIPLIED (v54 lesson) — derive the exact
+        // stored tuple from the SAME constructor the painter uses.
+        fn scan_ghost(app: &mut App, ctx: &egui::Context) -> Option<egui::Rect> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                events: vec![moved(egui::pos2(20.0, 18.0))],
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hit = out
+                .shapes
+                .iter()
+                .filter_map(|cs| {
+                    if let egui::epaint::Shape::Rect(r) = &cs.shape {
+                        if r.fill == Color32::from_rgba_unmultiplied(196, 64, 64, 80)
+                            && r.rect.width() > 10.0
+                        {
+                            return Some(r.rect);
+                        }
+                    }
+                    None
+                })
+                .max_by(|a, b| {
+                    (a.width() * a.height())
+                        .partial_cmp(&(b.width() * b.height()))
+                        .unwrap()
+                });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hit
+        }
+        let ghost = scan_ghost(&mut app, &ctx).expect("the live ghost rect paints");
+        // Growth: a bigger take paints a WIDER ghost (extent follows frames).
+        let w0 = ghost.width();
+        let more: Vec<f32> = vec![0.3f32; 24_000];
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 0,
+            at: 0,
+            frames: Arc::from(more),
+        });
+        let ghost2 = scan_ghost(&mut app, &ctx).expect("ghost still paints after growth");
+        assert!(
+            ghost2.width() > w0 + 5.0,
+            "extent grows with the take: {w0} -> {}",
+            ghost2.width()
+        );
+        let label = galley_centers(&mut app, &ctx, "REC ", false);
+        assert!(!label.is_empty(), "the REC readout paints");
+        // The final take removes the ghost (its clip body is opaque red —
+        // assert the translucent rect is gone instead).
+        app.handle_evt(crate::audio::Evt::Take {
+            track: 0,
+            at: 0,
+            data: Arc::from(vec![0.25f32; 48_000]),
+            preview: false,
+        });
+        assert!(scan_ghost(&mut app, &ctx).is_none(), "no ghost survives the final take");
     }
 
     /// v29: untick EVERYTHING and REC refuses with a hint instead of
