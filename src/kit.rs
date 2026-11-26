@@ -158,6 +158,110 @@ pub(crate) fn armed_outside_click(ui: &Ui, armed: bool, rect: Rect, pad: f32, es
         })
 }
 
+// ---------------------------------------------------------------------------
+// v170 (card t_3d0dfae8): the STANDARD confirm dialog — the ONE pattern
+// for "are you sure?" popups.
+//
+// Before v170 every destructive confirmation hand-rolled its own
+// egui::Window, copy and button row (`proj_confirm`, `rack_confirm_del`),
+// so behavior drifted between surfaces and "don't ask me again" had
+// nowhere to live. Rule going forward: every UX confirmation builds a
+// `ConfirmAsk` (title, body, confirm label, optional *Never warn again*
+// checkbox) and renders it through `confirm()`. The checkbox state is
+// bound to a NAMED persisted Config key by the CALLER (kit has no App
+// access — the helper stays stateless, like `armed_outside_click`
+// above); the caller owns the pending request between frames and the
+// persistence on confirm. First adopter: the child-track removal gate
+// (App::request_lane_removal in ui.rs).
+//
+// Contract:
+//   - CENTER-anchored, non-collapsible, non-resizable — the user can
+//     never lose the dialog to a drag (ad-hoc windows could wander off).
+//   - Cancel is the safe default: the Cancel button OR an Escape key
+//     press anywhere returns `No`; nothing else is touched.
+//   - `never_warn_label = Some(..)` paints the checkbox UNCHECKED by
+//     default; only the CONFIRM path may persist it (Checked + Cancel
+//     persists nothing).
+//   - The Yes/No verdict fires EXACTLY ONCE: the caller drops (or
+//     persists) the pending request as soon as `confirm()` resolves.
+// ---------------------------------------------------------------------------
+
+/// One pending standard confirmation. `kind` is the stable window-id
+/// source — one stable value per popup KIND, not per open.
+pub(crate) struct ConfirmAsk {
+    /// Stable machine id for this popup kind (window id source).
+    pub kind: &'static str,
+    /// Window title.
+    pub title: &'static str,
+    /// Primary copy: WHAT IS LOST (plain label).
+    pub body: String,
+    /// Secondary copy: WHAT SURVIVES (weak type). Optional.
+    pub note: Option<String>,
+    /// Destructive action button label, e.g. "Remove", "Delete".
+    pub confirm_label: &'static str,
+    /// Some(text) draws a Never-warn checkbox with this label;
+    /// None = a plain confirm/cancel pair.
+    pub never_warn_label: Option<&'static str>,
+    /// Cross-frame checkbox state. The caller seeds it false per open and
+    /// persists it (into its named Config key) only on `Confirm::Yes`.
+    pub never_warn: bool,
+}
+
+/// One-frame verdict from `confirm()`.
+pub(crate) enum Confirm {
+    /// Still open — the caller keeps the pending request.
+    Open,
+    /// Destructive action accepted (read `ask.never_warn` NOW).
+    Yes,
+    /// Cancelled — button, window close, or Escape. Safe default.
+    No,
+}
+
+/// Render one frame of the standard confirmation (see the section doc
+/// for the law). Returns the verdict; `Open` keeps the dialog up.
+pub(crate) fn confirm(ui: &Ui, ask: &mut ConfirmAsk) -> Confirm {
+    let mut verdict = Confirm::Open;
+    egui::Window::new(ask.title)
+        .id(egui::Id::new(("v170-confirm", ask.kind)))
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            if ui.ctx().input(|i| i.key_pressed(Key::Escape)) {
+                verdict = Confirm::No;
+                return;
+            }
+            ui.label(&ask.body);
+            if let Some(note) = &ask.note {
+                ui.label(egui::RichText::new(note.clone()).weak().small());
+            }
+            if let Some(label) = ask.never_warn_label {
+                ui.checkbox(&mut ask.never_warn, label);
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new(ask.confirm_label).strong())
+                            .min_size(egui::vec2(90.0, 0.0)),
+                    )
+                    .on_hover_text("do it now \u{2014} this cannot be undone")
+                    .clicked()
+                {
+                    verdict = Confirm::Yes;
+                }
+                if ui
+                    .button("Cancel")
+                    .on_hover_text("go back \u{2014} nothing changes")
+                    .clicked()
+                {
+                    verdict = Confirm::No;
+                }
+            });
+        });
+    verdict
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

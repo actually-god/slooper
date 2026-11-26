@@ -788,6 +788,12 @@ pub struct Config {
     /// ride App::set_spectrum_line (one seam: state + save + echo).
     #[serde(default)]
     pub spectrum_line: bool,
+    /// v170 (card t_3d0dfae8): "Never warn again" for removing a NON-EMPTY
+    /// child track. Set from the standard confirm dialog (kit::confirm);
+    /// true = removing a child track with clips happens without the
+    /// data-loss popup (empty child lanes never pop regardless).
+    #[serde(default)]
+    pub lane_rm_never_warn: bool,
     #[serde(default = "default_true")]
     pub show_midi: bool,
     /// v30 R4: the project-value-bindings window now belongs to the MAIN
@@ -943,6 +949,7 @@ impl Default for Config {
             show_mixer: true,
             mixer_follow_tracks: true,
             spectrum_line: false,
+            lane_rm_never_warn: false,
             show_midi: true,
             show_binds: true,
             side_wins: SideWins::default(),
