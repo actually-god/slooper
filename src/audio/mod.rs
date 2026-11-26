@@ -3405,7 +3405,7 @@ fn drive_script_events(
 /// the note-on arm (ghost notes on every export using bend/AT); live and
 /// offline bytes can no longer drift.
 #[inline]
-fn midi3_raw(kind: u8, ch: u8, d1: u8, d2: u8) -> [u8; 3] {
+pub(crate) fn midi3_raw(kind: u8, ch: u8, d1: u8, d2: u8) -> [u8; 3] {
     match kind {
         0 => [0x80 | ch & 0x0F, d1 & 0x7F, 0],
         1 => [0xB0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],

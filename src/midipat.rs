@@ -2066,15 +2066,14 @@ mod tests {
         assert!(p.bends.is_empty(), "audible lane untouched by the export law");
         let lane = p.bake_bends_for_export();
         assert!(!lane.is_empty(), "curve must populate the export lane");
-        assert_eq!(lane.first().unwrap().val, st_to_bend(-12.0), "starts clamped -full");
-        assert_eq!(lane.last().unwrap().val, st_to_bend(12.0), "ends clamped +full");
-        for b in &lane {
-            assert!(
-                b.val >= st_to_bend(-12.0) && b.val <= st_to_bend(12.0),
-                "wire law clamps every export sample: {}",
-                b.val
-            );
-        }
+        // Hard wire clamp: beyond full scale the bake lands on the raw
+        // extremes themselves (0 = full down, 16383 = full up).
+        assert_eq!(lane.first().unwrap().val, 0, "starts clamped at the wire floor");
+        assert_eq!(lane.last().unwrap().val, 16383, "ends clamped at the wire top");
+        // No mid-span excursion past the extremes either: the crossing
+        // through 0 st must be a real mid-wire sample, not an artifact.
+        let mid = lane.iter().find(|b| b.val >= 8000 && b.val <= 8500).expect("mid-wire sample");
+        assert!(mid.at > 0 && mid.at < 480, "sweep crosses center inside the note span");
         // Playback: UNCLAMPED to +-24 st — the whole point of the carrier.
         let ev = crate::audio::pattern_curve_events(&p, 48_000);
         assert!(!ev.is_empty());

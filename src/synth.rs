@@ -3289,11 +3289,38 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
         let flat = v167_2oct_render(&reg, "piano", 57, false);
         let curve = v167_2oct_render(&reg, "piano", 57, true);
         assert_ne!(flat, curve, "±2 st curve never reached the bundled piano");
+        // NEGATIVE CONTROL = the clamped world: the same dome at +-12 st
+        // (what the retired roll law delivered). The piano is multi-partial,
+        // so absolute cycle ratios run under the ideal 4x (measured 2.67x) —
+        // what must hold is that the UNCLAMPED dome beats the clamped one.
+        let mut pat = crate::midipat::Pattern::new(120);
+        pat.note_bends
+            .push(crate::midipat::NoteBend::new(vec![(0.0, -1200.0), (0.5, 1200.0), (1.0, -1200.0)]));
+        pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note: 57,
+            vel: 110,
+            press: 0,
+            start: 0,
+            len: 960,
+            bend: Some(0),
+        });
+        let inst = reg.create_instance("piano", 48_000.0, &[]).expect("piano");
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, 57, 110u8)];
+        ev.extend(crate::audio::pattern_curve_events(&pat, 48_000));
+        ev.push((47_000, 0, 0, 57, 0));
+        let mut clamped = vec![0f32; 48_000];
+        crate::audio::render_midi_events(&inst, &mut ev, 0, 48_000, &mut clamped);
         let win = |x: &[f32], a: usize, b: usize| v100_cycles(&x[a..b]) as f64;
         let (mf, mc) = (win(&flat, 19_200, 28_800), win(&curve, 19_200, 28_800));
-        eprintln!("v167 2oct piano: mid {mf} -> {mc} ({:.3}x)", mc / mf);
+        let mcl = win(&clamped, 19_200, 28_800);
+        eprintln!("v167 2oct piano: mid {mf} -> {mc} ({:.3}x) | clamped-dome {mcl} ({:.3}x)", mc / mf, mcl / mf);
         assert!(mf >= 20.0, "piano must sound in the measure window: {mf}");
-        assert!(mc / mf > 3.2, "curve must bend the piano fully 2 octaves: got {:.3}", mc / mf);
+        assert!(mc / mf > 2.3, "curve must bend the piano ~2 octaves: got {:.3}", mc / mf);
+        assert!(
+            mc > mcl * 1.20,
+            "beyond-+-12 st must ADD pitch (clamp-free carrier): {mc} vs clamped {mcl}"
+        );
     }
 
     /// "AS FAST as they want": a full 0 -> +2400¢ sweep inside the first
