@@ -10067,6 +10067,10 @@ impl App {
                         Sense::hover(),
                     );
                     sresp.on_hover_text(Self::SPEC_HOVER);
+                    #[cfg(test)]
+                    if let Ok(m) = crate::fxgui::KIT_PROBE.lock() {
+                        m.borrow_mut().push(("spectrum".to_string(), r2));
+                    }
                     paint_spectrum(ui, self.meter_state.as_ref(), r2, self.spectrum_line);
                 });
             }
@@ -10080,6 +10084,10 @@ impl App {
                 Sense::hover(),
             );
             sresp.on_hover_text(Self::SPEC_HOVER);
+            #[cfg(test)]
+            if let Ok(m) = crate::fxgui::KIT_PROBE.lock() {
+                m.borrow_mut().push(("spectrum".to_string(), r2));
+            }
             paint_spectrum(ui, self.meter_state.as_ref(), r2, self.spectrum_line);
         }
     }
@@ -26118,10 +26126,6 @@ fn paint_spectrum(
     line_mode: bool,
 ) {
     let p = ui.painter();
-    #[cfg(test)]
-    if let Ok(m) = crate::fxgui::KIT_PROBE.lock() {
-        m.borrow_mut().push(("spectrum".to_string(), rect));
-    }
     p.rect_filled(rect, 2.0, crate::kit::SPEC_BG);
     let (f_min, f_max) = (crate::meter::SPEC_F_MIN, crate::meter::SPEC_F_MAX);
     let x_of = |f: f32| -> f32 {
