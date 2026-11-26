@@ -923,8 +923,6 @@ const EXEMPTIONS: &[Ex] = &[
     Ex { kind: "blk", site: "ui.rs\texport_window\tapp.export_sel = false;", n: 2, why: "skip:view-state — selection/filter/collapse/toggle state paints itself (v86 R3)" },
     Ex { kind: "blk", site: "ui.rs\texport_window\tapp.export_sel = true;", n: 1, why: "skip:view-state — selection/filter/collapse/toggle state paints itself (v86 R3)" },
     Ex { kind: "blk", site: "ui.rs\tgrid_context_menu\tapp.sample_edit_win = Some(key);", n: 1, why: "skip:window-open — opens/closes a window or picker; the surface change is the feedback (v72 open_*)" },
-    Ex { kind: "blk", site: "ui.rs\tlevel_row\tapp.levels_dirty = true;", n: 1, why: "skip:internal-flag — repaint/pending-save plumbing, not user-visible state" },
-    Ex { kind: "blk", site: "ui.rs\tmaster_volume_controls\tapp.master_dirty = true;", n: 1, why: "skip:internal-flag — repaint/pending-save plumbing, not user-visible state" },
     Ex { kind: "blk", site: "ui.rs\tmix_column\tapp.fx_window = Some(t);", n: 1, why: "skip:window-open — opens/closes a window or picker; the surface change is the feedback (v72 open_*)" },
     Ex { kind: "blk", site: "ui.rs\tmix_column\tapp.synth_pick = Some(t);", n: 1, why: "skip:window-open — opens/closes a window or picker; the surface change is the feedback (v72 open_*)" },
     Ex { kind: "blk", site: "ui.rs\tmonitor_body\tapp.midi_log.clear();", n: 1, why: "skip:same-view — removal/clear repaints visibly; echo would repeat the widget (v86 R3)" },
