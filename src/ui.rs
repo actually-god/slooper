@@ -58,6 +58,11 @@ use crate::synth;
 /// lands on the mcp tool table through the ONE line in tools::install_all.
 pub(crate) mod mcp_windows;
 
+/// v173 (TS-027): whole-program hover + status-echo invariant harness.
+/// Test-only: it audits the render files below, ships in no binary.
+#[cfg(test)]
+mod coverage_audit;
+
 /// Keys a user may plausibly bind to a shortcut.
 /// v108: Home/End joined this list — SHORTCUT_DEFAULTS has bound them since
 /// v35 (the go-to pair, documented as rebindable), but their absence here
