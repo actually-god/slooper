@@ -896,6 +896,35 @@ const COL_SKIP_FG_HOVER: Color32 = Color32::from_rgb(240, 244, 255);
 const GRAB_EDGE_LANE: f32 = 7.0;
 const GRAB_EDGE_NOTE: f32 = 6.0;
 
+// v177 (ts-028 design-language audit, ts-022 pass): piano-roll + MIDI-bind
+// data tints — ONE home, the same doctrine as the v175 arrangement block
+// above (values frozen at the historical literals; adoption sites reference
+// these names; tripwired by v177_roll_note_tints_single_home +
+// v177_binds_bar_single_renderer).
+/// Roll note body: resting / selected (the brighter twin).
+const COL_NOTE: Color32 = Color32::from_rgb(80, 150, 245);
+const COL_NOTE_SEL: Color32 = Color32::from_rgb(120, 185, 255);
+/// A pitch curve / legacy-glide segment at REST — the roll's "curve" hue.
+/// The automation-CLIP identity is the separate COL_AUTO_CURVE* pair
+/// (ts-024 corridor): do not merge — teal means "in-roll modulation",
+/// red means "automation asset".
+const COL_NOTE_CURVE: Color32 = Color32::from_rgb(90, 220, 170);
+/// Any SELECTED roll element (note end caps = resize handles, curve trail,
+/// velocity bar, glide segment) wears the yellow-handle language — the
+/// SAME token as the grid's resize caps, aliased so the drift tripwire
+/// sees one literal home.
+const COL_ROLL_SEL: Color32 = COL_RESIZE_CAP;
+/// Velocity-lane bar at rest (the selected one wears COL_ROLL_SEL).
+const COL_VEL_BAR: Color32 = Color32::from_rgb(90, 160, 230);
+/// The legacy-glide curve-shape midpoint dot — orange = "bend the shape",
+/// distinct from the endpoint dots' COL_NOTE_CURVE.
+const COL_GLIDE_MID: Color32 = Color32::from_rgb(240, 150, 80);
+/// The MIDI-bind picker's mirrored mini-bar (shared renderer
+/// `bind_bar_paint`): track / fill / position needle.
+const COL_BIND_TRACK: Color32 = Color32::from_rgb(24, 26, 32);
+const COL_BIND_FILL: Color32 = Color32::from_rgb(96, 104, 132);
+const COL_BIND_NEEDLE: Color32 = Color32::from_gray(215);
+
 /// v112: the arrangement's asset-length lookup (asset id → timeline
 /// samples) as a borrow-cheap closure for `place_auto`/`Lane::occupied`.
 /// Takes the table + sample rate as plain args so callers can pass
@@ -12744,6 +12773,10 @@ impl App {
                         .clicked()
                     {
                         roll.px_per_beat = (roll.px_per_beat / 1.25).clamp(30.0, 400.0);
+                        // v177: the state change answers — a click that only
+                        // moves pixels left the toolbar silent.
+                        self.status =
+                            format!("roll zoom \u{b7} {:.0} px per beat", roll.px_per_beat);
                     }
                     if ui
                         .small_button("+")
@@ -12751,6 +12784,8 @@ impl App {
                         .clicked()
                     {
                         roll.px_per_beat = (roll.px_per_beat * 1.25).clamp(30.0, 400.0);
+                        self.status =
+                            format!("roll zoom \u{b7} {:.0} px per beat", roll.px_per_beat);
                     }
                     // v52 R6: how much ONE wheel tick trims a note's
                     // velocity (was hard-wired \u{b1}5).
@@ -12810,25 +12845,29 @@ impl App {
                             roll.pat.notes.get(ix).and_then(|n| n.bend).is_some()
                         })
                         .count();
-                    let cc = ui
-                        .small_button(RichText::new("clear curve").weak())
-                        .on_hover_text(if n_curves > 0 {
-                            "Remove the pitch curves from the selected notes (the notes stay)"
-                        } else {
-                            "Select a note that HAS a pitch curve \u{b7} Z+drag draws one"
-                        });
-                    if n_curves > 0 && cc.clicked() {
-                        for ix in roll.sel_notes.clone() {
-                            if let Some(n) = roll.pat.notes.get_mut(ix) {
-                                n.bend = None;
+                    // v177: NEVER a dead click — the v64 clipboard-row idiom:
+                    // add_enabled_ui so the button reads INACTIVE when there
+                    // is nothing to clear, and the disabled hover says what
+                    // arms it (a silent no-op click was the dead action).
+                    ui.add_enabled_ui(n_curves > 0, |ui| {
+                        if ui
+                            .small_button(RichText::new("clear curve").weak())
+                            .on_hover_text("Remove the pitch curves from the selected notes (the notes stay)")
+                            .on_disabled_hover_text("nothing selected carries a curve \u{b7} select a curve-carrying note, or Z+drag draws one")
+                            .clicked()
+                        {
+                            for ix in roll.sel_notes.clone() {
+                                if let Some(n) = roll.pat.notes.get_mut(ix) {
+                                    n.bend = None;
+                                }
                             }
+                            roll.pat.bake_bends();
+                            roll.pat.compact_note_bends();
+                            roll.changed = true;
+                            self.status =
+                                format!("cleared {n_curves} curve(s) \u{b7} notes kept");
                         }
-                        roll.pat.bake_bends();
-                        roll.pat.compact_note_bends();
-                        roll.changed = true;
-                        self.status =
-                            format!("cleared {n_curves} curve(s) \u{b7} notes kept");
-                    }
+                    });
                     if ui
                         .small_button(RichText::new("save").strong())
                         .on_hover_text(
@@ -13073,7 +13112,9 @@ impl App {
                 if black {
                     Color32::from_gray(28)
                 } else {
-                    Color32::from_gray(58)
+                    // v177: natural-key strip = the ONE edge token (ts-028
+                    // filed row drained: gray(58) was a re-fork of kit::EDGE).
+                    crate::kit::EDGE
                 },
             );
             // v37: key separators. Adjacent naturals (B|C) drew as
@@ -13206,9 +13247,9 @@ impl App {
             let col = if dragging {
                 crate::kit::ACCENT
             } else if is_sel {
-                Color32::from_rgb(120, 185, 255)
+                COL_NOTE_SEL
             } else {
-                Color32::from_rgb(80, 150, 245)
+                COL_NOTE
             };
             painter.rect_filled(
                 egui::Rect::from_min_max(
@@ -13226,7 +13267,7 @@ impl App {
                             egui::pos2((ex + 2.0).min(rect.max.x), y + roll.row_h - 1.0),
                         ),
                         1.0,
-                        Color32::from_rgb(250, 200, 50),
+                        COL_ROLL_SEL,
                     );
                 }
             }
@@ -13237,9 +13278,9 @@ impl App {
             if let Some(nb) = nb_of(note) {
                 let dur = dur.max(1e-6);
                 let tcol = if is_sel {
-                    Color32::from_rgb(250, 200, 50)
+                    COL_ROLL_SEL
                 } else {
-                    Color32::from_rgb(90, 220, 170)
+                    COL_NOTE_CURVE
                 };
                 let mut prev: Option<egui::Pos2> = None;
                 let mut tx = x0.max(grid_x0);
@@ -13374,9 +13415,9 @@ impl App {
                     ),
                     1.0,
                     if sel {
-                        Color32::from_rgb(250, 200, 50)
+                        COL_ROLL_SEL
                     } else {
-                        Color32::from_rgb(90, 160, 230)
+                        COL_VEL_BAR
                     },
                 );
             }
@@ -13410,9 +13451,9 @@ impl App {
                 tmp.clear();
                 crate::midipat::bake_seg(g, 8, &mut tmp);
                 let col = if *sel {
-                    Color32::from_rgb(250, 200, 50)
+                    COL_ROLL_SEL
                 } else {
-                    Color32::from_rgb(90, 220, 170)
+                    COL_NOTE_CURVE
                 };
                 for w in tmp.windows(2) {
                     let a = egui::pos2(
@@ -13433,7 +13474,7 @@ impl App {
                 for q in [e0, e1] {
                     painter.circle_filled(q, 4.0, col);
                 }
-                painter.circle_filled(mc, 3.0, Color32::from_rgb(240, 150, 80));
+                painter.circle_filled(mc, 3.0, COL_GLIDE_MID);
             }
         }
         // Topmost note under a point (last drawn wins). Notes are
@@ -20987,11 +21028,15 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                     let g_btn = egui::Button::new(
                         RichText::new(glbl)
                             .color(if mem.is_empty() {
-                                Color32::from_gray(110)
+                                // v177: indicator ternary bound to the kit
+                                // tokens (v174 token doc names REC idle
+                                // button text as WARN scope; identical
+                                // values — zero visual drift).
+                                crate::kit::MUTED
                             } else if any_rec {
-                                Color32::from_rgb(255, 90, 90)
+                                crate::kit::REC_ON
                             } else {
-                                Color32::from_rgb(220, 180, 120)
+                                crate::kit::WARN
                             })
                             .strong()
                             .small(),
@@ -21662,6 +21707,29 @@ fn bind_overlay(
     }
 }
 
+/// v177 (ts-028 audit): THE single renderer for the bind picker's value bar
+/// — the MIDI-bind popup mirrors BOTH track controls and plugin parameters,
+/// and both cells used to hand-paint the same track/fill/needle chrome with
+/// forked literals (the biggest chrome fork the ts-028 audit found). One
+/// renderer, palette values from the COL_BIND_* home, so a restyle is one
+/// edit. (v77 presetbar single-renderer precedent.)
+fn bind_bar_paint(p: &egui::Painter, bar: egui::Rect, frac: f32) {
+    let f = frac.clamp(0.0, 1.0);
+    p.rect_filled(bar, 2.0, COL_BIND_TRACK);
+    p.rect_filled(
+        egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * f, bar.height())),
+        2.0,
+        COL_BIND_FILL,
+    );
+    p.line_segment(
+        [
+            egui::pos2(bar.min.x + bar.width() * f, bar.min.y - 1.0),
+            egui::pos2(bar.min.x + bar.width() * f, bar.max.y + 1.0),
+        ],
+        egui::Stroke::new(1.0, COL_BIND_NEEDLE),
+    );
+}
+
 /// v27: one mixer control mirrored for binding. `vertical` draws a fader
 /// (volume/master), otherwise a compact labeled bar (trim/pan); the value
 /// text shows the control's CURRENT reading — the "static image" of the
@@ -21689,7 +21757,9 @@ fn bind_fader_cell(
         let gx = r.min.x + 10.0;
         p.line_segment(
             [egui::pos2(gx, r.min.y + 2.0), egui::pos2(gx, r.max.y - 2.0)],
-            egui::Stroke::new(3.0, Color32::from_gray(48)),
+            // v177: the rail is the ONE soft-separator tone (ts-028 filed
+            // gray-48 re-fork drained into kit::SEP_SOFT).
+            egui::Stroke::new(3.0, crate::kit::SEP_SOFT),
         );
         let y = r.max.y - 4.0 - f * (r.height() - 8.0);
         p.rect_filled(
@@ -21730,19 +21800,7 @@ fn bind_fader_cell(
             egui::pos2(r.min.x, r.min.y + 14.0),
             egui::vec2(r.width() - 2.0, 8.0),
         );
-        p.rect_filled(bar, 2.0, Color32::from_rgb(24, 26, 32));
-        p.rect_filled(
-            egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * f, bar.height())),
-            2.0,
-            Color32::from_rgb(96, 104, 132),
-        );
-        p.line_segment(
-            [
-                egui::pos2(bar.min.x + bar.width() * f, bar.min.y - 1.0),
-                egui::pos2(bar.min.x + bar.width() * f, bar.max.y + 1.0),
-            ],
-            egui::Stroke::new(1.0, Color32::from_gray(215)),
-        );
+        bind_bar_paint(p, bar, f);
     }
     if on {
         bind_overlay(ui, r, &format!("{name} \u{b7} track strip"), id, pick);
@@ -21837,28 +21895,9 @@ fn bind_param_cell(
         egui::pos2(r.min.x + 1.0, r.min.y + 16.0),
         egui::vec2(r.width() - 4.0, 8.0),
     );
-    p.rect_filled(bar, 2.0, Color32::from_rgb(24, 26, 32));
-    p.rect_filled(
-        egui::Rect::from_min_size(
-            bar.min,
-            egui::vec2(bar.width() * frac.clamp(0.0, 1.0), bar.height()),
-        ),
-        2.0,
-        Color32::from_rgb(96, 104, 132),
-    );
-    p.line_segment(
-        [
-            egui::pos2(
-                bar.min.x + bar.width() * frac.clamp(0.0, 1.0),
-                bar.min.y - 1.0,
-            ),
-            egui::pos2(
-                bar.min.x + bar.width() * frac.clamp(0.0, 1.0),
-                bar.max.y + 1.0,
-            ),
-        ],
-        egui::Stroke::new(1.0, Color32::from_gray(215)),
-    );
+    // v177: SAME renderer as bind_fader_cell's horizontal bar — the two
+    // cells mirror different control families but paint one chrome.
+    bind_bar_paint(p, bar, frac);
     bind_overlay(ui, r, &full, &id, pick);
 }
 
@@ -24503,6 +24542,9 @@ fn value_binds_body(ui: &mut egui::Ui, app: &mut App) {
             } else {
                 "switch".to_string()
             };
+            // v177: the row states WHAT IT BINDS AND FEEDS (ts-022 AC2):
+            // source control → target, which track, and how the control's
+            // travel maps — the old generic hover said only "in project".
             ui.label(format!(
                 "{} \u{2192} T{} {} ({})",
                 vb.bind.label(),
@@ -24510,13 +24552,37 @@ fn value_binds_body(ui: &mut egui::Ui, app: &mut App) {
                 lbl,
                 tail
             ))
-            .on_hover_text("bound in this project; travels with the project file");
-            if ui.small_button("relearn").clicked() {
+            .on_hover_text(format!(
+                "{} \u{2192} {} on track {} \u{b7} {} \u{b7} bound in this \
+                 project; travels with the project file",
+                vb.bind.label(),
+                lbl,
+                vb.track + 1,
+                if vb.kind == 0 {
+                    format!(
+                        "the control's travel {}..{} maps 0..1 of this value",
+                        vb.lo, vb.hi
+                    )
+                } else {
+                    "every press toggles this value".to_string()
+                }
+            ));
+            if ui
+                .small_button("relearn")
+                .on_hover_text(if vb.kind == 0 {
+                    "learn a NEW controller for this binding \u{b7} the wizard \
+                     asks for axis, minimum, maximum again"
+                } else {
+                    "learn a NEW switch \u{b7} press any button to take over \
+                     this binding"
+                })
+                .clicked()
+            {
                 learn = Some(i);
             }
             if ui
                 .small_button("\u{2715}")
-                .on_hover_text("unbind")
+                .on_hover_text("remove this binding \u{b7} the status line names what left")
                 .clicked()
             {
                 unbind = Some(i);
@@ -29991,7 +30057,17 @@ fn roll_rmb_menu(
                 ui.vertical(|ui| {
                     for (lab, t) in ROLL_LEN_BASE {
                         if ui
-                            .add_sized([102.0, 18.0], egui::Button::selectable(cur == t, lab))
+                            .add_sized(
+                                [102.0, 18.0],
+                                egui::Button::selectable(cur == t, lab),
+                            )
+                            // v177: every menu item states its own verb +
+                            // target (the header explains context; this row
+                            // explains itself even skimmed cold).
+                            .on_hover_text(format!(
+                                "Set note length to {lab} \u{b7} applies to {} note(s)",
+                                targets.len()
+                            ))
                             .clicked()
                         {
                             pick = Some((lab, t));
@@ -30001,7 +30077,14 @@ fn roll_rmb_menu(
                 ui.vertical(|ui| {
                     for (lab, t) in ROLL_LEN_DOT.into_iter().chain(ROLL_LEN_TRIP) {
                         if ui
-                            .add_sized([102.0, 18.0], egui::Button::selectable(cur == t, lab))
+                            .add_sized(
+                                [102.0, 18.0],
+                                egui::Button::selectable(cur == t, lab),
+                            )
+                            .on_hover_text(format!(
+                                "Set note length to {lab} \u{b7} applies to {} note(s)",
+                                targets.len()
+                            ))
                             .clicked()
                         {
                             pick = Some((lab, t));
@@ -30115,7 +30198,14 @@ fn roll_rmb_menu(
         }
         Some(RollRmbHit::Glide(i)) if i < roll.pat.bend_segs.len() => {
             let s = &roll.pat.bend_segs[i];
-            ui.label(RichText::new(format!("glide \u{b7} {}→{} ticks", s.t0, s.t1)).strong());
+            ui.label(
+                RichText::new(format!("glide \u{b7} {}→{} ticks", s.t0, s.t1)).strong(),
+            )
+            .on_hover_text(
+                "A glide bends pitch from its start value to its end value \
+                 \u{b7} drag its dots in the legacy lane; this strip holds \
+                 glides that no longer sit on a note",
+            );
             if ui
                 .button("Delete glide (Shift+RMB)")
                 .on_hover_text("Remove this glide now — or Shift+right-click it")
@@ -32182,7 +32272,8 @@ fn monitor_body(ui: &mut egui::Ui, app: &mut App) {
             ),
         };
         let r = ui.label(RichText::new(state).weak().small().color(if warn {
-            Color32::from_rgb(220, 180, 120)
+            // v177: the ONE warning-indicator token (ts-028 filed row).
+            crate::kit::WARN
         } else {
             Color32::from_gray(160)
         }));
@@ -32246,7 +32337,12 @@ fn monitor_body(ui: &mut egui::Ui, app: &mut App) {
                 .small(),
         );
         for s in &app.midi_sources {
-            ui.label(RichText::new(format!("  {s}")).weak().small().monospace());
+            ui.label(RichText::new(format!("  {s}")).weak().small().monospace())
+                .on_hover_text(
+                    "remote MIDI port auto-linked to slooper:midi_in by \
+                     the audio thread \u{b7} messages from it land in the \
+                     log below AND drive bindings live",
+                );
         }
     }
 
@@ -32280,7 +32376,18 @@ fn monitor_body(ui: &mut egui::Ui, app: &mut App) {
                                 .monospace(),
                         );
                     }
-                });
+                })
+                // v177 (ts-022 AC2 + the v160 truth law): every row states
+                // where it came from and what consumes such messages —
+                // TRUE for any message class and any synth class (stock
+                // script or hosted): the LOG itself feeds nothing; it is a
+                // display mirror of the live stream.
+                .on_hover_text(
+                    "arrived on slooper:midi_in \u{b7} the log is a display \
+                     mirror \u{b7} bindable messages (CC / note / program) \
+                     drive bound controls and the track's instrument live, \
+                     newest rows on top",
+                );
             }
         });
 }
@@ -68290,6 +68397,399 @@ mod tests {
         assert!(
             count(&mut app, &ctx, 2.0, COL_CLIP_SEL) >= 2,
             "both crossed clips carry the selection outline"
+        );
+    }
+
+    // ---- v177 (TS-022): piano roll + MIDI bindings/monitor pass ----------
+
+    /// v177 R1.1 (source): EVERY affordance row of the roll's RMB menu and
+    /// the shared clipboard rows carries its own hover copy — the ts-019 map
+    /// named this "the main gap" (zero hover standard on roll_rmb_menu).
+    /// Statement-window rule mirrored from v86_plugin_hover_region_scan:
+    /// affordance line through its own clicked()/changed().
+    #[test]
+    fn v177_roll_rmb_hover_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        const REGIONS: [&str; 2] = ["fn roll_rmb_menu(", "fn roll_clipboard_rows("];
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for anchor in REGIONS {
+            assert_eq!(
+                prod.matches(anchor).count(),
+                1,
+                "region anchor {anchor:?} not unique"
+            );
+            let region = v86_fn_region(prod, anchor);
+            let lines: Vec<&str> = region.lines().collect();
+            for (n, l) in lines.iter().enumerate() {
+                let s0 = l.trim_start();
+                if s0.starts_with("//") {
+                    continue;
+                }
+                let is_aff = s0.contains(".button(")
+                    || s0.contains("_button(")
+                    || s0.contains("Button::selectable(")
+                    || s0.contains("add_sized(");
+                if !is_aff {
+                    continue;
+                }
+                let mut end = (n + 18).min(lines.len() - 1);
+                for (k, row) in lines[n..=end].iter().enumerate() {
+                    if k > 0 && (row.contains("clicked()") || row.contains("changed()")) {
+                        end = n + k;
+                        break;
+                    }
+                }
+                let win: String = lines[n..=end].join(" ").to_lowercase();
+                if win.contains("on_hover") || win.contains("on_disabled_hover") {
+                    checked += 1;
+                } else {
+                    offenders.push(format!("{anchor} region line {}: {s0}", n + 1));
+                }
+            }
+        }
+        // The full inventory: 10 length picks + double + halve + Clear
+        // curve + Delete note (note branch) + glide delete + 2 clipboard.
+        assert!(
+            checked >= 10,
+            "hover scan must cover the whole menu, counted only {checked}"
+        );
+        assert!(
+            offenders.is_empty(),
+            "RMB rows without their own hover:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// v177 R4.2 (source): the roll's data tints are bound to the ONE
+    /// COL_* palette home (kit tokens where kit owns the value); the
+    /// palette holds the historical values verbatim.
+    #[test]
+    fn v177_roll_note_tints_single_home() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        // (a) The palette home pins the historical values verbatim.
+        let home: [(&str, &str); 5] = [
+            ("COL_NOTE", "Color32::from_rgb(80, 150, 245)"),
+            ("COL_NOTE_SEL", "Color32::from_rgb(120, 185, 255)"),
+            ("COL_NOTE_CURVE", "Color32::from_rgb(90, 220, 170)"),
+            ("COL_VEL_BAR", "Color32::from_rgb(90, 160, 230)"),
+            ("COL_GLIDE_MID", "Color32::from_rgb(240, 150, 80)"),
+        ];
+        for (name, val) in home {
+            assert!(
+                prod.contains(&format!("const {name}: Color32 = {val};")),
+                "palette home {name} must stay exactly {val}"
+            );
+        }
+        // The roll's selected-yellow IS the grid resize-cap token — one
+        // literal home for the whole yellow-handle language.
+        assert!(
+            prod.contains("const COL_ROLL_SEL: Color32 = COL_RESIZE_CAP;"),
+            "COL_ROLL_SEL must ALIAS the grid cap token, never re-fork it"
+        );
+        // (b) The roll painter carries NONE of those literals inline.
+        let roll = v86_fn_region(prod, "fn roll_inner(");
+        for b in [
+            "from_rgb(120, 185, 255)",
+            "from_rgb(80, 150, 245)",
+            "from_rgb(90, 220, 170)",
+            "from_rgb(90, 160, 230)",
+            "from_rgb(240, 150, 80)",
+            "from_rgb(250, 200, 50)",
+            "from_gray(58)",
+        ] {
+            assert!(!roll.contains(b), "roll_inner still forks literal {b}");
+        }
+        // (c) Where KIT owns the value, the roll calls kit.
+        assert!(
+            roll.contains("crate::kit::EDGE"),
+            "natural-key strip rows must read kit::EDGE"
+        );
+        assert!(
+            roll.contains("crate::kit::ACCENT"),
+            "the drag accent stays kit::ACCENT"
+        );
+    }
+
+    /// v177 R1.3 (runtime): the toolbar "clear curve" verb is GATED — with a
+    /// curve-less selection a click fires nothing and echoes nothing (the
+    /// dead action is gone); armed, the same click clears and echoes.
+    #[test]
+    fn v177_roll_clear_curve_gated() {
+        let (mut app, ctx) = v166_open_roll("v177ccgate");
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 240,
+                bend: None,
+            });
+            r.sel_notes = vec![0];
+        }
+        app.status = "SENTINEL-UNCHANGED".into();
+        frame(&mut app, &ctx, vec![]);
+        click_last(&mut app, &ctx, "clear curve");
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.status, "SENTINEL-UNCHANGED",
+            "the disabled verb must neither fire nor echo"
+        );
+        // Arm the same selection with a curve; the click now clears + echoes.
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat
+                .note_bends
+                .push(crate::midipat::NoteBend::new(vec![(0.0, 0.0), (1.0, -150.0)]));
+            r.pat.notes[0].bend = Some(r.pat.note_bends.len() as u32 - 1);
+            r.pat.bake_bends();
+        }
+        frame(&mut app, &ctx, vec![]);
+        click_last(&mut app, &ctx, "clear curve");
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.status.contains("cleared"), "echo: {}", app.status);
+        let r = app.piano_roll.as_ref().unwrap();
+        assert_eq!(r.pat.notes.len(), 1, "the note stays");
+        assert!(r.pat.notes[0].bend.is_none(), "armed click cleared the curve");
+    }
+
+    /// v177 R1.4 (runtime): the zoom buttons echo the NEW px/beat value to
+    /// the status line — a state change always answers.
+    #[test]
+    fn v177_roll_zoom_echo() {
+        let (mut app, ctx) = v166_open_roll("v177zoom");
+        let before = app.piano_roll.as_ref().unwrap().px_per_beat;
+        click_last(&mut app, &ctx, "+");
+        frame(&mut app, &ctx, vec![]);
+        let now = app.piano_roll.as_ref().unwrap().px_per_beat;
+        assert!(now > before, "zoom IN grew px/beat");
+        assert!(
+            app.status.contains("roll zoom") && app.status.contains(&format!("{now:.0}")),
+            "echo names the new value: {}",
+            app.status
+        );
+        click_last(&mut app, &ctx, "\u{2212}");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.piano_roll.as_ref().unwrap().px_per_beat < now,
+            "zoom OUT shrank px/beat"
+        );
+        assert!(
+            app.status.contains("roll zoom"),
+            "both directions echo: {}",
+            app.status
+        );
+    }
+
+    /// v177 R4.1 (source): the bind picker's value bar has ONE renderer —
+    /// both mirror cells delegate to `bind_bar_paint` and carry none of the
+    /// track/fill/needle literals; the palette + the rail token are named
+    /// homes (ts-028 audit: "biggest chrome fork in the program").
+    #[test]
+    fn v177_binds_bar_single_renderer() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        let fader = v86_fn_region(prod, "fn bind_fader_cell(");
+        let param = v86_fn_region(prod, "fn bind_param_cell(");
+        assert_eq!(
+            prod.matches("fn bind_bar_paint(").count(),
+            1,
+            "the shared renderer exists exactly once"
+        );
+        for region in [fader, param] {
+            assert!(
+                region.contains("bind_bar_paint(p, bar,"),
+                "bind cell must delegate the bar to the ONE renderer"
+            );
+            for b in [
+                "from_rgb(24, 26, 32)",
+                "from_rgb(96, 104, 132)",
+                "from_gray(215)",
+            ] {
+                assert!(!region.contains(b), "bind cell still forks chrome literal {b}");
+            }
+        }
+        assert!(
+            fader.contains("crate::kit::SEP_SOFT"),
+            "the fader rail reads the ONE soft-separator token"
+        );
+        for (name, val) in [
+            ("COL_BIND_TRACK", "Color32::from_rgb(24, 26, 32)"),
+            ("COL_BIND_FILL", "Color32::from_rgb(96, 104, 132)"),
+            ("COL_BIND_NEEDLE", "Color32::from_gray(215)"),
+        ] {
+            assert!(
+                prod.contains(&format!("const {name}: Color32 = {val};")),
+                "bind palette home {name} must stay exactly {val}"
+            );
+        }
+    }
+
+    /// v177 R2.1/R2.2 (runtime): a bound-control row's hover states source
+    /// → target, track, and the travel mapping; the relearn button says
+    /// what the wizard will ask. Tooltips must PAINT (v71 rule).
+    #[test]
+    fn v177_binds_row_feed_hover() {
+        let mut app = headless_app("v177feed");
+        let ctx = egui::Context::default();
+        app.value_binds.push(crate::config::ValueBind {
+            target: crate::automation::TARGET_TRACK_VOL.to_string(),
+            track: 0,
+            bind: crate::midi::MidiBind {
+                ty: 1, // 1 = CC (ty is the class, not the status byte)
+                ch: 1,
+                d1: 7,
+            },
+            kind: 0,
+            lo: 9,
+            hi: 110,
+        });
+        app.show_binds = true;
+        frame(&mut app, &ctx, vec![]);
+        let row = galley_at(&mut app, &ctx, "knob 9..110").expect("the bound row paints");
+        let tip = hover_until_tip(&mut app, &ctx, row.center(), &["maps 0..1"]);
+        assert!(
+            tip.iter().any(|t| t.contains("track 1") && t.contains("ch02")),
+            "hover names source AND target AND track: {tip:?}"
+        );
+        let rl = galley_at(&mut app, &ctx, "relearn").expect("relearn row paints");
+        let tip2 = hover_until_tip(&mut app, &ctx, rl.center(), &["axis"]);
+        assert!(
+            tip2.iter().any(|t| t.contains("axis")),
+            "relearn states what the wizard asks: {tip2:?}"
+        );
+    }
+
+    /// v177 R2.3 (runtime): the monitor's warn line paints with the ONE
+    /// kit::WARN token, and every log row + source row tooltips its origin
+    /// and consumer (log = display mirror, bindings consume the live
+    /// stream — phrased true for every message/synth class, v160 law).
+    #[test]
+    fn v177_monitor_rows_honest() {
+        let mut app = headless_app("v177mon");
+        let ctx = egui::Context::default();
+        app.show_midi = true;
+        app.last_midi = None;
+        app.midi_sources.clear();
+        frame(&mut app, &ctx, vec![]);
+        let cols = v166_text_colors(&mut app, &ctx);
+        let warn = cols
+            .iter()
+            .find(|(t, _)| t.contains("no MIDI source linked"))
+            .expect("honest wait-line paints");
+        assert_eq!(
+            warn.1,
+            crate::kit::WARN,
+            "the monitor warn line reads the kit::WARN token"
+        );
+        // Link + log: rows gain origin/consumer hovers.
+        app.midi_sources = vec!["Test Port 24: In".into()];
+        app.midi_log.push_back(MidiLine {
+            ts: "12:00:00".into(),
+            type_name: "CC",
+            describe: "CC ch1 #7 = 100".into(),
+            raw_hex: "B0 07 64".into(),
+        });
+        frame(&mut app, &ctx, vec![]);
+        let row = galley_at(&mut app, &ctx, "CC ch1 #7 = 100").expect("log row paints");
+        let tip = hover_until_tip(&mut app, &ctx, row.center(), &["display mirror"]);
+        assert!(
+            tip.iter().any(|t| t.contains("slooper:midi_in")),
+            "log row tooltips origin + consumer: {tip:?}"
+        );
+        let src = galley_at(&mut app, &ctx, "Test Port 24: In").expect("source row paints");
+        let tip2 = hover_until_tip(&mut app, &ctx, src.center(), &["auto-linked"]);
+        assert!(
+            tip2.iter().any(|t| t.contains("slooper:midi_in")),
+            "source row states what it feeds: {tip2:?}"
+        );
+    }
+
+    /// v177 R2.4 (runtime): a bind REFUSED mid-wizard echoes the reason —
+    /// the off-axis message is rejected and the echo names the axis that
+    /// was wanted. Nothing is stored on refusal.
+    #[test]
+    fn v177_binds_refused_axis_echo() {
+        let mut app = headless_app("v177refuse");
+        let ctx = egui::Context::default();
+        app.show_binds = true;
+        frame(&mut app, &ctx, vec![]);
+        app.arm_value_knob_learn(crate::automation::TARGET_TRACK_VOL, 0, usize::MAX);
+        // Step 1: a CC on channel 2 defines the axis (echo names it).
+        app.handle_evt(crate::audio::Evt::Midi(crate::audio::RawMidiMsg {
+            bytes: vec![0xB2, 7, 64],
+        }));
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.status.contains("axis"), "axis detection echoes: {}", app.status);
+        // Lock the axis through the real wizard button.
+        let lb = galley_centers(&mut app, &ctx, "Lock axis", false);
+        assert!(!lb.is_empty(), "the wizard offers Lock axis");
+        click_pt(&mut app, &ctx, lb[0]);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.knob_learn.as_ref().is_some_and(|k| k.axis_locked),
+            "the button locked the axis"
+        );
+        // Refusal: CC on channel 3 — a different axis.
+        app.handle_evt(crate::audio::Evt::Midi(crate::audio::RawMidiMsg {
+            bytes: vec![0xB3, 7, 90],
+        }));
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("must use the axis"),
+            "refused bind echoes the reason: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("ch"),
+            "the echo names the wanted axis: {}",
+            app.status
+        );
+        assert!(app.value_binds.is_empty(), "a refusal stores nothing");
+    }
+
+    /// v177 R3.2 (runtime): the lanes ride the canvas rect, not the window:
+    /// with the legacy glide lane open its label paints INSIDE the
+    /// remembered canvas — nothing overflows the window floor.
+    #[test]
+    fn v177_roll_lane_floor_fit() {
+        let (mut app, ctx) = v166_open_roll("v177lanefit");
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.bend_segs.push(crate::midipat::BendSeg {
+                t0: 0,
+                v0: 0.0,
+                t1: 480,
+                v1: 2.0,
+                curve: 0.0,
+            });
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 240,
+                bend: None,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        let canvas = app
+            .piano_roll
+            .as_ref()
+            .unwrap()
+            .canvas_rect
+            .expect("the canvas rect is remembered");
+        let lab = galley_at(&mut app, &ctx, "legacy glide lane")
+            .expect("the honest lane copy paints when a legacy seg exists");
+        assert!(
+            canvas.contains(lab.center()),
+            "lane label must ride the canvas rect (canvas {canvas:?}, label {lab:?})"
         );
     }
 }
