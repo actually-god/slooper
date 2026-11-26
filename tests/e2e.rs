@@ -181,6 +181,9 @@ struct SrcCap {
     ring: Arc<Vec<AtomicU32>>,
     widx: Arc<AtomicU64>,
     const_val: Arc<AtomicU32>,
+    /// v172: the resolved client name (JACK may suffix a requested tag),
+    /// so tests can name `name:out_a` in a multi-source layout.
+    src_name: String,
     active: AsyncClient<(), LoopSrcProc>,
 }
 
@@ -218,6 +221,7 @@ fn e2e_capture_src(b: &Backend, tag: &str, seed: u32, src_in: bool, gain: u8) ->
         ring,
         widx,
         const_val,
+        src_name,
         active,
     }
 }
@@ -965,6 +969,83 @@ fn e2e_transport_and_clips() {
     b.cmd(Cmd::StopAll);
     e2e_reset(&b);
     let _ = active;
+}
+
+/// v172 (card t_627ee9f3): two ticked input devices make a recording take
+/// ship exactly TWO separate takes — one `Evt::Take` per device, each
+/// carrying ONLY that source's signal (not the summed mix) and labeled with
+/// that port's name — and nothing re-ships afterwards (the v0.10
+/// double-ship regression had every stopped take arrive twice).
+#[test]
+fn v172_e2e_two_devices_two_takes() {
+    let Some((_g, b, _name, sr)) = e2e_backend() else {
+        return; // no audio server: skip
+    };
+
+    // Two constant sources (fixture-built): slot 0 = +0.25, slot 1 = -0.5
+    // (distinct so a summed take could never pass for either).
+    let a = e2e_capture_src(&b, "v172srcA", 0xA5A5, true, 3);
+    a.const_val.store(0.25f32.to_bits(), Ordering::Relaxed);
+    let bsrc = e2e_capture_src(&b, "v172srcB", 0x5A5A, true, 3);
+    bsrc.const_val.store((-0.5f32).to_bits(), Ordering::Relaxed);
+    e2e_apply(
+        &b,
+        vec![
+            format!("{}:out_a", a.src_name),
+            format!("{}:out_a", bsrc.src_name),
+        ],
+        vec![],
+    );
+    let _keep_a = a.active;
+    let _keep_b = bsrc.active;
+
+    b.cmd(Cmd::ToggleRecord { i: 0 });
+    std::thread::sleep(Duration::from_millis(400));
+    b.cmd(Cmd::ToggleRecord { i: 0 });
+
+    // Drain well past two manager idle ticks: a re-armed pending bit would
+    // show up here as a THIRD take (the double-ship regression).
+    let mut takes: Vec<(Option<String>, f32, usize)> = Vec::new();
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_millis(1200) {
+        if let Ok(ev) = b.evt_rx.try_recv() {
+            if let Evt::Take {
+                data,
+                preview,
+                device,
+                track,
+                ..
+            } = ev
+            {
+                assert_eq!(track, 0);
+                assert!(!preview);
+                let mean = data.iter().sum::<f32>() / data.len().max(1) as f32;
+                takes.push((device, mean, data.len()));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    e2e_reset(&b);
+    assert_eq!(takes.len(), 2, "one take per ticked device, exactly once: {takes:?}",);
+    assert_eq!(takes[0].0.as_deref(), Some("v172srcA:out_a"));
+    assert_eq!(takes[1].0.as_deref(), Some("v172srcB:out_a"));
+    assert!(
+        (takes[0].1 - 0.25).abs() < 0.03,
+        "slot A carried {} not its own 0.25 — summed capture regressed",
+        takes[0].1
+    );
+    assert!(
+        (takes[1].1 + 0.5).abs() < 0.03,
+        "slot B carried {} not its own -0.5 — summed capture regressed",
+        takes[1].1
+    );
+    for (i, (_, _, len)) in takes.iter().enumerate() {
+        assert!(
+            *len >= (sr as f32 * 0.2) as usize && *len <= (sr as f32 * 0.8) as usize,
+            "take {i} length {len}, expected ~0.4 s"
+        );
+    }
 }
 
 // --------------------------------------------------------------- metronome --

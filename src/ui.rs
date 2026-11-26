@@ -855,6 +855,31 @@ const COL_SNAP_LINE: Color32 = Color32::from_gray(44);
 /// Takes the table + sample rate as plain args so callers can pass
 /// `&arr_alen(&self.assets, self.sample_rate)` even while the receiver
 /// `&mut self.arr` is borrowed (disjoint field captures only).
+/// v172: default asset/clip name for a plain recording:
+/// `[project]-[input device]-Track N`. Every non-empty component goes
+/// through `sanitize_name` (Windows-illegal characters fold to `-`), and
+/// components that sanitize away to nothing are skipped — so a missing
+/// project name or a punctuation-only device can never produce a
+/// `--Track 3` double separator or a leading dash.
+fn take_asset_name(proj: &str, device: Option<&str>, track: usize) -> String {
+    let mut segs: Vec<String> = Vec::new();
+    for raw in [Some(proj), device].into_iter().flatten() {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let seg = crate::project::sanitize_name(raw);
+        // A component that sanitizes to pure separator noise (`":"` → `-`)
+        // is as good as absent; drop it rather than seam it in.
+        let seg = seg.trim_matches('-').to_string();
+        if !seg.is_empty() {
+            segs.push(seg);
+        }
+    }
+    segs.push(format!("Track {}", track + 1));
+    segs.join("-")
+}
+
 fn arr_alen<'a>(assets: &'a [Asset], sr: u32) -> impl Fn(u32) -> u64 + 'a {
     move |id| {
         assets
@@ -17592,7 +17617,14 @@ impl App {
     /// A finished take becomes: optional content quantize → WAV into the
     /// primary rack folder (when set) → asset → clip placed at the take's
     /// start position, snapped to the snap grid.
-    fn take_pipeline(&mut self, track: usize, at: u64, data: Arc<[f32]>, preview: bool) {
+    fn take_pipeline(
+        &mut self,
+        track: usize,
+        at: u64,
+        data: Arc<[f32]>,
+        preview: bool,
+        device: Option<String>,
+    ) {
         if track >= MAX_LOOPS {
             return;
         }
@@ -17604,25 +17636,46 @@ impl App {
         } else {
             data
         };
+        // v172: plain recordings are named `[project]-[device]-Track N`
+        // (every component sanitized); preview takes keep the old
+        // timestamped bounce name. The file gets the folder's unique-name
+        // convention ("name", "name-2", … — the MIDI-take loop's pattern),
+        // so re-recording the same device never overwrites the last take.
+        let base = if preview {
+            format!("preview-t{}-{}", track + 1, Self::fstamp())
+        } else {
+            take_asset_name(&self.proj_name, device.as_deref(), track)
+        };
+        let mut name = base.clone();
         let mut path = PathBuf::new();
         let mut dirty = true;
-        let stem = if preview { "preview" } else { "rec" };
-        let name = format!("{}-t{}-{}", stem, track + 1, Self::fstamp());
         if let Some(f) = self.rack.first_mut() {
             let dir = PathBuf::from(f.path.trim());
-            if !dir.as_os_str().is_empty() {
-                let p = dir.join(format!("{name}.wav"));
-                if std::fs::create_dir_all(&dir).is_ok()
-                    && crate::audio_io::export(
+            if !dir.as_os_str().is_empty() && std::fs::create_dir_all(&dir).is_ok() {
+                let mut n = 1u32;
+                loop {
+                    name = if n == 1 {
+                        base.clone()
+                    } else {
+                        format!("{base}-{n}")
+                    };
+                    let p = dir.join(format!("{name}.wav"));
+                    if p.exists() {
+                        n += 1;
+                        continue;
+                    }
+                    if crate::audio_io::export(
                         &p,
                         self.sample_rate,
                         &data,
                         crate::audio_io::ExportFormat::Wav,
                     )
                     .is_ok()
-                {
-                    path = p;
-                    dirty = false;
+                    {
+                        path = p;
+                        dirty = false;
+                    }
+                    break;
                 }
             }
         }
@@ -19157,13 +19210,16 @@ impl App {
                 at,
                 data,
                 preview,
+                device,
             } => {
                 // v169: the final asset clip replaces the live ghost —
                 // clear BEFORE the pipeline so no frame ever shows both.
+                // v172: a fan-out take arrives once per device; the first
+                // clears the ghost, the rest simply follow with their clips.
                 if let Some(slot) = self.live_takes.get_mut(track) {
                     *slot = None;
                 }
-                self.take_pipeline(track, at, data, preview);
+                self.take_pipeline(track, at, data, preview, device);
             }
             // v169: live partial take — grow (or restart, on a new pass /
             // new track) the ghost for this take.
@@ -45767,6 +45823,7 @@ mod tests {
             at: 9000,
             data: Arc::from(vec![0.25f32; 480]),
             preview: false,
+            device: None,
         });
         assert!(app.live_takes[0].is_none(), "final take leaves no ghost");
         assert_eq!(app.assets.len(), n_assets0 + 1, "one asset materialized");
@@ -45869,8 +45926,182 @@ mod tests {
             at: 0,
             data: Arc::from(vec![0.25f32; 48_000]),
             preview: false,
+            device: None,
         });
         assert!(scan_ghost(&mut app, &ctx).is_none(), "no ghost survives the final take");
+    }
+
+    /// v172 AC (GUI half): a fan-out take with three ticked devices
+    /// materializes as exactly three clips on the armed track, named
+    /// `[project]-[device]-Track N` per component-sanitized part
+    /// (`system:capture_2` folds the colon, `Mix: master` →
+    /// `Mix- master`), one WAV each in the rack folder, lanes stacked by
+    /// place_auto (all starts equal, so each take opens its own lane).
+    #[test]
+    fn v172_three_devices_three_named_clips() {
+        let mut app = headless_app("v172fan3");
+        app.sample_rate = 48_000;
+        app.auto_quantize = false;
+        app.proj_name = "Live set".into();
+        let dir = std::env::temp_dir().join("slooper-v172-ui-fan3");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.rack.clear();
+        app.rack.push(RackFolder::new(dir.to_string_lossy().into_owned()));
+        let n0 = app.assets.len();
+        for (dev, v) in [
+            ("Motif M2", 0.25f32),
+            ("system:capture_2", -0.5),
+            ("Mix: master", 0.125),
+        ] {
+            app.handle_evt(crate::audio::Evt::Take {
+                track: 0,
+                at: 4800,
+                data: Arc::from(vec![v; 240]),
+                preview: false,
+                device: Some(dev.into()),
+            });
+        }
+        assert_eq!(app.assets.len(), n0 + 3, "one asset per ticked device");
+        let names: Vec<&str> = app.assets[n0..].iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Live set-Motif M2-Track 1",
+                "Live set-system-capture_2-Track 1",
+                "Live set-Mix- master-Track 1",
+            ]
+        );
+        let n_clips: usize = app
+            .arr
+            .tracks
+            [0]
+            .lanes
+            .iter()
+            .map(|l| l.clips.len())
+            .sum();
+        assert_eq!(n_clips, 3, "all three takes land on the armed track");
+        let files: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 3, "one WAV per device in the rack folder");
+        assert!(files
+            .iter()
+            .all(|f| f.starts_with("Live set-") && f.ends_with(".wav")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v172 AC: re-recording the same device gets the folder's unique-name
+    /// suffix (`-2`, the MIDI-take "take"/"take-2" convention) — the first
+    /// take's WAV is never overwritten.
+    #[test]
+    fn v172_recording_collision_gets_suffix() {
+        let mut app = headless_app("v172collide");
+        app.sample_rate = 48_000;
+        app.auto_quantize = false;
+        app.proj_name = "Set".into();
+        let dir = std::env::temp_dir().join("slooper-v172-ui-collide");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.rack.clear();
+        app.rack.push(RackFolder::new(dir.to_string_lossy().into_owned()));
+        let take = |app: &mut App| {
+            app.handle_evt(crate::audio::Evt::Take {
+                track: 2,
+                at: 0,
+                data: Arc::from(vec![0.25f32; 120]),
+                preview: false,
+                device: Some("Mic 1".into()),
+            })
+        };
+        take(&mut app);
+        let i1 = app.assets.len() - 1;
+        take(&mut app);
+        let i2 = app.assets.len() - 1;
+        assert_eq!(app.assets[i1].name, "Set-Mic 1-Track 3");
+        assert_eq!(app.assets[i2].name, "Set-Mic 1-Track 3-2");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "both WAVs kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v172 AC: empty or punctuation-only project/device parts are skipped
+    /// — never a `--Track 3` seam, never a leading dash. (No rack folder
+    /// here: the dirty asset keeps the plain base name — uniqueness is a
+    /// folder convention, and there is no folder.)
+    #[test]
+    fn v172_empty_name_parts_seam_nothing() {
+        let mut app = headless_app("v172empty");
+        app.sample_rate = 48_000;
+        app.auto_quantize = false;
+        app.proj_name = "".into();
+        app.rack.clear();
+        let n0 = app.assets.len();
+        for dev in [None, Some("".to_string()), Some("::".to_string())] {
+            app.handle_evt(crate::audio::Evt::Take {
+                track: 1,
+                at: 0,
+                data: Arc::from(vec![0.1f32; 120]),
+                preview: false,
+                device: dev,
+            });
+        }
+        let names: Vec<&str> = app.assets[n0..].iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["Track 2", "Track 2", "Track 2"]);
+        assert!(names.iter().all(|n| !n.starts_with('-') && !n.contains("--")));
+    }
+
+    /// v172 AC: preview takes keep the old timestamped bounce name and the
+    /// device segment never leaks into them; a plain take with no device
+    /// (loop take / zero-device case) names as `[project]-Track N`.
+    #[test]
+    fn v172_preview_take_keeps_legacy_name() {
+        let mut app = headless_app("v172pvname");
+        app.sample_rate = 48_000;
+        app.auto_quantize = false;
+        app.proj_name = "Live set".into();
+        app.rack.clear();
+        let n0 = app.assets.len();
+        app.handle_evt(crate::audio::Evt::Take {
+            track: 0,
+            at: 0,
+            data: Arc::from(vec![0.2f32; 120]),
+            preview: true,
+            device: None,
+        });
+        assert!(
+            app.assets[n0].name.starts_with("preview-t1-"),
+            "{}",
+            app.assets[n0].name
+        );
+        app.handle_evt(crate::audio::Evt::Take {
+            track: 0,
+            at: 0,
+            data: Arc::from(vec![0.2f32; 120]),
+            preview: false,
+            device: None,
+        });
+        assert_eq!(app.assets[n0 + 1].name, "Live set-Track 1");
+    }
+
+    /// v172: the naming seam's full matrix — per-component sanitize, skip
+    /// rules for empty / separator-only parts, and the 1-based Track suffix.
+    #[test]
+    fn v172_take_asset_name_matrix() {
+        assert_eq!(
+            take_asset_name("Live set", Some("Motif M2"), 2),
+            "Live set-Motif M2-Track 3"
+        );
+        assert_eq!(take_asset_name("", None, 0), "Track 1");
+        assert_eq!(take_asset_name("  ", Some(":"), 0), "Track 1");
+        assert_eq!(
+            take_asset_name("Mix: master", Some("a/b"), 0),
+            "Mix- master-a-b-Track 1"
+        );
+        assert_eq!(
+            take_asset_name("p", Some("Con: trol: one"), 4),
+            "p-Con- trol- one-Track 5"
+        );
     }
 
     /// v29: untick EVERYTHING and REC refuses with a hint instead of

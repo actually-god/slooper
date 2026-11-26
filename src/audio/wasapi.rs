@@ -822,6 +822,7 @@ pub fn run(
         retry_budget: rt_recovery::RETRY_BUDGET,
         rt_spawn: None,
         fault: Arc::new(AtomicU32::new(rt_recovery::FAULT_NONE)),
+        cur_in_names: Vec::new(),
     };
     session.publish_ports();
     session.publish_midi();
@@ -862,6 +863,9 @@ struct WasapiSession {
     rt_spawn: Option<std::time::Instant>,
     /// W12a: RT thread writes its cause of death here before breaking.
     fault: Arc<AtomicU32>,
+    /// v172: slot-major device names from the last `apply` — the per-device
+    /// take fan-out labels (slot order matches the JACK input slots).
+    cur_in_names: Vec<Option<String>>,
 }
 
 impl WasapiSession {
@@ -1030,6 +1034,10 @@ fn open_midi_devices(sel: &[String], q: &Arc<MidiInQueue>, drops: &Arc<AtomicU64
 }
 
 impl ManagerBackend for WasapiSession {
+    /// v172: slot-major device names for the per-device take fan-out labels.
+    fn input_names(&self) -> Vec<Option<String>> {
+        self.cur_in_names.clone()
+    }
     fn refresh(&mut self, _tx: &SyncSender<Evt>) {
         self.publish_ports();
         self.publish_midi();
@@ -1050,6 +1058,13 @@ impl ManagerBackend for WasapiSession {
             .take(MAX_SLOTS)
             .map(|n| resolve(n, &in_devs))
             .collect();
+        // v172: remember the slot-major names for take fan-out labels.
+        self.cur_in_names = {
+            let mut v: Vec<Option<String>> =
+                ins.iter().take(MAX_SLOTS).cloned().map(Some).collect();
+            v.resize(MAX_SLOTS, None);
+            v
+        };
         let out_map: Vec<Option<(String, usize)>> = outs
             .iter()
             .take(MAX_SLOTS)
