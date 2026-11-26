@@ -45503,6 +45503,9 @@ mod tests {
         assert_eq!((g.at, g.frames.len()), (9000, 200), "new pass restarts");
         // The final take replaces the live view: ghost cleared, real asset
         // + clip in place, and NO other take-clip anywhere (no double paint).
+        // (Quantize OFF here: this pin is about the REPLACE contract; the
+        // quantize branch of take_pipeline is already pinned by v41.)
+        app.auto_quantize = false;
         let n_assets0 = app.assets.len();
         app.handle_evt(crate::audio::Evt::Take {
             track: 0,
@@ -45550,7 +45553,9 @@ mod tests {
             frames: Arc::from(chunk),
         });
         // Custom scan (the shared painted_rect only matches opaque fills;
-        // the ghost fill is deliberately translucent).
+        // the ghost fill is deliberately translucent). egui stores the
+        // translucent fill PREMULTIPLIED (v54 lesson) — derive the exact
+        // stored tuple from the SAME constructor the painter uses.
         fn scan_ghost(app: &mut App, ctx: &egui::Context) -> Option<egui::Rect> {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -45567,11 +45572,7 @@ mod tests {
                 .iter()
                 .filter_map(|cs| {
                     if let egui::epaint::Shape::Rect(r) = &cs.shape {
-                        let (r0, g0, b0, a0) = r.fill.to_tuple();
-                        if (a0 as i16 - 80).abs() <= 2
-                            && (r0 as i16 - 196).abs() <= 3
-                            && (g0 as i16 - 64).abs() <= 3
-                            && (b0 as i16 - 64).abs() <= 3
+                        if r.fill == Color32::from_rgba_unmultiplied(196, 64, 64, 80)
                             && r.rect.width() > 10.0
                         {
                             return Some(r.rect);
