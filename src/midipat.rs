@@ -1567,6 +1567,9 @@ mod tests {
         // A -12 st -> +12 st slide over a 480-tick note: dense 8-tick
         // grid, first sample -full-scale, last +full-scale, and NO
         // return-to-0 sample past the note end (hold-last semantics).
+        // v167 (pbc-1) RETARGETED: this is the EXPORT law now — the
+        // audible lane never carries owned curves (they play as
+        // sample-accurate kind-7 events; see v167_curve_* pins).
         let mut p = Pattern::new(120);
         let mut n = Note {
             ch: 0,
@@ -1581,16 +1584,19 @@ mod tests {
         n.bend = Some(0);
         p.notes.push(n);
         p.bake_bends();
-        assert!(!p.bends.is_empty(), "curve must populate the lane");
-        assert_eq!(p.bends.first().unwrap().at, 0);
-        assert_eq!(p.bends.first().unwrap().val, st_to_bend(-12.0), "starts at -full");
-        assert_eq!(p.bends.last().unwrap().at, 480);
-        assert_eq!(p.bends.last().unwrap().val, st_to_bend(12.0), "ends at +full");
-        let mid = p.bends.iter().find(|b| b.at == 240).unwrap();
+        assert!(p.bends.is_empty(), "v167: the audible lane EXCLUDES owned curves");
+        assert_eq!(p.curve_regions(), vec![(0, 480)], "the curve owns its note window");
+        let lane = p.bake_bends_for_export();
+        assert!(!lane.is_empty(), "curve must populate the EXPORT lane");
+        assert_eq!(lane.first().unwrap().at, 0);
+        assert_eq!(lane.first().unwrap().val, st_to_bend(-12.0), "starts at -full");
+        assert_eq!(lane.last().unwrap().at, 480);
+        assert_eq!(lane.last().unwrap().val, st_to_bend(12.0), "ends at +full");
+        let mid = lane.iter().find(|b| b.at == 240).unwrap();
         assert_eq!(mid.val, st_to_bend(0.0), "midpoint crosses zero");
-        assert_eq!(p.bends.len(), 61, "dense 8-tick grid, same density as bake_seg");
+        assert_eq!(lane.len(), 61, "dense 8-tick grid, same density as bake_seg");
         // Monotonic — no wobble, no post-note return samples.
-        for w in p.bends.windows(2) {
+        for w in lane.windows(2) {
             assert!(w[0].val < w[1].val, "monotonic sweep, ticks {}->{}", w[0].at, w[1].at);
             assert_eq!(w[1].at - w[0].at, 8);
         }
@@ -1622,13 +1628,16 @@ mod tests {
             bend: Some(1),
         });
         p.bake_bends();
+        // v167 (pbc-1): last-onset-wins is the EXPORT law now (playback
+        // delivers each note's own curve as kind-7 events).
+        let lane = p.bake_bends_for_export();
         // In the overlap (ticks 128..480) the lane must sit at B's +full.
-        for b in p.bends.iter().filter(|b| b.at >= 136 && b.at <= 472) {
+        for b in lane.iter().filter(|b| b.at >= 136 && b.at <= 472) {
             assert_eq!(b.val, st_to_bend(12.0), "tick {}: last-onset B must own", b.at);
         }
         // Before B's onset A owns it (sabotage polarity: would also be
         // true if the merge dropped everything — pin both sides).
-        let a_own = p.bends.iter().find(|b| b.at == 64).unwrap();
+        let a_own = lane.iter().find(|b| b.at == 64).unwrap();
         assert_eq!(a_own.val, st_to_bend(-12.0), "A owns pre-B territory");
     }
 
@@ -1732,7 +1741,16 @@ mod tests {
         assert_eq!(legacy_lane.len(), 61);
         p.migrate_bend_segs();
         p.bake_bends();
-        assert_eq!(p.bends, legacy_lane, "migrated re-bake must be bit-identical");
+        // v167 (pbc-1) RETARGETED: the migrated curve now plays as
+        // sample-accurate kind-7 events (lane EXCLUDES it), but the
+        // EXPORT law must stay bit-identical to the legacy bake_seg —
+        // that is what foreign MIDI consumers still receive.
+        assert!(p.bends.is_empty(), "v167: owned curve left the audible lane");
+        assert_eq!(
+            p.bake_bends_for_export(),
+            legacy_lane,
+            "migrated curve's EXPORT bake must be bit-identical to bake_seg"
+        );
     }
 
     #[test]
@@ -1766,7 +1784,10 @@ mod tests {
             bend: None,
         });
         p.bake_bends();
-        let before = p.bends.clone();
+        // v167 (pbc-1): the audible lane is empty (owned curves excluded);
+        // what crosses the .mid wire is the EXPORT bake.
+        assert!(p.bends.is_empty(), "v167: lane excludes owned curves");
+        let before = p.bake_bends_for_export();
         assert!(!before.is_empty());
         let f = std::env::temp_dir().join(format!("sp-v101rt-{}.mid", std::process::id()));
         p.save_mid(&f).unwrap();
@@ -1842,10 +1863,14 @@ mod tests {
         assert!((m.note_bends[n64.bend.unwrap() as usize].cents_at(0.5) - 600.0).abs() < 0.5,
             "handle resolves to ITS OWN curve (cross-wire sabotage check)");
         m.bake_bends();
+        // v167 (pbc-1): the audible lane stays EMPTY (owned curves play as
+        // kind-7 events); last-onset-wins survives as the EXPORT law.
+        assert!(m.bends.is_empty(), "v167: lane excludes owned curves");
         // Last-onset-wins on total overlap: equal onsets, sorted-stable
         // later entry (n64) takes the lane — just prove BOTH curves'
-        // values appear and the lane is sound.
-        assert!(!m.bends.is_empty());
+        // values appear and the export lane is sound.
+        let lane = m.bake_bends_for_export();
+        assert!(!lane.is_empty());
     }
 
     #[test]
@@ -1875,7 +1900,9 @@ mod tests {
             bend: Some(1),
         });
         p.bake_bends();
-        let lane_both = p.bends.len();
+        // v167 (pbc-1): lane-vs-export as above — the deletion story must
+        // hold in the EXPORT shape (the audible lane is empty throughout).
+        let lane_both = p.bake_bends_for_export().len();
         // Remove the first note (what the UI delete sites do).
         p.notes.remove(0);
         if p.has_note_bends() {
@@ -1889,15 +1916,18 @@ mod tests {
             "remapped handle still resolves to the SURVIVOR'S curve"
         );
         p.bake_bends();
-        // Lane lost the -600 region entirely: every lane sample is the
-        // +900 st level now (sabotage: forgetting bake leaves -600 tails).
-        assert!(p.bends.len() < lane_both, "lane shrank with the deleted curve");
-        for b in p.bends.iter().filter(|b| b.at >= 480) {
+        assert!(p.bends.is_empty(), "v167: audible lane excluded curves all along");
+        // Export lost the -600 region entirely: every export sample is the
+        // +900 st level now (sabotage: forgetting the delete leaves -600
+        // tails).
+        let lane = p.bake_bends_for_export();
+        assert!(lane.len() < lane_both, "export lane shrank with the deleted curve");
+        for b in lane.iter().filter(|b| b.at >= 480) {
             assert_eq!(b.val, st_to_bend(9.0), "post-survival lane is pure survivor");
         }
         assert!(
-            !p.bends.iter().take_while(|b| b.at < 480).any(|b| (b.val as i32 - st_to_bend(-6.0) as i32).abs() < 4),
-            "deleted note's curve fully GONE from the lane"
+            !lane.iter().take_while(|b| b.at < 480).any(|b| (b.val as i32 - st_to_bend(-6.0) as i32).abs() < 4),
+            "deleted note's curve fully GONE from the export lane"
         );
     }
 

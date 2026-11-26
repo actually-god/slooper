@@ -1978,8 +1978,9 @@ mod tests {
 
     // v101 (pb-2): THE render A/B pin the pb-1 spike promised — a
     // per-note PITCH CURVE (control points, not a hand-fed sweep) must
-    // drive the scripted render through the real bake → kind-5 lane →
-    // ABI v2 path. Both polarities: curve ON vs no curve (flat control
+    // drive the scripted render through the REAL v167 carrier: the
+    // sample-accurate `pattern_curve_events` generator → kind-7 events →
+    // ABI bend(). Both polarities: curve ON vs no curve (flat control
     // with identical timing), plus shape proof: the curve bows UP to
     // +12 st mid-note and back DOWN by the end — a linear-sweep
     // regression would raise the LATE window, this must raise the MID
@@ -2004,19 +2005,17 @@ mod tests {
             bend: if curved { Some(0) } else { None },
         });
         pat.bake_bends();
-        assert_eq!(pat.bends.is_empty(), !curved, "bake must fill the lane from the curve");
+        // v167 (pbc-1): the audible lane NEVER carries owned curves —
+        // the real carrier is the sample-accurate kind-7 generator used
+        // below (the v167_curve_* pins assert the carrier law itself).
+        assert!(pat.bends.is_empty(), "v167: lane excludes owned curves");
+        assert_eq!(pat.curve_regions().is_empty(), !curved, "curve owns its note window");
         let inst = reg
             .create_instance(synth, 48_000.0, if synth == "sampler" { &[0.0, 48.0, 1.0] } else { &[] })
             .expect("scripted instance");
         let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, note, 110u8)];
-        for b in pat.bends.iter() {
-            ev.push((
-                pat.ticks_to_samples(b.at, 48_000),
-                5u8,
-                0u8,
-                (b.val & 0x7F) as u8,
-                ((b.val >> 7) & 0x7F) as u8,
-            ));
+        if curved {
+            ev.extend(crate::audio::pattern_curve_events(&pat, 48_000));
         }
         ev.push((47_000, 0, 0, note, 0));
         let mut out = vec![0f32; 48_000];
