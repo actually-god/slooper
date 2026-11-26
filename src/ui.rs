@@ -11435,7 +11435,14 @@ impl App {
         }
         // v52 R6: baked pitch-bend lane (kind 5 = 14-bit lsb/msb, the
         // engine's own encoding) so roll previews glide like the grid.
+        // v167 (pbc-1): same carrier law as playback — lane events inside
+        // an owned curve's window are skipped, the curve itself rides as
+        // sample-accurate kind-7 events.
+        let regs = pat.curve_regions();
         for m in pat.bends.iter() {
+            if Pattern::in_curve_region(&regs, m.at) {
+                continue;
+            }
             ev.push((
                 pat.ticks_to_samples(m.at, sr),
                 5,
@@ -11444,6 +11451,8 @@ impl App {
                 ((m.val >> 7) & 0x7F) as u8,
             ));
         }
+        // v167: the owned curves themselves (sample-accurate kind 7).
+        ev.extend(crate::audio::pattern_curve_events(pat, sr));
         ev
     }
 
@@ -51860,7 +51869,11 @@ mod tests {
                 nb.pts[1].1
             );
             assert!(r.nb_live.is_empty(), "stroke buffer cleared on commit");
-            assert!(!r.pat.bends.is_empty(), "baked to the audible lane");
+            // v167 (pbc-1): the curve is NOT baked to the audible lane —
+            // it plays as sample-accurate kind-7 events, and owns its
+            // note window for the lane-skip law.
+            assert!(r.pat.bends.is_empty(), "v167: lane excludes owned curves");
+            assert!(!r.pat.curve_regions().is_empty(), "curve owns its playback window");
         }
         // The gesture must NOT move the source note, and must echo.
         let n0 = app.piano_roll.as_ref().unwrap().pat.notes[0];
@@ -52003,7 +52016,10 @@ mod tests {
             let ci = r.pat.notes[0].bend.expect("drawn curve attached to the note");
             let nb = &r.pat.note_bends[ci as usize];
             assert_eq!(nb.pts.len(), 2, "collinear stroke -> line: {:?}", nb.pts);
-            assert!(!r.pat.bends.is_empty(), "curve audible via baked lane");
+            // v167 (pbc-1): audible carrier = kind-7 curve events, not the
+            // baked lane (which now stays legacy-shape).
+            assert!(r.pat.bends.is_empty(), "v167: lane excludes owned curves");
+            assert!(!r.pat.curve_regions().is_empty(), "curve audible via its window");
         }
         assert!(app.status.contains("pitch curve"), "status: {}", app.status);
         // Negative control: a SECOND Z-press WITHOUT drag (too-short
@@ -52048,7 +52064,10 @@ mod tests {
             assert_eq!(nb.pts.len(), 2, "still 2 points");
             assert_eq!(nb.pts[1].0, 1.0, "endpoint time is pinned");
             assert!(nb.pts[1].1 > 800.0, "endpoint pulled way up: {}", nb.pts[1].1);
-            assert!(r.pat.bends.len() >= 2, "re-baked after edit");
+            // v167 (pbc-1): edits keep the curve OUT of the audible lane;
+            // the window bookkeeping is what must stay live.
+            assert!(r.pat.bends.is_empty(), "v167: lane excludes owned curves");
+            assert!(!r.pat.curve_regions().is_empty(), "window still owned after edit");
         }
         assert!(app.status.contains("curve point"), "echo: {}", app.status);
     }

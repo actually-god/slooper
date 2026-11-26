@@ -234,6 +234,14 @@ impl NoteBend {
     pub fn active(&self) -> bool {
         !self.pts.is_empty()
     }
+
+    /// v167 (pbc-1, card t_879a77ef): exact |cents| bound of the curve.
+    /// PCHIP is monotone and never overshoots its control values, so the
+    /// bound is simply the largest |point| — the engine uses it to size the
+    /// plugin bend range (RPN0) a curve needs, with zero evaluation.
+    pub fn max_cents_abs(&self) -> f32 {
+        self.pts.iter().fold(0.0f32, |a, &(_, c)| a.max(c.abs()))
+    }
 }
 
 /// A timed polyphonic aftertouch (0xA) message, v42/MPE: pressure for ONE
@@ -432,35 +440,100 @@ impl Pattern {
         self.note_bends = live;
     }
 
+    /// v167 (pbc-1, card t_879a77ef): merged (start, end) TICK windows of
+    /// notes owning an active pitch curve, sorted and disjoint. Playback
+    /// staging SKIPS baked [`Pattern::bends`] lane events inside these
+    /// windows — the CURVE is the carrier then (evaluated per sample by the
+    /// audio layer, full ±2400¢ range); the lane copy stays the export and
+    /// legacy-editor shape only.
+    pub fn curve_regions(&self) -> Vec<(u32, u32)> {
+        let mut r: Vec<(u32, u32)> = self
+            .notes
+            .iter()
+            .filter(|n| {
+                n.bend
+                    .is_some_and(|i| self.note_bends.get(i as usize).is_some_and(|nb| nb.active()))
+            })
+            .map(|n| (n.start, n.start.saturating_add(n.len.max(1))))
+            .collect();
+        r.sort();
+        let mut out: Vec<(u32, u32)> = Vec::with_capacity(r.len());
+        for (a, b) in r {
+            match out.last_mut() {
+                Some(l) if a <= l.1 => l.1 = l.1.max(b),
+                _ => out.push((a, b)),
+            }
+        }
+        out
+    }
+
+    /// v167: is tick `at` inside an owned-curve window? `regions` must come
+    /// from [`Pattern::curve_regions`] (sorted, disjoint) — binary search.
+    pub fn in_curve_region(regions: &[(u32, u32)], at: u32) -> bool {
+        let i = regions.partition_point(|&(a, _)| a <= at);
+        match i.checked_sub(1) {
+            Some(j) => regions[j].0 <= at && at < regions[j].1,
+            None => false,
+        }
+    }
+
+    /// v167: semitone bend range the widest curve on this pattern NEEDS
+    /// (RPN0 demand for hosted feeds; 0 = no curve). The bound is exact:
+    /// PCHIP never overshoots control points (see [`NoteBend::max_cents_abs`]).
+    pub fn curve_demand_st(&self) -> u8 {
+        let mut mx = 0.0f32;
+        for n in self.notes.iter() {
+            if let Some(i) = n.bend {
+                if let Some(nb) = self.note_bends.get(i as usize) {
+                    mx = mx.max(nb.max_cents_abs());
+                }
+            }
+        }
+        if mx < 1.0 {
+            0
+        } else {
+            (mx * 0.01).ceil().clamp(1.0, 24.0) as u8
+        }
+    }
+
     /// v52 R6: rebuild the raw `bends` lane from the editable segments
     /// (segments are then authoritative). Call after ANY seg edit.
-    /// v101 (pb-2): per-note [`NoteBend`] curves join the same lane
-    /// (single truth for VST feed, MIDI export, scripted ABI v2 and the
-    /// roll audition — everything downstream already understands bends).
-    /// Curves sample dense every 8 ticks across their own point span,
-    /// exactly like [`bake_seg`]; on overlap the LAST-ONSET note wins
-    /// each tick (spec § 5); nothing returns to 0 after a note ends
-    /// (808 slides stay put, same as the old lane). A pattern with NO
-    /// curves takes the old code path UNCHANGED (back-compat pins).
+    /// v101 (pb-2): per-note [`NoteBend`] curves joined this lane.
+    /// v167 (pbc-1, card t_879a77ef) RETARGETED: the AUDIBLE lane carries
+    /// the LEGACY shape only (orphan segments + anything imported until
+    /// the first edit). Owned note curves play as sample-accurate kind-7
+    /// sidecar events evaluated on the audio thread — a ±12 st 14-bit
+    /// lane could never carry ±2400¢ anyway. The SMF-export shape lives
+    /// in [`Pattern::bake_bends_for_export`]. v105's empty-source lane
+    /// clear survives: no segments -> the rebuilt lane is empty.
     pub fn bake_bends(&mut self) {
+        let mut out = Vec::new();
+        for seg in self.bend_segs.iter() {
+            bake_seg(seg, 8, &mut out);
+        }
+        out.sort_by_key(|b| b.at);
+        self.bends = out;
+    }
+
+    /// v167 (pbc-1): the SMF-EXPORT bend shape = the stored lane (legacy
+    /// segments + hand-imported bends) UNION owned curves baked at the
+    /// OLD ±12 st roll law, dense 8 ticks, last-onset-wins between curves,
+    /// nothing returning to 0 after a note ends. MIDI wire physics: 0xE0
+    /// is ±12 st full scale, so curve points beyond clamp on EXPORT —
+    /// documented lossy interop; playback never sees this shape (it
+    /// evaluates the raw curve). Stored lane entries are seeded with an
+    /// unbeatable onset, so a v101-saved project (whose lane still holds
+    /// the old curve bake) re-exports BIT-IDENTICALLY, and hand-imported
+    /// bends survive every export.
+    pub fn bake_bends_for_export(&self) -> Vec<Bend> {
         if !self.has_note_bends() {
-            if self.bend_segs.is_empty() {
-                // v105 (pb-3): no source left = the audible lane must go
-                // silent too — a bare `return` kept the LAST baked curve
-                // sounding after its owner note/curve was deleted.
-                self.bends.clear();
-                return;
-            }
-            let mut out = Vec::new();
-            for seg in self.bend_segs.iter() {
-                bake_seg(seg, 8, &mut out);
-            }
-            out.sort_by_key(|b| b.at);
-            self.bends = out;
-            return;
+            return self.bends.clone();
         }
         // tick -> (onset of the winning source, raw 14-bit value).
         let mut lane: std::collections::BTreeMap<u32, (u32, u16)> = Default::default();
+        for b in self.bends.iter() {
+            lane.insert(b.at, (u32::MAX, b.val)); // unbeatable: seed wins ties
+        }
         let put = |lane: &mut std::collections::BTreeMap<u32, (u32, u16)>,
                        at: u32,
                        onset: u32,
@@ -472,19 +545,6 @@ impl Pattern {
                 }
             }
         };
-        // Legacy (orphan) segments first — same math as the old path.
-        for seg in self.bend_segs.iter() {
-            let t1 = seg.t1.max(seg.t0 + 1);
-            let steps = ((t1 - seg.t0) / 8).max(1);
-            let c = (seg.curve / 100.0).clamp(-1.0, 1.0);
-            for i in 0..=steps {
-                let s = i as f32 / steps as f32;
-                let sp = (s + c * s * (1.0 - s)).clamp(0.0, 1.0);
-                let v = seg.v0 + (seg.v1 - seg.v0) * sp;
-                let at = seg.t0 + ((t1 - seg.t0) as f64 * s as f64).round() as u32;
-                put(&mut lane, at, seg.t0, st_to_bend(v));
-            }
-        }
         // Note curves in onset order (later onsets overwrite on conflict).
         let mut items: Vec<(u32, usize, u32, u32)> = Vec::new(); // (onset, curve idx, note start, note len)
         for n in self.notes.iter() {
@@ -511,10 +571,9 @@ impl Pattern {
                 put(&mut lane, at, ns, st_to_bend(nb.cents_at(tn) * 0.01));
             }
         }
-        self.bends = lane
-            .iter()
-            .map(|(at, (_, v))| Bend { ch: 0, val: *v, at: *at })
-            .collect();
+        lane.into_iter()
+            .map(|(at, (_, v))| Bend { ch: 0, val: v, at })
+            .collect()
     }
 
     /// v52 R6: an imported file's raw bends (no `slooper-bnd` meta)
@@ -705,7 +764,11 @@ impl Pattern {
         }
         // v42/MPE lanes: 0xE carries LSB then MSB (7-bit halves), 0xA is
         // (note, pressure) — standard SMF voice encodings.
-        for b in &self.bends {
+        // v167 (pbc-1): the EXPORT law, not the audible lane — owned
+        // curves join here baked at the old ±12 st roll law (lossy
+        // interop; playback evaluates the raw curve as kind-7 events).
+        let export_bends = self.bake_bends_for_export();
+        for b in &export_bends {
             ev.push((
                 b.at,
                 vec![
@@ -1380,7 +1443,18 @@ mod tests {
         std::fs::remove_file(&f2).ok();
         assert!(q2.bend_segs.is_empty(), "owned seg migrated away");
         assert!(q2.notes[0].bend.is_some(), "…into the owning note's curve");
-        assert!(!q2.bends.is_empty(), "lane re-derived for old-app playback");
+        // v167 (pbc-1) CONTRACT CHANGE: owned curves LEFT the audible
+        // lane — the curve itself is the playback carrier (sample-accurate
+        // kind-7 events); old-app/foreign readers still receive the baked
+        // 0xE lane through the EXPORT bake (file shape unchanged there).
+        assert!(q2.bends.is_empty(), "v167: audible lane excludes owned curves");
+        assert!(
+            crate::audio::pattern_curve_events(&q2, 48_000)
+                .iter()
+                .any(|e| e.1 == crate::audio::KIND_CURVE),
+            "curve carrier survives the file"
+        );
+        assert!(!q2.bake_bends_for_export().is_empty(), "export bake keeps the old shape");
     }
 
     #[test]
@@ -1504,6 +1578,9 @@ mod tests {
         // A -12 st -> +12 st slide over a 480-tick note: dense 8-tick
         // grid, first sample -full-scale, last +full-scale, and NO
         // return-to-0 sample past the note end (hold-last semantics).
+        // v167 (pbc-1) RETARGETED: this is the EXPORT law now — the
+        // audible lane never carries owned curves (they play as
+        // sample-accurate kind-7 events; see v167_curve_* pins).
         let mut p = Pattern::new(120);
         let mut n = Note {
             ch: 0,
@@ -1518,16 +1595,19 @@ mod tests {
         n.bend = Some(0);
         p.notes.push(n);
         p.bake_bends();
-        assert!(!p.bends.is_empty(), "curve must populate the lane");
-        assert_eq!(p.bends.first().unwrap().at, 0);
-        assert_eq!(p.bends.first().unwrap().val, st_to_bend(-12.0), "starts at -full");
-        assert_eq!(p.bends.last().unwrap().at, 480);
-        assert_eq!(p.bends.last().unwrap().val, st_to_bend(12.0), "ends at +full");
-        let mid = p.bends.iter().find(|b| b.at == 240).unwrap();
+        assert!(p.bends.is_empty(), "v167: the audible lane EXCLUDES owned curves");
+        assert_eq!(p.curve_regions(), vec![(0, 480)], "the curve owns its note window");
+        let lane = p.bake_bends_for_export();
+        assert!(!lane.is_empty(), "curve must populate the EXPORT lane");
+        assert_eq!(lane.first().unwrap().at, 0);
+        assert_eq!(lane.first().unwrap().val, st_to_bend(-12.0), "starts at -full");
+        assert_eq!(lane.last().unwrap().at, 480);
+        assert_eq!(lane.last().unwrap().val, st_to_bend(12.0), "ends at +full");
+        let mid = lane.iter().find(|b| b.at == 240).unwrap();
         assert_eq!(mid.val, st_to_bend(0.0), "midpoint crosses zero");
-        assert_eq!(p.bends.len(), 61, "dense 8-tick grid, same density as bake_seg");
+        assert_eq!(lane.len(), 61, "dense 8-tick grid, same density as bake_seg");
         // Monotonic — no wobble, no post-note return samples.
-        for w in p.bends.windows(2) {
+        for w in lane.windows(2) {
             assert!(w[0].val < w[1].val, "monotonic sweep, ticks {}->{}", w[0].at, w[1].at);
             assert_eq!(w[1].at - w[0].at, 8);
         }
@@ -1559,13 +1639,16 @@ mod tests {
             bend: Some(1),
         });
         p.bake_bends();
+        // v167 (pbc-1): last-onset-wins is the EXPORT law now (playback
+        // delivers each note's own curve as kind-7 events).
+        let lane = p.bake_bends_for_export();
         // In the overlap (ticks 128..480) the lane must sit at B's +full.
-        for b in p.bends.iter().filter(|b| b.at >= 136 && b.at <= 472) {
+        for b in lane.iter().filter(|b| b.at >= 136 && b.at <= 472) {
             assert_eq!(b.val, st_to_bend(12.0), "tick {}: last-onset B must own", b.at);
         }
         // Before B's onset A owns it (sabotage polarity: would also be
         // true if the merge dropped everything — pin both sides).
-        let a_own = p.bends.iter().find(|b| b.at == 64).unwrap();
+        let a_own = lane.iter().find(|b| b.at == 64).unwrap();
         assert_eq!(a_own.val, st_to_bend(-12.0), "A owns pre-B territory");
     }
 
@@ -1669,7 +1752,16 @@ mod tests {
         assert_eq!(legacy_lane.len(), 61);
         p.migrate_bend_segs();
         p.bake_bends();
-        assert_eq!(p.bends, legacy_lane, "migrated re-bake must be bit-identical");
+        // v167 (pbc-1) RETARGETED: the migrated curve now plays as
+        // sample-accurate kind-7 events (lane EXCLUDES it), but the
+        // EXPORT law must stay bit-identical to the legacy bake_seg —
+        // that is what foreign MIDI consumers still receive.
+        assert!(p.bends.is_empty(), "v167: owned curve left the audible lane");
+        assert_eq!(
+            p.bake_bends_for_export(),
+            legacy_lane,
+            "migrated curve's EXPORT bake must be bit-identical to bake_seg"
+        );
     }
 
     #[test]
@@ -1703,7 +1795,10 @@ mod tests {
             bend: None,
         });
         p.bake_bends();
-        let before = p.bends.clone();
+        // v167 (pbc-1): the audible lane is empty (owned curves excluded);
+        // what crosses the .mid wire is the EXPORT bake.
+        assert!(p.bends.is_empty(), "v167: lane excludes owned curves");
+        let before = p.bake_bends_for_export();
         assert!(!before.is_empty());
         let f = std::env::temp_dir().join(format!("sp-v101rt-{}.mid", std::process::id()));
         p.save_mid(&f).unwrap();
@@ -1779,10 +1874,14 @@ mod tests {
         assert!((m.note_bends[n64.bend.unwrap() as usize].cents_at(0.5) - 600.0).abs() < 0.5,
             "handle resolves to ITS OWN curve (cross-wire sabotage check)");
         m.bake_bends();
+        // v167 (pbc-1): the audible lane stays EMPTY (owned curves play as
+        // kind-7 events); last-onset-wins survives as the EXPORT law.
+        assert!(m.bends.is_empty(), "v167: lane excludes owned curves");
         // Last-onset-wins on total overlap: equal onsets, sorted-stable
         // later entry (n64) takes the lane — just prove BOTH curves'
-        // values appear and the lane is sound.
-        assert!(!m.bends.is_empty());
+        // values appear and the export lane is sound.
+        let lane = m.bake_bends_for_export();
+        assert!(!lane.is_empty());
     }
 
     #[test]
@@ -1812,7 +1911,9 @@ mod tests {
             bend: Some(1),
         });
         p.bake_bends();
-        let lane_both = p.bends.len();
+        // v167 (pbc-1): lane-vs-export as above — the deletion story must
+        // hold in the EXPORT shape (the audible lane is empty throughout).
+        let lane_both = p.bake_bends_for_export().len();
         // Remove the first note (what the UI delete sites do).
         p.notes.remove(0);
         if p.has_note_bends() {
@@ -1826,15 +1927,18 @@ mod tests {
             "remapped handle still resolves to the SURVIVOR'S curve"
         );
         p.bake_bends();
-        // Lane lost the -600 region entirely: every lane sample is the
-        // +900 st level now (sabotage: forgetting bake leaves -600 tails).
-        assert!(p.bends.len() < lane_both, "lane shrank with the deleted curve");
-        for b in p.bends.iter().filter(|b| b.at >= 480) {
+        assert!(p.bends.is_empty(), "v167: audible lane excluded curves all along");
+        // Export lost the -600 region entirely: every export sample is the
+        // +900 st level now (sabotage: forgetting the delete leaves -600
+        // tails).
+        let lane = p.bake_bends_for_export();
+        assert!(lane.len() < lane_both, "export lane shrank with the deleted curve");
+        for b in lane.iter().filter(|b| b.at >= 480) {
             assert_eq!(b.val, st_to_bend(9.0), "post-survival lane is pure survivor");
         }
         assert!(
-            !p.bends.iter().take_while(|b| b.at < 480).any(|b| (b.val as i32 - st_to_bend(-6.0) as i32).abs() < 4),
-            "deleted note's curve fully GONE from the lane"
+            !lane.iter().take_while(|b| b.at < 480).any(|b| (b.val as i32 - st_to_bend(-6.0) as i32).abs() < 4),
+            "deleted note's curve fully GONE from the export lane"
         );
     }
 
@@ -1855,5 +1959,143 @@ mod tests {
         bake_seg(&p.bend_segs[0], 8, &mut direct);
         direct.sort_by_key(|b| b.at);
         assert_eq!(p.bends, direct, "legacy path must not change AT ALL");
+    }
+
+    // ---- v167 (card t_879a77ef): curve-carrier migration & export laws ----
+
+    /// Migration (pb-2 law) under the v167 carrier: a legacy OWNED segment
+    /// becomes the note's curve with cents == old lane values x100
+    /// BIT-EXACT, the curve (not the lane) owns playback, and the SMF
+    /// export bake reproduces the old bake_seg bit-identically. The 12-EDO
+    /// default tune is v164-owned and untouched here.
+    #[test]
+    fn v167_curve_migration_pitch() {
+        let mut p = Pattern::new(120);
+        p.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 480,
+            bend: None,
+        });
+        p.bend_segs.push(BendSeg { t0: 0, t1: 480, v0: 0.0, v1: 6.0, curve: 0.0 });
+        p.migrate_bend_segs();
+        let i = p.notes[0].bend.expect("owned seg became a curve");
+        let nb = &p.note_bends[i as usize];
+        assert_eq!(nb.pts.len(), 2);
+        assert_eq!(nb.pts[0], (0.0, 0.0));
+        assert_eq!(nb.pts[1], (1.0, 600.0), "curve cents == old seg x100, bit-exact");
+        // v167: the curve is the carrier.
+        assert_eq!(p.curve_regions(), vec![(0, 480)], "curve owns its note window");
+        assert_eq!(p.curve_demand_st(), 6, "RPN0 demand == widest curve (st)");
+        p.bake_bends();
+        assert!(p.bends.is_empty(), "migrated owned curves left the audible lane");
+        let ev = crate::audio::pattern_curve_events(&p, 48_000);
+        assert!(!ev.is_empty() && ev.iter().all(|e| e.1 == crate::audio::KIND_CURVE));
+        // SMF consumers get the OLD shape, bit-identically.
+        let mut legacy = Vec::new();
+        bake_seg(&BendSeg { t0: 0, t1: 480, v0: 0.0, v1: 6.0, curve: 0.0 }, 8, &mut legacy);
+        legacy.sort_by_key(|b| b.at);
+        assert_eq!(
+            p.bake_bends_for_export(),
+            legacy,
+            "migrated curve's export bake == old bake_seg, bit-identical"
+        );
+    }
+
+    /// A drawn curve (on the milli-t / hundredth-cent storage grid)
+    /// survives save/load bit-exactly, and its sample-accurate carrier
+    /// stream + note window are identical after the round trip.
+    #[test]
+    fn v167_curve_roundtrip_bitexact() {
+        let mut p = Pattern::new(120);
+        p.notes.push(Note {
+            ch: 1,
+            note: 63,
+            vel: 90,
+            press: 0,
+            start: 24,
+            len: 360,
+            bend: Some(0),
+        });
+        p.note_bends.push(NoteBend::new(vec![
+            (0.0, -37.5),
+            (0.25, 91.25),
+            (0.5, -1234.5),
+            (0.75, 2399.75),
+            (1.0, 0.0),
+        ]));
+        p.len_ticks = 960;
+        let f = std::env::temp_dir().join(format!("sp-v167rt-{}.mid", std::process::id()));
+        p.save_mid(&f).unwrap();
+        let q = Pattern::load_mid(&f).unwrap();
+        std::fs::remove_file(&f).ok();
+        let qi = q.notes[0].bend.expect("curve survives save/load");
+        assert_eq!(
+            q.note_bends[qi as usize].pts,
+            p.note_bends[0].pts,
+            "curve points bit-exact across the round trip"
+        );
+        assert_eq!(q.curve_regions(), vec![(24, 384)], "carrier window round-trips");
+        assert_eq!(
+            crate::audio::pattern_curve_events(&q, 48_000),
+            crate::audio::pattern_curve_events(&p, 48_000),
+            "sample-accurate carrier stream identical after round trip"
+        );
+    }
+
+    /// SMF export is DOCUMENTED LOSSY INTEROP: a +-24 st curve clamps at
+    /// the wire's +-12 st full scale on export, while the playback carrier
+    /// reads the RAW curve (unclamped). The audible lane stays empty.
+    #[test]
+    fn v167_export_lane_bakes_curves() {
+        let mut p = Pattern::new(120);
+        p.notes.push(Note {
+            ch: 0,
+            note: 60,
+            vel: 100,
+            press: 0,
+            start: 0,
+            len: 480,
+            bend: Some(0),
+        });
+        p.note_bends.push(NoteBend::new(vec![(0.0, -2400.0), (1.0, 2400.0)]));
+        p.bake_bends();
+        assert!(p.bends.is_empty(), "audible lane untouched by the export law");
+        let lane = p.bake_bends_for_export();
+        assert!(!lane.is_empty(), "curve must populate the export lane");
+        // Hard wire clamp: beyond full scale the bake lands on the raw
+        // extremes themselves (0 = full down, 16383 = full up).
+        assert_eq!(lane.first().unwrap().val, 0, "starts clamped at the wire floor");
+        assert_eq!(lane.last().unwrap().val, 16383, "ends clamped at the wire top");
+        // No mid-span excursion past the extremes either: the crossing
+        // through 0 st must be a real mid-wire sample, not an artifact.
+        let mid = lane.iter().find(|b| b.val >= 8000 && b.val <= 8500).expect("mid-wire sample");
+        assert!(mid.at > 0 && mid.at < 480, "sweep crosses center inside the note span");
+        // Playback: UNCLAMPED to +-24 st — the whole point of the carrier.
+        let ev = crate::audio::pattern_curve_events(&p, 48_000);
+        assert!(!ev.is_empty());
+        let mx = ev.iter().map(|e| crate::audio::curve_st(e.3, e.4).abs()).fold(0f32, f32::max);
+        assert!(mx > 23.9, "playback reaches +-24 st unclamped: {mx}");
+    }
+
+    /// Hardware/controller flows survive: orphan segments + hand-imported
+    /// lane bends keep the PRE-v167 lane law verbatim, and with no curves
+    /// the export bake is the identity (lane == export), demand/regions
+    /// inert. (The queue-side roll law is pinned by v103_bend_rescale_law.)
+    #[test]
+    fn v167_wheel_lane_untouched() {
+        let mut p = Pattern::new(120);
+        p.bend_segs.push(BendSeg { t0: 100, t1: 580, v0: -2.0, v1: 3.0, curve: 40.0 });
+        p.bake_bends();
+        let mut direct = Vec::new();
+        bake_seg(&p.bend_segs[0], 8, &mut direct);
+        direct.sort_by_key(|b| b.at);
+        assert_eq!(p.bends, direct, "legacy lane law byte-identical");
+        assert!(p.curve_regions().is_empty(), "no notes, no regions");
+        assert_eq!(p.curve_demand_st(), 0, "no curve, no RPN0 demand");
+        assert_eq!(p.bake_bends_for_export(), p.bends, "curve-free: export lane == audible lane");
     }
 }
