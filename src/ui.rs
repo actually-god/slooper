@@ -19856,7 +19856,7 @@ impl App {
         if self.edo_fonts_gen != self.edo_fonts_installed_gen {
             self.edo_fonts_installed_gen = self.edo_fonts_gen;
             self.edo_packs_active = false; // queued definitions activate at the START of the next pass
-            apply_edo_fonts(&ui.ctx(), &self.edo_pack_infos);
+            apply_edo_fonts(ui.ctx(), &self.edo_pack_infos);
         } else {
             self.edo_packs_active = true;
         }
@@ -32825,7 +32825,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                         )
                         .clicked()
                     {
-                        rescan_edo_packs(app, &ui.ctx());
+                        rescan_edo_packs(app, ui.ctx());
                     }
                 });
                 if let Some(pick) = pack_pick {

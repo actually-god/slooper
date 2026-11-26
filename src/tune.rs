@@ -999,7 +999,7 @@ mod tests {
     /// must ship files the scanner's skrifa gate ACCEPTS, on any OS.
     fn v172_real_font() -> Vec<u8> {
         let fd = egui::FontDefinitions::default();
-        (&*fd.font_data["Hack"].font).to_vec()
+        fd.font_data["Hack"].font.to_vec()
     }
 
     #[test]
