@@ -468,6 +468,16 @@ struct RecSrc {
     auto: bool,
 }
 
+/// v169: a live partial take shown while a take rolls. `at` is the playhead
+/// position the current pass armed at; `frames` the samples captured so far
+/// (deltas appended per `Evt::TakeProgress`; a pass with a different `at` —
+/// loop record — restarts the buffer).
+#[derive(Clone, Default)]
+struct LiveTake {
+    at: u64,
+    frames: Vec<f32>,
+}
+
 /// v0.11 R5: the automation manager window's editing state.
 struct AutoEdit {
     /// Existing asset being edited in place (None = unsaved new curve).
@@ -1897,6 +1907,11 @@ pub struct App {
     auto_rec: Vec<AutoRecState>,
     /// v29: per-track sources armed by the single REC button.
     rec_src: Vec<RecSrc>,
+    /// v169: rolling partial takes — one per track currently recording an
+    /// audio/preview/loop take. Grows from `Evt::TakeProgress` deltas, is
+    /// replaced by the final `Evt::Take` (or dropped by `Evt::TakeDiscarded`),
+    /// and paints as a live "ghost" clip on the track's last lane.
+    live_takes: Vec<Option<LiveTake>>,
     /// v52 R4: tracks joined to the RECORD GROUP, in JOIN ORDER (front =
     /// oldest). The top-bar "REC GROUP" master arms/stops every member at
     /// once; the loop ("l") selector is LINKED across members (a joining
@@ -2607,6 +2622,7 @@ impl App {
             chrome_closing: std::collections::HashSet::new(),
             midi_rec: vec![MidiRecState::default(); MAX_LOOPS],
             auto_rec: vec![AutoRecState::default(); MAX_LOOPS],
+            live_takes: (0..MAX_LOOPS).map(|_| None).collect(),
             rec_src: (0..MAX_LOOPS)
                 .map(|t| {
                     let a = cfg.rec_src.get(t).copied().unwrap_or([true, false, false]);
@@ -8276,9 +8292,8 @@ impl App {
                 start: self.backend.engine.pos(),
                 caps: Vec::new(),
             };
-            if !self.backend.engine.transport_on() {
-                self.backend.cmd(Cmd::PlayAll);
-            }
+            // v169: one transport-start seam for every recorder.
+            self.start_transport_now();
             self.status = format!(
                 "track {}: automation recording \u{2014} MOVE the control you want to capture",
                 i + 1
@@ -11112,9 +11127,10 @@ impl App {
             // v32: the live feed must cover armed tracks (the player hears
             // the take they are laying down) — RT reads this mirror.
             self.backend.engine.set_midi_rec_arm(i, true);
-            if !self.backend.engine.transport_on() {
-                self.backend.cmd(Cmd::PlayAll);
-            }
+            // v169: one transport-start seam for every recorder (was a
+            // Cmd::PlayAll round trip — same engine effect, now synchronous
+            // and headless-observable like the rest of the arm).
+            self.start_transport_now();
             self.status = format!("track {}: MIDI recording…", i + 1);
         }
     }
@@ -12935,29 +12951,28 @@ impl App {
         // resize handles, same language as the loop-area handles)
         const EDGE_PX: f32 = 6.0;
         // v105 (pb-3, spec docs/SAMPLER-PITCH.md § 4 VISUAL): per-note
-        // pitch-curve trail geometry. The trail box rides the note's ROW:
-        // ±trail_half px around the row center; ±1200 ¢ fills it, and a
-        // bigger curve auto-scales (rounded up to 600 ¢ steps, cap ±2400)
-        // so everything drawn stays visible. Drawing sensitivity follows
-        // the same map — the stroke under the pointer IS the painted curve.
+        // pitch-curve trail geometry. The trail rides the note's ROW:
+        // ±trail_half px around the row center = ±1200 ¢.
+        // v168 (pbc-2-gui): the 600¢-step compressing auto-scale is
+        // RETIRED — px-per-cent is CONSTANT (1200 ¢ = trail_half =
+        // max(2·row_h,24) px, v105-identical for any curve within ±1200 ¢)
+        // and beyond that the trail EXTENDS with the curve: a ±2400 ¢ swing
+        // paints ±2·trail_half and drags with the same sensitivity, up to
+        // the model cap NB_MAX_CENTS. Unlimited range, constant aiming
+        // precision, and "zoom rows" (Alt+wheel) doubles as the curve-zoom
+        // knob (row_h grows → trail_half grows → cents-per-pixel shrink).
         let trail_half = (2.0 * roll.row_h).max(24.0);
+        let px_per_cent = trail_half / 1200.0;
         let nb_of = |n: &crate::midipat::Note| -> Option<&crate::midipat::NoteBend> {
             n.bend
                 .and_then(|i| roll.pat.note_bends.get(i as usize))
                 .filter(|nb| nb.active())
         };
-        let nb_disp = |pts: &[(f32, f32)]| -> f32 {
-            let mx = pts.iter().fold(0f32, |a, p| a.max(p.1.abs()));
-            if mx <= 1200.0 {
-                1200.0
-            } else {
-                (mx.ceil() / 600.0 * 600.0).min(2400.0)
-            }
-        };
         let row_c = |n: i32| y_of(n) + roll.row_h * 0.5;
-        let y_of_c = |n: i32, disp: f32, c: f32| row_c(n) - c / disp * trail_half;
-        let c_at_y = |n: i32, disp: f32, y: f32| {
-            ((row_c(n) - y) / trail_half * disp).clamp(-2400.0, 2400.0)
+        let y_of_c = |n: i32, c: f32| row_c(n) - c * px_per_cent;
+        let c_at_y = |n: i32, y: f32| {
+            ((row_c(n) - y) / px_per_cent)
+                .clamp(-crate::midipat::NB_MAX_CENTS, crate::midipat::NB_MAX_CENTS)
         };
         let hover = ui.input(|i| i.pointer.hover_pos());
         for (idx, note) in roll.pat.notes.iter().enumerate() {
@@ -13008,7 +13023,6 @@ impl App {
             // endpoint-drag targets).
             if let Some(nb) = nb_of(note) {
                 let dur = dur.max(1e-6);
-                let disp = nb_disp(&nb.pts);
                 let tcol = if is_sel {
                     Color32::from_rgb(250, 200, 50)
                 } else {
@@ -13018,7 +13032,7 @@ impl App {
                 let mut tx = x0.max(grid_x0);
                 while tx <= x1 {
                     let t = ((sec_at(tx) - s0) / dur).clamp(0.0, 1.0);
-                    let q = egui::pos2(tx, y_of_c(n, disp, nb.cents_at(t as f32)));
+                    let q = egui::pos2(tx, y_of_c(n, nb.cents_at(t as f32)));
                     if let Some(p) = prev {
                         painter.line_segment([p, q], egui::Stroke::new(1.6f32, tcol));
                     }
@@ -13030,7 +13044,7 @@ impl App {
                         let endp = k == 0 || k + 1 == nb.pts.len();
                         let q = egui::pos2(
                             x_of(s0 + *pt_t as f64 * dur),
-                            y_of_c(n, disp, *pt_c),
+                            y_of_c(n, *pt_c),
                         );
                         painter.circle_filled(q, if endp { 4.0 } else { 3.0 }, tcol);
                     }
@@ -13040,12 +13054,11 @@ impl App {
             if matches!(roll.gesture, RollGesture::NbDraw { idx: d } if d == idx)
                 && roll.nb_live.len() >= 2
             {
-                let disp = nb_disp(&roll.nb_live);
                 let mut prev: Option<egui::Pos2> = None;
                 for (pt_t, pt_c) in roll.nb_live.iter() {
                     let q = egui::pos2(
                         x_of(s0 + *pt_t as f64 * dur),
-                        y_of_c(n, disp, *pt_c),
+                        y_of_c(n, *pt_c),
                     );
                     if let Some(p) = prev {
                         painter.line_segment(
@@ -13303,11 +13316,10 @@ impl App {
                 if pt.x < x0 - 8.0 || pt.x > x1 + 8.0 {
                     continue;
                 }
-                let disp = nb_disp(&nb.pts);
                 for (pi, (pt_t, pt_c)) in nb.pts.iter().enumerate() {
                     let q = egui::pos2(
                         x_of(s0 + *pt_t as f64 * dur),
-                        y_of_c(n.note as i32, disp, *pt_c),
+                        y_of_c(n.note as i32, *pt_c),
                     );
                     if (pt - q).length() <= 8.0 {
                         return Some((ni, pi));
@@ -13347,23 +13359,51 @@ impl App {
         // hovers a note (the wheel-trim control has no slider, so
         // it needs to be told the value directly).
         if let Some(hp) = hover {
-            if let Some((i, _, _)) = note_hit(&roll.pat.notes, hp) {
+            // v168 (pbc-2): the hover probe answers for the note body AND
+            // for curve dots — a dot's readout works even when the dot
+            // rides above/below the body (big curves, small rows).
+            let hit = note_hit(&roll.pat.notes, hp);
+            let dot_hit = nb_dot_hit(&roll.pat.notes, &roll.sel_notes, &roll.pat.note_bends, hp);
+            let note_i = hit.map(|(i, _, _)| i).or_else(|| dot_hit.map(|(ni, _)| ni));
+            if let Some(i) = note_i {
                 if let Some(n) = roll.pat.notes.get(i) {
                     // v105: the readout says whether THIS note has a curve
                     // and what the next gesture would be (discoverability).
                     let curve = nb_of(n).is_some();
+                    // v168 (pbc-2): hovering a curve DOT reads out that
+                    // point's live pitch — the EDO-aware label on the
+                    // canvas, same status-echo channel (v71/v72 law).
+                    let mut dot_txt = String::new();
+                    if let (Some(ci), Some((_, pi))) =
+                        (n.bend, dot_hit.filter(|(ni, _)| *ni == i))
+                    {
+                        let pt = roll
+                            .pat
+                            .note_bends
+                            .get(ci as usize)
+                            .and_then(|nb| nb.pts.get(pi))
+                            .copied();
+                        if let Some((_, c)) = pt {
+                            dot_txt = format!(
+                                " \u{b7} dot {} ({:+.0} cents)",
+                                crate::tune::label_pitch_text_live(n.note as i32, c),
+                                c
+                            );
+                        }
+                    }
                     painter.text(
                         hp + egui::vec2(14.0, 14.0),
                         egui::Align2::LEFT_TOP,
                         format!(
-                            "{} \u{b7} vel {} \u{b7} wheel to change \u{b7} RMB: length{}",
+                            "{} \u{b7} vel {} \u{b7} wheel to change \u{b7} RMB: length{}{}",
                             note_name(n.note),
                             n.vel,
                             if curve {
                                 " \u{b7} curve: drag dots \u{b7} Shift+RMB removes it"
                             } else {
                                 " \u{b7} Z+drag: draw pitch curve"
-                            }
+                            },
+                            dot_txt
                         ),
                         egui::FontId::proportional(9.0),
                         Color32::from_rgb(230, 230, 170),
@@ -13565,8 +13605,7 @@ impl App {
                         if let Some(ci) = cur.map(|c| c as usize) {
                             if let Some(nb) = roll.pat.note_bends.get(ci).filter(|nb| nb.active())
                             {
-                                let disp = nb_disp(&nb.pts);
-                                let c0 = c_at_y(row, disp, pt.y);
+                                let c0 = c_at_y(row, pt.y);
                                 roll.nb_base = nb.pts.clone();
                                 roll.gesture = RollGesture::NbWarp { idx, c0 };
                                 warping = true;
@@ -13806,16 +13845,24 @@ impl App {
                     RollGesture::NbDraw { idx } => {
                         // Freehand stroke: append the pointer to nb_live with
                         // strictly increasing t (back-strokes just update the
-                        // last sample). Drawing scale = 1200 ¢ per trail half,
+                        // last sample). Scale = 1200 ¢ per trail half,
                         // identical to the paint (WYSIWYG under the pointer).
                         if in_grid(pt) {
+                            let mut echo: Option<String> = None;
                             if let Some(n) = roll.pat.notes.get(idx) {
                                 let s0 = t_of(n.start);
                                 let dur = t_of(n.len.max(1)).max(1e-6);
                                 let row = n.note as i32;
                                 let t =
                                     ((sec_at(pt.x) - s0) / dur).clamp(0.0, 1.0) as f32;
-                                let c = c_at_y(row, 1200.0, pt.y);
+                                let c = c_at_y(row, pt.y);
+                                // v168 (pbc-2): the LIVE pitch under the pen
+                                // — EDO-aware label + cents, every frame.
+                                echo = Some(format!(
+                                    "drawing \u{b7} {} \u{b7} {:+.0} cents",
+                                    crate::tune::label_pitch_text_live(row, c),
+                                    c
+                                ));
                                 let live = &mut roll.nb_live;
                                 let extend = live.last().is_some_and(|lp| t - lp.0 >= 1e-4);
                                 if extend {
@@ -13825,6 +13872,9 @@ impl App {
                                 } else {
                                     live.push((t, c));
                                 }
+                            }
+                            if let Some(e) = echo {
+                                self.status = e;
                             }
                         }
                     }
@@ -13840,20 +13890,27 @@ impl App {
                             .get(idx)
                             .map(|n| (n.note as i32, t_of(n.start), t_of(n.len.max(1)).max(1e-6)));
                         let mut edited = false;
+                        let mut echo: Option<String> = None;
                         if let (Some(ci), Some((row, s0, dur))) = (ci, geo) {
                             if let Some(nb) = roll.pat.note_bends.get_mut(ci as usize) {
                                 if pi < nb.pts.len() {
-                                    let disp = nb_disp(&nb.pts);
                                     let sec = sec_at(pt.x);
                                     let t = if mods.shift {
                                         (snap(sec) - s0) / dur
                                     } else {
                                         (sec - s0) / dur
                                     };
-                                    let mut c = c_at_y(row, disp, pt.y);
+                                    let mut c = c_at_y(row, pt.y);
                                     if mods.ctrl {
                                         c = (c / 100.0).round() * 100.0;
                                     }
+                                    // v168 (pbc-2): the dragged point's live
+                                    // pitch — EDO-aware label + cents.
+                                    echo = Some(format!(
+                                        "curve point \u{b7} {} \u{b7} {:+.0} cents",
+                                        crate::tune::label_pitch_text_live(row, c),
+                                        c
+                                    ));
                                     let last = nb.pts.len() - 1;
                                     if pi == 0 || pi == last {
                                         nb.pts[pi].1 = c;
@@ -13868,6 +13925,9 @@ impl App {
                                 }
                             }
                         }
+                        if let Some(e) = echo {
+                            self.status = e;
+                        }
                         if edited {
                             roll.pat.bake_bends();
                             roll.changed = true;
@@ -13879,6 +13939,7 @@ impl App {
                         // compounding drag would runaway).
                         let ci = roll.pat.notes.get(idx).and_then(|n| n.bend);
                         let mut edited = false;
+                        let mut echo: Option<String> = None;
                         if let Some(ci) = ci {
                             if !roll.nb_base.is_empty() {
                                 let row = match roll.pat.notes.get(idx) {
@@ -13886,8 +13947,13 @@ impl App {
                                     None => 0,
                                 };
                                 if roll.pat.notes.get(idx).is_some() {
-                                    let disp = nb_disp(&roll.nb_base);
-                                    let c = c_at_y(row, disp, pt.y);
+                                    let c = c_at_y(row, pt.y);
+                                    // v168 (pbc-2): pitch under the warp pen.
+                                    echo = Some(format!(
+                                        "warping \u{b7} {} \u{b7} {:+.0} cents",
+                                        crate::tune::label_pitch_text_live(row, c),
+                                        c
+                                    ));
                                     // Near-zero anchor cannot carry a ratio —
                                     // warp additively over an octave instead.
                                     let f = if c0.abs() > 24.0 {
@@ -13904,13 +13970,22 @@ impl App {
                                             .nb_base
                                             .iter()
                                             .map(|(t, v)| {
-                                                (*t, (v * f).clamp(-2400.0, 2400.0))
+                                                (
+                                                    *t,
+                                                    (v * f).clamp(
+                                                        -crate::midipat::NB_MAX_CENTS,
+                                                        crate::midipat::NB_MAX_CENTS,
+                                                    ),
+                                                )
                                             })
                                             .collect();
                                         edited = true;
                                     }
                                 }
                             }
+                        }
+                        if let Some(e) = echo {
+                            self.status = e;
                         }
                         if edited {
                             roll.pat.bake_bends();
@@ -14015,7 +14090,7 @@ impl App {
                         });
                         let end_c = land
                             .map(|tn| (tn.note as i32 - srcrow) as f32 * 100.0)
-                            .unwrap_or_else(|| c_at_y(srcrow, 1200.0, pt.y));
+                            .unwrap_or_else(|| c_at_y(srcrow, pt.y));
                         let mut pts: Vec<(f32, f32)> =
                             live.into_iter().filter(|p| p.0 < 0.995).collect();
                         pts.push((1.0, end_c));
@@ -14038,8 +14113,9 @@ impl App {
                         roll.changed = true;
                         *preview = true;
                         *curve_echo = Some(format!(
-                            "pitch curve on {} \u{b7} {npts} pts \u{b7} ends {end_c:+.0} cents \u{b7} drag a dot to edit",
-                            note_name(roll.pat.notes[idx].note)
+                            "pitch curve on {} \u{b7} {npts} pts \u{b7} ends {end_c:+.0} cents ({}) \u{b7} drag a dot to edit",
+                            note_name(roll.pat.notes[idx].note),
+                            crate::tune::label_pitch_text_live(srcrow, end_c)
                         ));
                     } else if !live.is_empty() {
                         self.status = "curve too short \u{b7} drag a longer stroke across the note".into();
@@ -14061,8 +14137,15 @@ impl App {
                         roll.changed = true;
                         *preview = true;
                         if let Some((t, c)) = echo {
-                            *curve_echo =
-                                Some(format!("curve point \u{b7} t {t:.2} at {c:+.0} cents"));
+                            let row = roll.pat.notes.get(idx).map(|n| n.note as i32);
+                            *curve_echo = Some(match row {
+                                Some(row) => format!(
+                                    "curve point \u{b7} t {t:.2} at {c:+.0} cents ({})",
+                                    crate::tune::label_pitch_text_live(row, c)
+                                ),
+                                None =>
+                                    format!("curve point \u{b7} t {t:.2} at {c:+.0} cents"),
+                            });
                         }
                     }
                 } else if let RollGesture::NbWarp { idx, .. } = roll.gesture {
@@ -14080,7 +14163,14 @@ impl App {
                         roll.changed = true;
                         *preview = true;
                         if let Some(c) = end_c {
-                            *curve_echo = Some(format!("curve warped \u{b7} ends {c:+.0} cents"));
+                            let row = roll.pat.notes.get(idx).map(|n| n.note as i32);
+                            *curve_echo = Some(match row {
+                                Some(row) => format!(
+                                    "curve warped \u{b7} ends {c:+.0} cents ({})",
+                                    crate::tune::label_pitch_text_live(row, c)
+                                ),
+                                None => format!("curve warped \u{b7} ends {c:+.0} cents"),
+                            });
                         }
                     }
                 } else if was_move && roll.changed {
@@ -17325,6 +17415,27 @@ impl App {
         self.save_config();
     }
 
+    /// v169: start the transport straight from the GUI thread, exactly
+    /// mirroring `Cmd::PlayAll`'s engine semantics (play at/past the end
+    /// restarts at the top; auditions clear before a real take). The engine
+    /// atomics are the single transport truth the GUI mirrors, so a direct
+    /// poke needs no manager round trip — the record buttons arm synchronously
+    /// (v29 doctrine) and the take's `rec_at` snapshot lands on the running
+    /// position. Shared by the audio, MIDI and automation record arms so no
+    /// recorder can drift from the "recording starts playback" contract.
+    fn start_transport_now(&mut self) {
+        if self.sample_rate == 0 || self.backend.engine.transport_on() {
+            return;
+        }
+        let e = &self.backend.engine;
+        if e.pos() >= e.proj_len() {
+            e.seek_to(0);
+        }
+        e.stop_preview();
+        e.stop_audition();
+        e.set_transport(true);
+    }
+
     fn toggle_record(&mut self, i: usize) {
         if self.sample_rate == 0 {
             self.status = "record: wait for the audio engine".into();
@@ -17368,6 +17479,12 @@ impl App {
             );
             return;
         }
+        // v169: recording means playback — the transport starts right now
+        // from the current position (both guards above unchanged). The echo
+        // goes first so the arm paths' own messages ('a' wins / LOOP hint)
+        // still get the last word.
+        self.start_transport_now();
+        self.status = format!("track {}: recording…", i + 1);
         // v42 "p": the preview take rides the SAME take buffer as the audio
         // take — arm it via the engine's preview flag (snapshotted by
         // start_rec). 'a' wins if both are ticked; the clash is announced.
@@ -18971,7 +19088,37 @@ impl App {
                 at,
                 data,
                 preview,
-            } => self.take_pipeline(track, at, data, preview),
+            } => {
+                // v169: the final asset clip replaces the live ghost —
+                // clear BEFORE the pipeline so no frame ever shows both.
+                if let Some(slot) = self.live_takes.get_mut(track) {
+                    *slot = None;
+                }
+                self.take_pipeline(track, at, data, preview);
+            }
+            // v169: live partial take — grow (or restart, on a new pass /
+            // new track) the ghost for this take.
+            Evt::TakeProgress { track, at, frames } => {
+                if let Some(slot) = self.live_takes.get_mut(track) {
+                    match slot.as_mut() {
+                        Some(live) if live.at == at => {
+                            live.frames.extend_from_slice(&frames);
+                        }
+                        _ => {
+                            *slot = Some(LiveTake {
+                                at,
+                                frames: frames.to_vec(),
+                            });
+                        }
+                    }
+                }
+            }
+            // v169: take discarded (empty stop / empty claim) — ghost gone.
+            Evt::TakeDiscarded { track } => {
+                if let Some(slot) = self.live_takes.get_mut(track) {
+                    *slot = None;
+                }
+            }
 
             Evt::Midi(raw) => {
                 if let Some(msg) = MidiMsg::parse(&raw.bytes) {
@@ -28288,6 +28435,77 @@ fn lane_row(
             egui::Stroke::new(2.0, COL_GHOST),
             egui::StrokeKind::Inside,
         );
+    }
+    // v169: live take ghost — a rolling audio/preview/loop take paints on
+    // the track's LAST lane: a red grow-rect whose extent grows with every
+    // Evt::TakeProgress batch, a peak-column waveform, and a "REC s" read.
+    // The final Evt::Take clears the ghost in handle_evt BEFORE take_pipeline
+    // places the real clip, so ghost and result never coexist (and a
+    // discarded take clears it too).
+    if k + 1 == app.arr.tracks[t].lanes.len().max(1) {
+        if let Some(live) = app.live_takes.get(t).and_then(|o| o.as_ref()) {
+            let lx0 = x_of(x0, live.at, sr, px);
+            let lx1 = x_of(x0, live.at + live.frames.len() as u64, sr, px);
+            if lx1 > rect.min.x && lx0 < rect.max.x {
+                let gres = egui::Rect::from_min_max(
+                    egui::pos2(lx0.max(rect.min.x), rect.min.y + 1.0),
+                    egui::pos2(lx1.min(rect.max.x), rect.max.y - 1.0),
+                );
+                ui.painter().rect_filled(
+                    gres,
+                    2.0,
+                    Color32::from_rgba_unmultiplied(196, 64, 64, 80),
+                );
+                ui.painter().rect_stroke(
+                    gres,
+                    2.0,
+                    egui::Stroke::new(1.5, Color32::from_rgb(255, 90, 90)),
+                    egui::StrokeKind::Inside,
+                );
+                // Peak columns: a bounded scan (>=1 sample per column,
+                // striding up to ~64 samples/column) keeps the per-frame
+                // cost trivial even near the ~60 s buffer cap.
+                let n = live.frames.len();
+                let cols = ((gres.width() / 2.0).floor() as usize).clamp(1, 4096);
+                if n > 0 && gres.width() > 3.0 {
+                    let per = n.div_ceil(cols).max(1);
+                    let step = (per / 64).max(1);
+                    let mid = gres.center().y;
+                    let half = (gres.height() / 2.0 * 0.8).max(1.0);
+                    let mut col = 0usize;
+                    let mut a = 0usize;
+                    let colw = gres.width() / cols as f32;
+                    while col < cols && a < n {
+                        let b = (a + per).min(n);
+                        let mut p = 0.0f32;
+                        let mut j = a;
+                        while j < b {
+                            let v = live.frames[j].abs();
+                            if v > p {
+                                p = v;
+                            }
+                            j += step;
+                        }
+                        let gx = gres.min.x + (col as f32 + 0.5) * colw;
+                        let hh = (p.min(2.0) / 2.0 * half).max(0.8);
+                        ui.painter().line_segment(
+                            [egui::pos2(gx, mid - hh), egui::pos2(gx, mid + hh)],
+                            egui::Stroke::new(1.0, Color32::from_rgb(255, 150, 150)),
+                        );
+                        col += 1;
+                        a = b;
+                    }
+                    let secs = live.frames.len() as f64 / sr.max(1.0);
+                    ui.painter().text(
+                        gres.min + egui::vec2(3.0, 1.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("REC {secs:.1}s"),
+                        egui::FontId::proportional(9.0),
+                        Color32::from_rgb(255, 210, 210),
+                    );
+                }
+            }
+        }
     }
     ui.set_clip_rect(old_clip);
 
@@ -45220,6 +45438,267 @@ mod tests {
             !app.backend.engine.rec_loop_armed(0),
             "STOP clears the loop"
         );
+    }
+
+    /// v169 AC1: pressing the track REC button starts the transport right
+    /// away from the current position — no separate Play. Both classic
+    /// guards keep their veto, a MIDI-only arm shares the same seam, and
+    /// STOP must leave playback running ("playback behaves as normal").
+    #[test]
+    fn v169_record_toggle_starts_transport() {
+        let mut app = headless_app("v169tplay");
+        app.rec_src[0] = RecSrc {
+            audio: true,
+            preview: false,
+            loop_rec: false,
+            midi: false,
+            auto: false,
+        };
+        // Guard 1: no engine yet -> classic wait echo, transport stays parked.
+        app.sample_rate = 0;
+        app.toggle_record_all(0);
+        assert!(
+            !app.backend.engine.transport_on(),
+            "no engine: transport stays parked"
+        );
+        assert!(app.status.contains("wait for the audio engine"));
+        app.sample_rate = 48_000;
+        // Guard 2: nothing ticked -> hint, transport stays parked.
+        app.rec_src[1] = RecSrc {
+            audio: false,
+            preview: false,
+            loop_rec: false,
+            midi: false,
+            auto: false,
+        };
+        app.toggle_record_all(1);
+        assert!(
+            !app.backend.engine.transport_on(),
+            "no source: transport stays parked"
+        );
+        assert!(app.status.contains("tick a source"), "{}", app.status);
+        // Audio-take arm: transport runs from the CURRENT position.
+        app.backend.engine
+            .set_project(Arc::new(vec![]), Arc::new(crate::arrange::Arrangement::new()), 100_000);
+        app.backend.engine.force_pos(12345);
+        app.toggle_record_all(0);
+        assert!(
+            app.backend.engine.transport_on(),
+            "REC must start the transport"
+        );
+        assert_eq!(
+            app.backend.engine.pos(),
+            12345,
+            "starts from the current position, not the top"
+        );
+        assert!(app.status.contains("recording"), "arm echo: {}", app.status);
+        // A past-the-end position restarts at the top — PlayAll semantics.
+        app.backend.engine.force_pos(100_000);
+        app.backend.engine.set_transport(false);
+        app.backend.engine.set_rec_loop(0, false);
+        // (the arm on track 2 below reaches start_transport_now again)
+        // MIDI-only track: same contract through the shared seam.
+        app.rec_src[2] = RecSrc {
+            audio: false,
+            preview: false,
+            loop_rec: false,
+            midi: true,
+            auto: false,
+        };
+        app.toggle_record_all(2);
+        assert!(app.midi_rec[2].armed, "MIDI armed");
+        assert!(
+            app.backend.engine.transport_on() && app.backend.engine.pos() == 0,
+            "MIDI arm also plays, past-the-end restarts at the top"
+        );
+        // STOP (GUI-visible MIDI arm): playback continues — record stop is
+        // NOT a transport stop.
+        app.toggle_record_all(2);
+        assert!(!app.midi_rec[2].armed, "stop disarms");
+        assert!(
+            app.backend.engine.transport_on(),
+            "stop does NOT stop playback"
+        );
+        // Audio-take STOP via a directly armed engine take (NULL_AUDIO has
+        // no manager to run the Cmd path, so arm the engine the way the
+        // manager would): the stop branch must also leave the transport on.
+        app.backend.engine.start_rec(0);
+        app.toggle_record_all(0);
+        assert!(
+            app.backend.engine.transport_on(),
+            "audio-take stop leaves playback running"
+        );
+        assert!(app.status.contains("recording stopped"), "{}", app.status);
+    }
+
+    /// v169 AC2/3/4 (GUI half): TakeProgress deltas grow the ghost; group
+    /// tracks stay independent; a new pass replaces (loop record); the
+    /// final Evt::Take replaces the ghost with the real asset clip; and a
+    /// discarded take leaves no stale ghost.
+    #[test]
+    fn v169_ghost_grows_take_replaces() {
+        let mut app = headless_app("v169ghost");
+        app.sample_rate = 48_000;
+        let chunk: Vec<f32> = (0..400).map(|k| k as f32 * 0.001).collect();
+        let chunk2: Vec<f32> = vec![0.5f32; 200];
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 0,
+            at: 1000,
+            frames: Arc::from(chunk.clone()),
+        });
+        {
+            let g = app
+                .live_takes
+                .first()
+                .and_then(|o| o.as_ref())
+                .expect("ghost after the first progress event");
+            assert_eq!((g.at, g.frames.len()), (1000, 400));
+        }
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 0,
+            at: 1000,
+            frames: Arc::from(chunk2.clone()),
+        });
+        assert_eq!(
+            app.live_takes[0].as_ref().unwrap().frames.len(),
+            600,
+            "the same pass accumulates"
+        );
+        // Group recording: a second track's stream is fully independent.
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 3,
+            at: 2500,
+            frames: Arc::from(chunk.clone()),
+        });
+        assert_eq!(app.live_takes[3].as_ref().unwrap().frames.len(), 400);
+        assert_eq!(
+            app.live_takes[0].as_ref().unwrap().frames.len(),
+            600,
+            "group tracks do not cross-talk"
+        );
+        // New pass (loop record re-armed elsewhere): replace, not append.
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 0,
+            at: 9000,
+            frames: Arc::from(chunk2.clone()),
+        });
+        let g = app.live_takes[0].as_ref().unwrap();
+        assert_eq!((g.at, g.frames.len()), (9000, 200), "new pass restarts");
+        // The final take replaces the live view: ghost cleared, real asset
+        // + clip in place, and NO other take-clip anywhere (no double paint).
+        // (Quantize OFF here: this pin is about the REPLACE contract; the
+        // quantize branch of take_pipeline is already pinned by v41.)
+        app.auto_quantize = false;
+        let n_assets0 = app.assets.len();
+        app.handle_evt(crate::audio::Evt::Take {
+            track: 0,
+            at: 9000,
+            data: Arc::from(vec![0.25f32; 480]),
+            preview: false,
+        });
+        assert!(app.live_takes[0].is_none(), "final take leaves no ghost");
+        assert_eq!(app.assets.len(), n_assets0 + 1, "one asset materialized");
+        let a = app.assets.last().unwrap();
+        assert_eq!(a.data.len(), 480);
+        let n_clips: usize = app.arr.tracks[0]
+            .lanes
+            .iter()
+            .map(|l| l.clips.len())
+            .sum();
+        assert_eq!(n_clips, 1, "exactly one clip — the ghost is not a second");
+        // A discarded take clears any rolling ghost.
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 1,
+            at: 12000,
+            frames: Arc::from(chunk2.clone()),
+        });
+        assert!(app.live_takes[1].is_some(), "ghost rolled on track 2");
+        app.handle_evt(crate::audio::Evt::TakeDiscarded { track: 1 });
+        assert!(app.live_takes[1].is_none(), "discarded: no stale ghost");
+    }
+
+    /// v169 AC5: the rolling take PAINTS — red grow-rect on the track's
+    /// last lane + a "REC" readout galley — after a progress event lands.
+    #[test]
+    fn v169_ghost_paints() {
+        let mut app = headless_app("v169paint");
+        app.sample_rate = 48_000;
+        let ctx = egui::Context::default();
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        frame(&mut app, &ctx, vec![]);
+        // Half a second of signal at the top of the timeline.
+        let chunk: Vec<f32> = (0..24_000)
+            .map(|k| ((k as f32) * 0.05).sin() * 0.6)
+            .collect();
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 0,
+            at: 0,
+            frames: Arc::from(chunk),
+        });
+        // Custom scan (the shared painted_rect only matches opaque fills;
+        // the ghost fill is deliberately translucent). egui stores the
+        // translucent fill PREMULTIPLIED (v54 lesson) — derive the exact
+        // stored tuple from the SAME constructor the painter uses.
+        fn scan_ghost(app: &mut App, ctx: &egui::Context) -> Option<egui::Rect> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                events: vec![moved(egui::pos2(20.0, 18.0))],
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let hit = out
+                .shapes
+                .iter()
+                .filter_map(|cs| {
+                    if let egui::epaint::Shape::Rect(r) = &cs.shape {
+                        if r.fill == Color32::from_rgba_unmultiplied(196, 64, 64, 80)
+                            && r.rect.width() > 10.0
+                        {
+                            return Some(r.rect);
+                        }
+                    }
+                    None
+                })
+                .max_by(|a, b| {
+                    (a.width() * a.height())
+                        .partial_cmp(&(b.width() * b.height()))
+                        .unwrap()
+                });
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            hit
+        }
+        let ghost = scan_ghost(&mut app, &ctx).expect("the live ghost rect paints");
+        // Growth: a bigger take paints a WIDER ghost (extent follows frames).
+        let w0 = ghost.width();
+        let more: Vec<f32> = vec![0.3f32; 24_000];
+        app.handle_evt(crate::audio::Evt::TakeProgress {
+            track: 0,
+            at: 0,
+            frames: Arc::from(more),
+        });
+        let ghost2 = scan_ghost(&mut app, &ctx).expect("ghost still paints after growth");
+        assert!(
+            ghost2.width() > w0 + 5.0,
+            "extent grows with the take: {w0} -> {}",
+            ghost2.width()
+        );
+        let label = galley_centers(&mut app, &ctx, "REC ", false);
+        assert!(!label.is_empty(), "the REC readout paints");
+        // The final take removes the ghost (its clip body is opaque red —
+        // assert the translucent rect is gone instead).
+        app.handle_evt(crate::audio::Evt::Take {
+            track: 0,
+            at: 0,
+            data: Arc::from(vec![0.25f32; 48_000]),
+            preview: false,
+        });
+        assert!(scan_ghost(&mut app, &ctx).is_none(), "no ghost survives the final take");
     }
 
     /// v29: untick EVERYTHING and REC refuses with a hint instead of
@@ -64570,6 +65049,317 @@ mod tests {
             strip.matches("from_gray(60)").count(),
             1,
             "strip anchors keep today's ink"
+        );
+    }
+
+    // ============ v168 (card t_73fea549, pbc-2-gui): linear curve axis ============
+    //
+    // The ±2-octave Septabee swing must be VISIBLE and EDITABLE at a
+    // constant aiming precision (no compressing auto-scale), with the
+    // EDO-aware pitch label echoed wherever the user aims. Pins drive
+    // real gestures through frame().
+
+    /// Probe `app` once more (1440×853), optionally with fresh input
+    /// events, and return the RAW shapes (before tessellation) — the
+    /// v105 paint-probe idiom.
+    fn v168_probe(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let raw = egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let shapes = out.shapes.clone();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        shapes
+    }
+
+    #[test]
+    fn v168_axis_2oct_trail_paints_full_height() {
+        // A ±2-octave curve is FULLY VISIBLE: px-per-cent is constant
+        // (trail_half = 24 px = ±1200¢ at default zoom), so the trail
+        // EXTENDS to ±2·trail_half = ±48 px. The retired auto-scale
+        // compressed everything into the fixed ±24 px box — a capped
+        // trail could never paint 44+ px from the row center.
+        let mut app = headless_app("v168wide");
+        let ctx = egui::Context::default();
+        crate::tune::set(12, 60);
+        let c = v52_roll_rig(&mut app, &ctx);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+                bend: None,
+            });
+            r.pat
+                .note_bends
+                .push(crate::midipat::NoteBend::new(vec![
+                    (0.0, 0.0),
+                    (0.5, -2400.0),
+                    (1.0, 2400.0),
+                ]));
+            r.pat.notes[0].bend = Some(0);
+            r.pat.bake_bends();
+        }
+        frame(&mut app, &ctx, vec![]);
+        let row_c = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
+        let shapes = v168_probe(&mut app, &ctx, vec![]);
+        let mut top = f32::MAX;
+        let mut bot = f32::MIN;
+        for cs in &shapes {
+            if let egui::epaint::Shape::LineSegment { points, stroke } = &cs.shape {
+                let (r0, g0, b0, a0) = stroke.color.to_tuple();
+                if a0 == 255 && r0 == 90 && g0 == 220 && b0 == 170 {
+                    top = top.min(points[0].y.min(points[1].y));
+                    bot = bot.max(points[0].y.max(points[1].y));
+                }
+            }
+        }
+        assert!(
+            row_c - top >= 45.0,
+            "trail paints the +2-oct extreme ({} px above center; the retired auto-scale capped at 24)",
+            row_c - top
+        );
+        assert!(
+            bot - row_c >= 44.0,
+            "trail paints the -2-oct extreme ({} px below center)",
+            bot - row_c
+        );
+        crate::tune::set(crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT);
+    }
+
+    #[test]
+    fn v168_axis_linear_sensitivity() {
+        // LINEAR LAW + EDITABILITY: the +1200¢ endpoint dot sits EXACTLY
+        // trail_half (24 px) above the row center — the old auto-scale
+        // drew it at 12 px, so this press only grabs a dot under the
+        // linear map. One pixel = 50¢ everywhere: +24 px lands the
+        // NB_MAX_CENTS cap. Then the ROW-ZOOM knob (row_h 22) doubles the
+        // px-per-cent: the same 11 px moves HALF the cents.
+        let mut app = headless_app("v168lin");
+        let ctx = egui::Context::default();
+        crate::tune::set(12, 60);
+        let c = v105_curve_rig(&mut app, &ctx);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.note_bends[0].pts = vec![(0.0, 0.0), (1.0, 1200.0)];
+            r.pat.bake_bends();
+        }
+        frame(&mut app, &ctx, vec![]);
+        let grid_x0 = c.min.x + 58.0;
+        let row_c = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
+        let dot = egui::pos2(grid_x0 + 160.0 - 2.0, row_c - 24.0);
+        let up = egui::pos2(dot.x, dot.y - 24.0);
+        frame(&mut app, &ctx, vec![moved(dot), btn(dot, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(up)]);
+        // Mid-drag the status reads the dragged point's LIVE pitch.
+        assert!(
+            app.status.contains("curve point")
+                && app.status.contains("C6")
+                && app.status.contains("+2400"),
+            "drag echo = label + cents: {}",
+            app.status
+        );
+        frame(&mut app, &ctx, vec![moved(up), btn(up, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            let end = r.pat.note_bends[0].pts[1].1;
+            assert!((end - 2400.0).abs() < 60.0, "+48 px = the model cap: {end}");
+        }
+        assert!(
+            app.status.contains("curve point") && app.status.contains("(C6)"),
+            "release echo carries the label: {}",
+            app.status
+        );
+        // Zoom knob: row_h 22 → trail_half 44 px → 11 px = 300¢ (not 550¢).
+        // The row law is row_c = max.y − 10 + vscroll_px − 60.5·row_h, so
+        // doubling the row height would scroll row 60 ABOVE the canvas at
+        // the old vscroll — compensate it (60.5·(22−11) = 665.5 px) to keep
+        // the dot under the pointer at the SAME painted spot as before.
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.row_h = 22.0;
+            r.vscroll_px = 500.0 + 665.5;
+            r.pat.note_bends[0].pts = vec![(0.0, 0.0), (1.0, 1200.0)];
+            r.pat.bake_bends();
+        }
+        frame(&mut app, &ctx, vec![]);
+        let row_c = c.max.y - 10.0 + 1165.5 - 22.0 * 60.5;
+        let dot = egui::pos2(grid_x0 + 160.0 - 2.0, row_c - 44.0);
+        let up = egui::pos2(dot.x, dot.y - 11.0);
+        frame(&mut app, &ctx, vec![moved(dot), btn(dot, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(up)]);
+        frame(&mut app, &ctx, vec![moved(up), btn(up, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            let end = r.pat.note_bends[0].pts[1].1;
+            assert!(
+                (end - 1500.0).abs() < 30.0,
+                "zoomed: 55 px at 44px/1200¢ = 1500¢, got {end}"
+            );
+        }
+        crate::tune::set(crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT);
+    }
+
+    #[test]
+    fn v168_drag_echo_pitch_label() {
+        // MID-GESTURE the status line shows the live pitch as the EDO-
+        // aware label + cents (12-EDO: 400¢ above C4 = E4), every frame
+        // of the freehand stroke — and the release echo keeps the v105
+        // format with the label appended.
+        let mut app = headless_app("v168echo");
+        let ctx = egui::Context::default();
+        crate::tune::set(12, 60);
+        let c = v105_two_note_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let row_c = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
+        let z = |down: bool| egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: down,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let a = egui::pos2(grid_x0 + 80.0, row_c);
+        frame(&mut app, &ctx, vec![z(true), moved(a), btn(a, egui::PointerButton::Primary, true)]);
+        let b = egui::pos2(grid_x0 + 150.0, row_c - 8.0); // 8 px = 400 cents
+        frame(&mut app, &ctx, vec![moved(b)]);
+        assert!(
+            app.status.contains("E4") && app.status.contains("+400"),
+            "drag echo names the live pitch: {}",
+            app.status
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(b), btn(b, egui::PointerButton::Primary, false), z(false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("pitch curve") && app.status.contains("(E4)"),
+            "release echo carries the label: {}",
+            app.status
+        );
+        crate::tune::set(crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT);
+    }
+
+    /// Draw a 6px-up (300¢) Z-stroke on row 61 of a fresh rig at `tune`,
+    /// and return the committed app's status line.
+    fn v168_draw_300(tune: (u32, u8)) -> String {
+        let mut app = headless_app("v168edo");
+        let ctx = egui::Context::default();
+        crate::tune::set(tune.0, tune.1);
+        let c = v52_roll_rig(&mut app, &ctx);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 61,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+                bend: None,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        let grid_x0 = c.min.x + 58.0;
+        let row_c = c.max.y - 10.0 + 500.0 - 11.0 * 61.5;
+        let z = |down: bool| egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: down,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let a = egui::pos2(grid_x0 + 80.0, row_c);
+        let b = egui::pos2(grid_x0 + 150.0, row_c - 6.0);
+        frame(&mut app, &ctx, vec![z(true), moved(a), btn(a, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(b)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(b), btn(b, egui::PointerButton::Primary, false), z(false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        let status = app.status.clone();
+        crate::tune::set(crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT);
+        status
+    }
+
+    #[test]
+    fn v168_release_echo_edo_label() {
+        // The release echo follows the LIVE TUNING: +300¢ over row 61 is
+        // E4 at 12-EDO, but row 61 at 24-EDO sits a quarter-tone lower
+        // and the SAME gesture reads D#4+50c.
+        let s12 = v168_draw_300((12, 60));
+        assert!(s12.contains("(E4)"), "12-EDO echo: {s12}");
+        let s24 = v168_draw_300((24, 60));
+        assert!(s24.contains("(D#4+50c)"), "24-EDO echo: {s24}");
+    }
+
+    #[test]
+    fn v168_hover_dot_echo_pitch() {
+        // Hovering a curve dot reads out that point's pitch in the
+        // canvas readout (v71/v72 hover-text standard): "… · dot D#4
+        // (+300 cents)". The pointer event rides the probe frame.
+        let mut app = headless_app("v168hover");
+        let ctx = egui::Context::default();
+        crate::tune::set(12, 60);
+        let c = v105_curve_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let row_c = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
+        let dot = egui::pos2(grid_x0 + 160.0 - 2.0, row_c - 6.0); // +300¢ / 50¢px
+        let shapes = v168_probe(&mut app, &ctx, vec![egui::Event::PointerMoved(dot)]);
+        let found = shapes.iter().any(|cs| {
+            matches!(&cs.shape, egui::epaint::Shape::Text(t)
+                if t.galley.text().contains("dot D#4 (+300 cents)"))
+        });
+        assert!(found, "hover on a curve dot echoes its pitch label");
+        crate::tune::set(crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT);
+    }
+
+    #[test]
+    fn v168_echo_and_axis_source() {
+        // Completeness audit (v54 source-scan law): the compressing
+        // auto-scale is GONE, every echo consumes the tune.rs single
+        // home, and the always-run trail paint loop allocates nothing.
+        // Needles use concat! so the pin cannot match its own text.
+        let ui_src = include_str!("ui.rs");
+        assert!(
+            !ui_src.contains(concat!("nb_", "disp")),
+            "the 600¢-step auto-scale is retired"
+        );
+        let home = concat!("tune::label_pitch_te", "xt_live");
+        assert_eq!(
+            ui_src.matches(home).count(),
+            7,
+            "3 drag + 1 hover + 3 release echoes consume the single home"
+        );
+        // The trail loop (always-run, per note) must be allocation-free.
+        let a = ui_src.find("let mut prev: Option<egui::Pos2> = None;").expect("trail loop");
+        let loop_body = &ui_src[a..a + 600];
+        assert!(loop_body.contains("cents_at"), "grabbed the trail loop");
+        assert!(
+            !loop_body.contains("format!") && !loop_body.contains("clone"),
+            "the trail paint loop must not allocate per frame"
         );
     }
 }

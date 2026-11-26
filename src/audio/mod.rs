@@ -587,6 +587,23 @@ pub enum Evt {
         data: Arc<[f32]>,
         preview: bool,
     },
+    /// v169: live partial-take publish. While a take is rolling, the
+    /// manager's idle tick ships the frames captured since the last event
+    /// (`frames` = delta starting at cumulative index `len` of this pass;
+    /// `at` = playhead where THIS pass armed). The GUI grows a ghost clip
+    /// at `at`; the final [`Evt::Take`] replaces it. A changed `at` means a
+    /// new pass (loop record) — the ghost restarts.
+    TakeProgress {
+        track: usize,
+        at: u64,
+        frames: Arc<[f32]>,
+    },
+    /// v169: a take vanished without producing a clip (empty stop, or the
+    /// capacity claim found it empty). The GUI drops any live ghost for
+    /// `track` so nothing stale keeps painting.
+    TakeDiscarded {
+        track: usize,
+    },
     /// A remote MIDI source ports currently wired into `slooper:midi_in`
     /// (auto-connected; refreshed on port/client registration events).
     Midi(RawMidiMsg),
@@ -1439,6 +1456,19 @@ impl Engine {
             Arc::from(data),
             preview,
         )
+    }
+
+    /// v169: manager-thread copy of the take frames `[from, len)` currently
+    /// captured on track `i` (the take keeps rolling — unlike `copy_take`
+    /// this never touches state). Same quiesce discipline as `copy_take`'s
+    /// caller: only indices below `len` are read, and the RT cursor only
+    /// ever advances, so frames below the (post-sleep) snapshot of `len`
+    /// were committed before this read.
+    pub fn copy_take_delta(&self, i: usize, from: usize) -> Arc<[f32]> {
+        let n = (self.rec_len[i].load(Ordering::Relaxed) as usize).min(LOOP_CAP as usize);
+        let from = from.min(n);
+        let data = unsafe { std::slice::from_raw_parts(self.rec_bufs[i].add(from), n - from) };
+        Arc::from(data)
     }
 
     // ---- global transport ---------------------------------------------------
@@ -2569,6 +2599,8 @@ fn toggle_record(engine: &Engine, i: usize, tx: &SyncSender<Evt>) {
                 "track {}: empty take discarded",
                 i + 1
             )));
+            // v169: any live ghost for this track must vanish with it.
+            let _ = tx.try_send(Evt::TakeDiscarded { track: i });
         } else {
             let _ = tx.try_send(Evt::Take {
                 track: i,
@@ -2579,6 +2611,41 @@ fn toggle_record(engine: &Engine, i: usize, tx: &SyncSender<Evt>) {
         }
     } else {
         engine.start_rec(i);
+    }
+}
+
+/// v169: partial-take pump. Called from the manager's idle tick while takes
+/// roll: for every recording track it ships the frames captured since the
+/// last event as [`Evt::TakeProgress`]. `sent` remembers, per track, the
+/// arming position and how many frames of THIS pass already went out; a
+/// re-armed pass (loop record — `at` differs) restarts the stream from 0.
+/// Quiesce follows `copy_take`'s discipline: snapshot the cursor, sleep past
+/// a block, re-read, then copy below the (older) committed watermark — the
+/// RT cursor only ever advances, so those frames cannot be mid-write.
+fn pump_live_takes(engine: &Engine, tx: &SyncSender<Evt>, sent: &mut [(u64, u64); MAX_LOOPS]) {
+    for (t, st) in sent.iter_mut().enumerate() {
+        if engine.rec_state_of(t) != TR_REC {
+            *st = (0, 0);
+            continue;
+        }
+        let at = engine.rec_at(t);
+        let (pass_at, pass_len) = *st;
+        let base = if pass_at == at { pass_len } else { 0 };
+        let len = engine.rec_len_of(t) as u64;
+        if len <= base {
+            *st = (at, base.min(len));
+            continue;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(6));
+        let frames = engine.copy_take_delta(t, base as usize);
+        if !frames.is_empty() {
+            *st = (at, base + frames.len() as u64);
+            let _ = tx.try_send(Evt::TakeProgress {
+                track: t,
+                at,
+                frames,
+            });
+        }
     }
 }
 
@@ -2597,8 +2664,20 @@ fn manager_loop(
     sample_rate: u32,
     session: &mut dyn ManagerBackend,
 ) -> ManagerExit {
+    // v169: per-track (arming pos, frames already shipped) for the
+    // partial-take pump; lives across idle ticks.
+    let mut live_sent = [(0u64, 0u64); MAX_LOOPS];
     loop {
-        match cmd_rx.recv_timeout(std::time::Duration::from_millis(250)) {
+        // While a take rolls, tick faster so the live ghost stays ≤ ~150 ms
+        // behind real time; the idle MIDI-source re-derive pays no extra
+        // tax in practice (its session.idle is a port-list diff).
+        let any_rec = (0..MAX_LOOPS).any(|t| engine.rec_state_of(t) == TR_REC);
+        let tick = if any_rec {
+            std::time::Duration::from_millis(120)
+        } else {
+            std::time::Duration::from_millis(250)
+        };
+        match cmd_rx.recv_timeout(tick) {
             Ok(Cmd::Refresh) => session.refresh(evt_tx),
             Ok(Cmd::SetMidiInputs(sel)) => session.set_midi_inputs(&sel, evt_tx),
             Ok(Cmd::Apply { ins, outs }) => {
@@ -2759,7 +2838,11 @@ fn manager_loop(
                     pend &= !(1u128 << i);
                     std::thread::sleep(std::time::Duration::from_millis(25));
                     let (at, data, preview) = engine.copy_take(i);
-                    if !data.is_empty() {
+                    if data.is_empty() {
+                        // v169: nothing shipped → drop any live ghost so it
+                        // does not linger over an empty take.
+                        let _ = evt_tx.try_send(Evt::TakeDiscarded { track: i });
+                    } else {
                         let _ = evt_tx.try_send(Evt::Take {
                             track: i,
                             at,
@@ -2768,6 +2851,10 @@ fn manager_loop(
                         });
                     }
                 }
+                // v169: live partial takes — grows the ghost clips in the
+                // arrangement while the takes roll (after claims, so a
+                // loop-pass commit replaces before the next pass grows).
+                pump_live_takes(engine, evt_tx, &mut live_sent);
                 // No command pending: re-derive the MIDI source set. This is
                 // what makes bindings work when a device (re)appears on a new
                 // port name — e.g. hardware that gets a fresh ALSA/JACK port
@@ -6917,6 +7004,139 @@ mod tests {
         e.stop_rec_loop(3);
         assert!(!e.rec_is_loop(3), "STOP clears armed AND live");
         assert!(!e.rec_loop_armed(3), "STOP clears armed AND live");
+    }
+
+    /// v169: the manager-side partial-take pump ships monotonically growing
+    /// DELTA events for a running take, ships nothing while it idles, and
+    /// restarts the stream at frame 0 for a new pass (loop record — the
+    /// arming position `at` differs).
+    #[test]
+    fn v169_pump_emits_deltas_and_resets_on_new_pass() {
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![]), Arc::new(Arrangement::new()), 100_000);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Evt>(32);
+        let mut sent = [(0u64, 0u64); MAX_LOOPS];
+
+        e.seek_to(4000);
+        e.start_rec(0);
+        for k in 0..900u32 {
+            e.rec_write(0, k, (k as f32) * 0.001);
+        }
+        e.rec_len[0].store(900, Ordering::Relaxed);
+        pump_live_takes(&e, &tx, &mut sent);
+        let (track, at, first) = match rx.try_recv() {
+            Ok(Evt::TakeProgress { track, at, frames }) => (track, at, frames),
+            other => panic!("expected TakeProgress, got {other:?}"),
+        };
+        assert_eq!((track, at), (0, 4000), "first event names the pass");
+        assert_eq!(first.len(), 900);
+        assert!(
+            (first[500] - 0.5).abs() < 1e-6,
+            "delta carries the captured frames"
+        );
+
+        // A growing take ships ONLY the new tail (GUI accumulates).
+        for k in 900..2000u32 {
+            e.rec_write(0, k, (k as f32) * 0.001);
+        }
+        e.rec_len[0].store(2000, Ordering::Relaxed);
+        pump_live_takes(&e, &tx, &mut sent);
+        let second = match rx.try_recv() {
+            Ok(Evt::TakeProgress { frames, .. }) => frames,
+            other => panic!("expected a delta TakeProgress, got {other:?}"),
+        };
+        assert_eq!(second.len(), 1100, "only the frames since the last tick");
+        assert!((second[0] - 0.9).abs() < 1e-6, "delta starts at the cursor");
+        pump_live_takes(&e, &tx, &mut sent);
+        assert!(rx.try_recv().is_err(), "a tick without new frames ships nothing");
+
+        // New pass (loop-record re-arm at a different position): the stream
+        // restarts from frame 0 — the GUI side replaces the ghost.
+        e.rec_state[0].store(TR_IDLE, Ordering::Relaxed);
+        pump_live_takes(&e, &tx, &mut sent);
+        assert!(rx.try_recv().is_err(), "a stopped take never streams");
+        e.seek_to(50_000);
+        e.start_rec(0);
+        e.rec_write(0, 0, 0.5);
+        e.rec_len[0].store(1, Ordering::Relaxed);
+        pump_live_takes(&e, &tx, &mut sent);
+        match rx.try_recv() {
+            Ok(Evt::TakeProgress { at, frames, .. }) => {
+                assert_eq!(at, 50_000, "the new pass reports its own arming pos");
+                assert_eq!(frames.len(), 1, "new pass restarts the stream at 0");
+                assert!((frames[0] - 0.5).abs() < 1e-6);
+            }
+            other => panic!("expected restart TakeProgress, got {other:?}"),
+        }
+        // Stopped tracks reset their bookkeeping (a later track-0 pass with
+        // the SAME at must not inherit the old cursor).
+        e.rec_state[0].store(TR_IDLE, Ordering::Relaxed);
+        pump_live_takes(&e, &tx, &mut sent);
+        assert_eq!(sent[0], (0, 0), "idle tick clears the bookkeeping");
+    }
+
+    /// v169 (AC group recording): every armed track gets its own progress
+    /// stream — own arming position, own frame count, no cross-talk.
+    #[test]
+    fn v169_pump_group_recording_is_per_track() {
+        let e = Engine::new();
+        e.set_project(Arc::new(vec![]), Arc::new(Arrangement::new()), 100_000);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Evt>(32);
+        let mut sent = [(0u64, 0u64); MAX_LOOPS];
+        e.seek_to(1000);
+        e.start_rec(1);
+        e.seek_to(9000);
+        e.start_rec(4);
+        for k in 0..40u32 {
+            e.rec_write(1, k, 0.1);
+        }
+        e.rec_len[1].store(40, Ordering::Relaxed);
+        for k in 0..10u32 {
+            e.rec_write(4, k, -0.2);
+        }
+        e.rec_len[4].store(10, Ordering::Relaxed);
+        pump_live_takes(&e, &tx, &mut sent);
+        let mut seen = [false; 2];
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                Evt::TakeProgress { track, at, frames } => {
+                    if track == 1 {
+                        assert_eq!((at, frames.len()), (1000, 40));
+                        seen[0] = true;
+                    } else if track == 4 {
+                        assert_eq!((at, frames.len()), (9000, 10));
+                        seen[1] = true;
+                    } else {
+                        panic!("unexpected track {track}");
+                    }
+                }
+                other => panic!("only progress events expected, got {other:?}"),
+            }
+        }
+        assert!(seen[0] && seen[1], "both group members streamed");
+    }
+
+    /// v169: an EMPTY stop discards the take — besides the existing notice it
+    /// must also emit `Evt::TakeDiscarded` so the GUI drops any live ghost.
+    #[test]
+    fn v169_empty_stop_discards() {
+        let e = Engine::new();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Evt>(32);
+        toggle_record(&e, 2, &tx);
+        assert_eq!(e.rec_state_of(2), TR_REC, "first press arms");
+        toggle_record(&e, 2, &tx);
+        assert_eq!(e.rec_state_of(2), TR_IDLE, "second press stops");
+        let mut notice = false;
+        let mut discarded = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                Evt::Notice(ref m) if m.contains("empty take discarded") => notice = true,
+                Evt::TakeDiscarded { track: 2 } => discarded = true,
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert!(notice, "the existing discard notice still ships");
+        assert!(discarded, "the ghost-kill event ships alongside it");
     }
 
     /// Latency compensation is a START-of-take skip: a fresh recording

@@ -69,10 +69,13 @@ pub fn get() -> (u32, u8) {
 
 /// Pure primitive (see the module doc). NOT clamped: `n` must already be
 /// within [EDO_MIN, EDO_MAX] (callers read it back through [`get`], and
-/// pins pass it directly).
+/// pins pass it directly). v168 (pbc-2) widened the row to any integer:
+/// a drawn pitch curve bends far beyond the 0..=127 keyboard, and the
+/// continuous-pitch labelers below name those rows too (`k` as u8 keeps
+/// working — every existing caller compiles unchanged).
 #[inline]
-pub fn key(n: u32, root: u8, k: u8) -> f64 {
-    (k as f64 - root as f64) * (12.0 / n as f64) + (root as f64 - 69.0)
+pub fn key<K: Into<f64>>(n: u32, root: u8, k: K) -> f64 {
+    (k.into() - root as f64) * (12.0 / n as f64) + (root as f64 - 69.0)
 }
 
 /// Primitive at the LIVE tuning — the script host trampoline and every
@@ -172,16 +175,32 @@ pub fn label(n: u32, root: u8, k: u8) -> NoteLabel {
             anchor: true,
         };
     }
-    // Exact half-semitone ties go to the lower row (tk.floor()); every
-    // other offset takes its true nearest. f64 equality is safe here:
-    // a true tie is a binary-exact .5, and no true non-tie is within
-    // 1e-12 of one for n ≤ 128.
+    nearest_row_label(tk)
+}
+
+/// The label for an ARBITRARY sounding pitch in semitones-relative-to-A4:
+/// the nearest standard 12-EDO row plus its explicit-signed residual —
+/// exact half-semitone ties go to the LOWER row (`tk.floor()`), so 50-cent
+/// steps always render `<lower>+50c`, never a root/sign-dependent mix.
+/// A pitch that lands (after cent-rounding) on a standard row reads as
+/// the plain anchor name. Shared by [`label`]'s intermediate path and the
+/// v168 continuous-pitch labelers — ONE tie law in the repo.
+fn nearest_row_label(tk: f64) -> NoteLabel {
+    // f64 equality is safe here: a true tie is a binary-exact .5, and no
+    // true non-tie is within 1e-12 of one for n ≤ 128 (and mouse-derived
+    // curve cents are never expected to fabricate an exact .5).
     let nearest = if tk - tk.floor() == 0.5 {
         tk.floor()
     } else {
         tk.round()
     };
     let cents = ((tk - nearest) * 100.0).round() as i64;
+    if cents == 0 {
+        return NoteLabel {
+            text: std_name(nearest as i32 + 69),
+            anchor: true,
+        };
+    }
     NoteLabel {
         text: format!("{}{:+}c", std_name(nearest as i32 + 69), cents),
         anchor: false,
@@ -199,6 +218,38 @@ pub fn label_live(k: u8) -> NoteLabel {
 #[inline]
 pub fn label_text_live(k: u8) -> String {
     label_live(k).text
+}
+
+// ---------------------------------------------------------------------------
+// v168 (card t_73fea549, pbc-2-gui): CONTINUOUS-pitch labeling — the drawn
+// pitch curve bends a row by an arbitrary cents offset far past the
+// keyboard; every live echo (drag/hover/release) names THAT pitch through
+// these wrappers. Same single home, same tie law as [`label`].
+// ---------------------------------------------------------------------------
+
+/// The label of the CONTINUOUS pitch "row `k` (an i32 — bends may leave
+/// the 0..=127 keyboard) bent by `cents_off`" at `(n, root)`. The pitch is
+/// the sounding position `key(n, root, k) + cents_off/100` semitones from
+/// A4, then [`nearest_row_label`] — so at N = 12 `label_pitch(12, 60, 60,
+/// 300) == "F4"`, at 24-EDO row 61 reads `"C4+50c"`, and a grid point bent
+/// by 0 cents is byte-identical to [`label`] (`v168_label_pitch_grid_
+/// matches_label`).
+#[inline]
+pub fn label_pitch(n: u32, root: u8, k: i32, cents_off: f32) -> NoteLabel {
+    nearest_row_label(key(n, root, k) + f64::from(cents_off) / 100.0)
+}
+
+/// [`label_pitch`] at the live tuning (the packed atomic).
+#[inline]
+pub fn label_pitch_live(k: i32, cents_off: f32) -> NoteLabel {
+    let (n, r) = get();
+    label_pitch(n, r, k, cents_off)
+}
+
+/// [`label_pitch_live`]'s text — the echo/status convenience wrapper.
+#[inline]
+pub fn label_pitch_text_live(k: i32, cents_off: f32) -> String {
+    label_pitch_live(k, cents_off).text
 }
 
 #[cfg(test)]
@@ -480,5 +531,57 @@ mod tests {
         assert!((tune_key(127) - key(128, 127, 127)).abs() < 1e-12);
         set(back.0, back.1);
         assert_eq!(get(), back);
+    }
+
+    // ---- v168 (card t_73fea549, pbc-2-gui): continuous-pitch labels ----
+
+    #[test]
+    fn v168_label_pitch_n12_octaves() {
+        // The drawn-curve currency at 12-EDO: ±2 octaves land on exact
+        // rows, a 35¢ offset names the nearest row + explicit residual,
+        // and the −50¢ tie takes the LOWER row (same law as `label`).
+        assert_eq!(label_pitch(12, 60, 60, 1200.0).text, "C5");
+        assert!(label_pitch(12, 60, 60, 1200.0).anchor);
+        assert_eq!(label_pitch(12, 60, 60, 2400.0).text, "C6");
+        assert_eq!(label_pitch(12, 60, 60, -2400.0).text, "C2");
+        assert_eq!(label_pitch(12, 60, 60, 300.0).text, "D#4", "the name table spells 63 D#");
+        assert_eq!(label_pitch(12, 60, 60, 1235.0).text, "C5+35c");
+        assert!(!label_pitch(12, 60, 60, 1235.0).anchor);
+        assert_eq!(label_pitch(12, 60, 60, -50.0).text, "B3+50c", "tie → LOWER row");
+        assert_eq!(label_pitch(12, 60, 60, -49.9).text, "C4-50c", "non-tie takes its side");
+    }
+
+    #[test]
+    fn v168_label_pitch_grid_matches_label() {
+        // A grid point bent by 0 cents labels BYTE-IDENTICALLY to
+        // `label()` — text AND anchor flag — for every key at several
+        // tunings: the two builders share the one tie/nearest law.
+        for &n in &[12u32, 16, 19, 24, 31, 53] {
+            for k in 0u8..=127 {
+                let a = label(n, 60, k);
+                let b = label_pitch(n, 60, i32::from(k), 0.0);
+                assert_eq!(b.text, a.text, "n{n} k{k}");
+                assert_eq!(b.anchor, a.anchor, "n{n} k{k} anchor");
+            }
+        }
+    }
+
+    #[test]
+    fn v168_label_pitch_i32_rows() {
+        // Curves bend far beyond the keyboard: the primitive takes i32
+        // rows and the names extend (octave math has no 0..=127 edge).
+        assert_eq!(key(12, 60, -5i32), -74.0);
+        assert_eq!(label_pitch(12, 60, -5, 0.0).text, "G-2");
+        assert_eq!(label_pitch(12, 60, 132, 0.0).text, "C10");
+        // The tuning is baked into the row pitch: 24-EDO row 61 IS C4+50c,
+        // bent +650¢ it sounds exactly G4.
+        assert_eq!(label_pitch(24, 60, 61, 0.0).text, "C4+50c");
+        assert_eq!(label_pitch(24, 60, 61, 650.0).text, "G4");
+        // live wrappers read the packed atomic.
+        let back = get();
+        set(24, 60);
+        assert_eq!(label_pitch_text_live(61, 0.0), "C4+50c");
+        assert!(label_pitch_live(61, 650.0).anchor);
+        set(back.0, back.1);
     }
 }
