@@ -1436,6 +1436,30 @@ impl ClapStageEntry {
         // roll-space bends rescale to the track range, RPN0 announces
         // per channel before the first bend since the last change.
         if m[0] & 0xF0 == 0xE0 {
+            let raw = ((m[2] as u16) << 7) | (m[1] as u16);
+            // v167 (pbc-1): DIRECT-CURRENCY curve bend (d2 bit-7 = decicent
+            // payload) — same law as vsthost::queue: auto-widen the RPN0
+            // range, push plugin-currency bytes verbatim (roll rescale
+            // walls at ±12 st and must NEVER touch the curve).
+            if m[2] & 0x80 != 0 {
+                let st = (raw as i16) as f32 * 0.001;
+                let need = st.abs().ceil().clamp(1.0, 24.0) as u8;
+                let cur = s.bend_range.load(Ordering::Relaxed);
+                let r = cur.max(need);
+                if r > cur {
+                    s.bend_range.store(r, Ordering::Relaxed);
+                }
+                let bit = 1u16 << (m[0] & 0x0F);
+                if r > cur || s.bend_seen == u8::MAX || s.bend_announced & bit == 0 {
+                    s.bend_announced &= !bit;
+                    for b in crate::vsthost::rpn0_burst(m[0] & 0x0F, r) {
+                        self.push_q(s, b, pos);
+                    }
+                    s.bend_announced |= bit;
+                }
+                let v = (8192.0 + (st * 8191.0 / r as f32).round()).clamp(1.0, 16383.0) as u16;
+                return self.push_q(s, [m[0], (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8], pos);
+            }
             let r = s.bend_range.load(Ordering::Relaxed);
             let bit = 1u16 << (m[0] & 0x0F);
             if s.bend_seen == u8::MAX || s.bend_announced & bit == 0 {
@@ -1444,7 +1468,7 @@ impl ClapStageEntry {
                 }
                 s.bend_announced |= bit;
             }
-            let v = crate::vsthost::bend_rescale(((m[2] as u16) << 7) | (m[1] as u16), r);
+            let v = crate::vsthost::bend_rescale(raw, r);
             return self.push_q(s, [m[0], (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8], pos);
         }
         self.push_q(s, m, pos)

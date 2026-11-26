@@ -11407,7 +11407,14 @@ impl App {
         }
         // v52 R6: baked pitch-bend lane (kind 5 = 14-bit lsb/msb, the
         // engine's own encoding) so roll previews glide like the grid.
+        // v167 (pbc-1): same carrier law as playback — lane events inside
+        // an owned curve's window are skipped, the curve itself rides as
+        // sample-accurate kind-7 events.
+        let regs = pat.curve_regions();
         for m in pat.bends.iter() {
+            if Pattern::in_curve_region(&regs, m.at) {
+                continue;
+            }
             ev.push((
                 pat.ticks_to_samples(m.at, sr),
                 5,
@@ -11416,6 +11423,8 @@ impl App {
                 ((m.val >> 7) & 0x7F) as u8,
             ));
         }
+        // v167: the owned curves themselves (sample-accurate kind 7).
+        ev.extend(crate::audio::pattern_curve_events(pat, sr));
         ev
     }
 

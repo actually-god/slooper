@@ -3992,6 +3992,41 @@ impl RtStageEntry {
         // RPN0 announces that range BEFORE the first bend of every channel
         // (and eagerly for ch0 at init / range change, see process_inner).
         if msg[0] & 0xF0 == 0xE0 {
+            let raw = ((msg[2] as u16) << 7) | (msg[1] as u16);
+            // v167 (pbc-1, card t_879a77ef): DIRECT-CURRENCY bend — d2
+            // bit-7 set means the 14-bit payload is DECI-SEMITONES from a
+            // drawn pitch curve (kind 7), NOT a roll-space wheel value.
+            // Roll law physically walls at ±12 st (see bend_rescale), so
+            // the curve first AUTO-WIDENS the announced RPN0 range to
+            // ceil(|st|) capped 24 (clearing this channel's announce mask
+            // so RPN0 re-fires BEFORE the bend; the block-head adopt then
+            // re-arms every other channel), and the plugin-currency 14-bit
+            // value is pushed VERBATIM — no rescale, no ±12 clamp. Legacy
+            // roll writers always mask d2 to 7 bits, so bit-7 cannot
+            // collide with a wheel/lane bend.
+            if msg[2] & 0x80 != 0 {
+                let st = (raw as i16) as f32 * 0.001;
+                let need = st.abs().ceil().clamp(1.0, 24.0) as u8;
+                let cur = s.bend_range.load(Ordering::Relaxed);
+                let r = cur.max(need);
+                if r > cur {
+                    s.bend_range.store(r, Ordering::Relaxed);
+                }
+                let bit = 1u16 << (msg[0] & 0x0F);
+                if r > cur || s.bend_seen == u8::MAX || s.bend_announced & bit == 0 {
+                    s.bend_announced &= !bit; // stale currency — re-arm
+                    for b in rpn0_burst(msg[0] & 0x0F, r) {
+                        if s.pending_midi.len() >= MIDI_QUEUE_CAP {
+                            s.midi_drops.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        s.pending_midi.push(QueuedMidi { m: b, pos });
+                    }
+                    s.bend_announced |= bit;
+                }
+                let v = (8192.0 + (st * 8191.0 / r as f32).round()).clamp(1.0, 16383.0) as u16;
+                return Self::push_q(s, [msg[0], (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8], pos);
+            }
             let r = s.bend_range.load(Ordering::Relaxed);
             let bit = 1u16 << (msg[0] & 0x0F);
             if s.bend_seen == u8::MAX || s.bend_announced & bit == 0 {
@@ -4004,7 +4039,7 @@ impl RtStageEntry {
                 }
                 s.bend_announced |= bit;
             }
-            let v = bend_rescale(((msg[2] as u16) << 7) | (msg[1] as u16), r);
+            let v = bend_rescale(raw, r);
             let m = [msg[0], (v & 0x7F) as u8, ((v >> 7) & 0x7F) as u8];
             return Self::push_q(s, m, pos);
         }

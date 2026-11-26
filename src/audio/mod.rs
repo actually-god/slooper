@@ -3052,7 +3052,16 @@ fn stage_midi_events(
         ev.push((base + s, 2, m.ch, 0, m.val));
     }
     // v42/MPE lanes: bends (kind 5, 14-bit split) and per-note AT (kind 4).
+    // v167 (pbc-1): events inside an owned note curve's tick window are
+    // SKIPPED — the drawn curve is the carrier there (materialized below as
+    // sample-accurate kind-7 events, full ±2400¢). The baked lane keeps
+    // carrying orphan segments and hand-imported bends, and `bake_bends`
+    // still writes it as the SMF-export/legacy shape.
+    let regs = pat.curve_regions();
     for m in pat.bends.iter() {
+        if crate::midipat::Pattern::in_curve_region(&regs, m.at) {
+            continue;
+        }
         let s = pat.ticks_to_samples(m.at, sr);
         if s < cl.cut || s - cl.cut >= span {
             continue;
@@ -3064,6 +3073,11 @@ fn stage_midi_events(
             (m.val & 0x7F) as u8,
             ((m.val >> 7) & 0x7F) as u8,
         ));
+    }
+    if pat.has_note_bends() {
+        materialize_curves(pat, cl, sr, cl.pos, cl.pos + span, |s, ch, lo, hi| {
+            ev.push((s, KIND_CURVE, ch, lo, hi))
+        });
     }
     for m in pat.polys.iter() {
         let s = pat.ticks_to_samples(m.at, sr);
@@ -3096,8 +3110,133 @@ fn apply_script_event(inst: &crate::synth::Instance, kind: u8, ch: u8, d1: u8, d
             ch,
             crate::midipat::bend_to_st(((d2 as u16) << 7) | (d1 as u16)),
         ),
+        // v167 (pbc-1): kind 7 = drawn per-note pitch curve materialized at
+        // sample resolution; the i16 deci-cent payload decodes to an
+        // UNCLAMPED f32 semitone offset (the whole point: the curve is the
+        // carrier, MIDI's ±12 st roll law and the track bend range never
+        // touch the scripted path).
+        7 => inst.bend(ch, curve_st(d1, d2)),
         _ => inst.note_on(ch, d1, d2),
     }
+}
+
+/// v167 (pbc-1, card t_879a77ef): kind 7 = CONTINUOUS CURVE BEND. A
+/// per-note [`crate::midipat::NoteBend`] drawn by the user, materialized
+/// at SAMPLE resolution into the shared event stream. Payload: d1/d2 =
+/// i16 DECI-SEMITONES little-endian (0.001 st steps — quantization 100×
+/// below audibility; ±32.767 st span covers the full ±24 st curve bound).
+/// This is NOT the kind-5 roll-space currency: plugin feeds decode the
+/// payload at the queue choke point, auto-widen the RPN0 bend range to
+/// carry it, and push plugin-currency bytes verbatim (see `midi3_raw`
+/// kind-7 — the d2 bit-7 direct-currency marker); lane events inside a
+/// curve's tick window are skipped at staging (the baked lane stays the
+/// SMF-export/legacy shape). Live wheel, orphan segments and
+/// hand-imported bends keep the kind-5 law untouched.
+pub(crate) const KIND_CURVE: u8 = 7;
+
+/// Encode one curve bend (semitones) as a kind-7 event. RT-safe.
+#[inline]
+pub(crate) fn curve_ev(off: u64, ch: u8, st: f32) -> (u64, u8, u8, u8, u8) {
+    let c10 = (st * 1000.0).round().clamp(-32768.0, 32767.0) as i16;
+    let u = c10 as u16;
+    (off, KIND_CURVE, ch, (u & 0xFF) as u8, ((u >> 8) as u8))
+}
+
+/// Decode a kind-7 payload to semitones. RT-safe.
+#[inline]
+pub(crate) fn curve_st(d1: u8, d2: u8) -> f32 {
+    ((d1 as u16 | ((d2 as u16) << 8)) as i16) as f32 * 0.001
+}
+
+/// v167: materialize every active curve of `pat` that overlaps the ABSOLUTE
+/// sample window [w0, w1) into kind-7 events via [`note_curve_events`] —
+/// the single per-note generator shared by both staging passes, the roll
+/// preview and the pins. The note trim law mirrors note staging
+/// (`s0 < cut || s0 - cut >= span` skips). RT-safe given a non-allocating
+/// `push` (scratch Vec / ev buffer behind it).
+fn materialize_curves<F: FnMut(u64, u8, u8, u8)>(
+    pat: &crate::midipat::Pattern,
+    cl: &crate::arrange::Clip,
+    sr: u32,
+    w0: u64,
+    w1: u64,
+    mut push: F,
+) {
+    let avail = pat.len_samples(sr);
+    let span = cl.span(avail);
+    let base = cl.pos.saturating_sub(cl.cut);
+    for note in pat.notes.iter() {
+        let Some(i) = note.bend else { continue };
+        let Some(nb) = pat.note_bends.get(i as usize) else { continue };
+        if !nb.active() {
+            continue;
+        }
+        let s0 = pat.ticks_to_samples(note.start, sr);
+        if s0 < cl.cut || s0 - cl.cut >= span {
+            continue; // same trim law as the note staging above
+        }
+        let on = base + s0;
+        let len_s = pat.ticks_to_samples(note.len, sr).max(1);
+        note_curve_events(nb, note.ch, on, len_s, w0, w1, &mut push);
+    }
+}
+
+/// v167 (pbc-1): emit ONE note's [`crate::midipat::NoteBend`] as kind-7
+/// events across the ABSOLUTE sample window [w0, w1) ∩ [on, on+len_s).
+/// One event per sample the value MOVES on (≥0.001 st): constant segments
+/// emit exactly once (the instrument holds), fast ramps emit EVERY sample
+/// — that density IS the "as fast as they want" acceptance (no 8-tick
+/// bake staircase anymore); the note-end value HOLDS (v101 law: nothing
+/// returns to 0). Sample-accurate by construction: the consumer sees the
+/// PCHIP value at each event's exact sample. `push` gets
+/// (absolute sample, ch, lo-byte, hi-byte). RT-safe.
+pub(crate) fn note_curve_events<F: FnMut(u64, u8, u8, u8)>(
+    nb: &crate::midipat::NoteBend,
+    ch: u8,
+    on: u64,
+    len_s: u64,
+    w0: u64,
+    w1: u64,
+    mut push: F,
+) {
+    let a = on.max(w0);
+    let b = (on + len_s).min(w1);
+    if a >= b {
+        return;
+    }
+    let mut prev = f32::NAN;
+    for s in a..b {
+        let t = ((s - on) as f32 / len_s as f32).clamp(0.0, 1.0);
+        let st = nb.cents_at(t) * 0.01;
+        if !prev.is_nan() && (st - prev).abs() < 1e-4 {
+            continue;
+        }
+        let e = curve_ev(s, ch, st);
+        push(e.0, e.2, e.3, e.4);
+        prev = st;
+    }
+}
+
+/// v167: whole-pattern curve events in PATTERN time (clip at position 0,
+/// no trim) — the shape the roll audition/preview and the pins consume.
+pub(crate) fn pattern_curve_events(
+    pat: &crate::midipat::Pattern,
+    sr: u32,
+) -> Vec<(u64, u8, u8, u8, u8)> {
+    let mut out = Vec::new();
+    for note in pat.notes.iter() {
+        let Some(i) = note.bend else { continue };
+        let Some(nb) = pat.note_bends.get(i as usize) else { continue };
+        if !nb.active() {
+            continue;
+        }
+        let on = pat.ticks_to_samples(note.start, sr);
+        let len_s = pat.ticks_to_samples(note.len.max(1), sr).max(1);
+        note_curve_events(nb, note.ch, on, len_s, 0, u64::MAX, |s, ch, lo, hi| {
+            out.push((s, KIND_CURVE, ch, lo, hi))
+        });
+    }
+    out
 }
 
 /// v150: SINGLE SOURCE for the scripted-instrument scan/dispatch loop the
@@ -3157,6 +3296,15 @@ fn midi3_raw(kind: u8, ch: u8, d1: u8, d2: u8) -> [u8; 3] {
         2 => [0xD0 | ch & 0x0F, d2 & 0x7F, 0],
         4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
         5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
+        // v167 (pbc-1): kind 7 (drawn-curve bend) rides the pitch-bend
+        // wire with its DECICENT payload IN PLACE (d1/d2 = i16 LE, ±32.767
+        // st span covers the ±24 st curve bound) and d2 bit-7 as the
+        // DIRECT-CURRENCY marker: the queue choke points decode the
+        // semitones, AUTO-WIDEN the RPN0 range and push the plugin-
+        // currency 14-bit value verbatim — never the roll-law rescale
+        // (which physically walls at ±12 st). Legacy roll writers always
+        // mask d2 to 7 bits, so bit 7 can only ever originate here.
+        7 => [0xE0 | ch & 0x0F, d1, d2 | 0x80],
         _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
     }
 }
@@ -3231,6 +3379,21 @@ pub(crate) fn stage_edo(
             evq.push((
                 off,
                 midi3_raw(5, ch, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8),
+            ));
+        }
+        // v167 (pbc-1): curve bends (decicent payload, direct currency)
+        // compose the same v164 residual law as lane bends above — the
+        // channel already carries the last played key's residual, so the
+        // curve shifts RELATIVE to the EDO offset instead of erasing it.
+        // The payload is re-encoded and the direct-currency marker (d2
+        // bit-7) re-asserted for the queue choke point.
+        7 => {
+            let st = crate::audio::curve_st(d1, d2) + res[c];
+            let c10 = (st * 1000.0).round().clamp(-32768.0, 32767.0) as i16;
+            let u = c10 as u16;
+            evq.push((
+                off,
+                [0xE0 | ch & 0x0F, (u & 0xFF) as u8, ((u >> 8) as u8) | 0x80],
             ));
         }
         _ => evq.push((off, midi3_raw(kind, ch, d1, d2))),
@@ -3309,6 +3472,9 @@ fn stage_track_events(
     t: usize,
     arr: &Arrangement,
     midi_cache: &[Option<Arc<crate::midipat::Pattern>>],
+    // v167: per-asset-index curve tick windows (from `Pattern::curve_regions`,
+    // rebuilt by the RT on midi_gen) — lane events inside them are skipped.
+    midi_regions: &[Vec<(u32, u32)>],
     live_ev: &[(usize, u8, u8, u8, u8)],
     live: bool,
     pattern_run: bool,
@@ -3384,7 +3550,17 @@ fn stage_track_events(
                 }
             }
             // v42/MPE lanes: pattern bends and per-note aftertouch.
+            // v167 (pbc-1): lane events inside an owned curve window are
+            // skipped — the curve rides as sample-accurate kind-7 events
+            // (block-relative offsets), see `materialize_curves`.
+            let regs: &[(u32, u32)] = midi_regions
+                .get(cl.asset as usize)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
             for m in pat.bends.iter() {
+                if crate::midipat::Pattern::in_curve_region(regs, m.at) {
+                    continue;
+                }
                 let s = pat.ticks_to_samples(m.at, sr);
                 if s < cl.cut || s - cl.cut >= span {
                     continue;
@@ -3399,6 +3575,11 @@ fn stage_track_events(
                         ((m.val >> 7) & 0x7F) as u8,
                     ));
                 }
+            }
+            if pat.has_note_bends() {
+                materialize_curves(pat, cl, sr, p0, span_end, |s, ch, lo, hi| {
+                    ev.push(((s - p0) as usize, KIND_CURVE, ch, lo, hi))
+                });
             }
             for m in pat.polys.iter() {
                 let s = pat.ticks_to_samples(m.at, sr);
@@ -3612,6 +3793,7 @@ impl Proc {
             synth_pg,
             synths_cache,
             midi_cache,
+            curve_regions,
             sil,
             evq,
             mono2,
@@ -3740,6 +3922,7 @@ impl Proc {
                     t2,
                     &arr,
                     midi_cache,
+                    curve_regions,
                     live_ev,
                     live_t,
                     pattern_run,
@@ -3946,6 +4129,7 @@ impl Proc {
                             t,
                             &arr,
                             midi_cache,
+                            curve_regions,
                             &[],
                             false,
                             true,
@@ -3962,8 +4146,8 @@ impl Proc {
                 if ci == 0 {
                     if live_t {
                         stage_track_events(
-                            t, &arr, midi_cache, live_ev, true, false, p0, span_end, block_n, sr,
-                            midi_ev, &mut cring, None,
+                            t, &arr, midi_cache, curve_regions, live_ev, true, false, p0,
+                            span_end, block_n, sr, midi_ev, &mut cring, None,
                         );
                     }
                     if !aud_block[t].is_empty() {
@@ -4355,6 +4539,10 @@ struct Proc {
     /// MIDI pattern table (parallel to `assets`; refreshed on `midi_gen`).
     midi_cache: Arc<Vec<Option<Arc<crate::midipat::Pattern>>>>,
     midi_cache_gen: u64,
+    /// v167 (pbc-1): per-asset-index owned-curve tick windows (derived
+    /// from `Pattern::curve_regions`, rebuilt on the same `midi_gen`
+    /// swap) — playback staging skips baked-lane bends inside them.
+    curve_regions: Vec<Vec<(u32, u32)>>,
     /// Events staged for the current block, sorted by (offset, kind):
     /// (sample offset, kind 0=note-off 1=CC 2=pressure 3=note-on, ch, d1, d2).
     midi_ev: Vec<(usize, u8, u8, u8, u8)>,
@@ -4554,6 +4742,13 @@ fn new_proc(
         dflt_synth: engine.default_synth(),
         midi_cache: engine.midi(),
         midi_cache_gen: engine.midi_gen(),
+        // v167: derived windows must match the constructor's midi() snapshot
+        // (the gen check below only refreshes on CHANGE).
+        curve_regions: engine
+            .midi()
+            .iter()
+            .map(|p| p.as_ref().map(|p| p.curve_regions()).unwrap_or_default())
+            .collect(),
         auto_cache: engine.auto_assets(),
         auto_last: AutoOut::default(),
         auto_cache_gen: engine.auto_gen(),
@@ -5166,6 +5361,13 @@ impl Proc {
             if let Ok(m) = self.engine.midi.try_lock() {
                 self.midi_cache = m.clone();
                 self.midi_cache_gen = mg;
+                // v167: curve windows ride the same gen swap (derived,
+                // cheap, user-edit-rate only — the RT block reads the
+                // cached table with a binary search, zero allocation).
+                self.curve_regions = m
+                    .iter()
+                    .map(|p| p.as_ref().map(|p| p.curve_regions()).unwrap_or_default())
+                    .collect();
             }
         }
         let ag = self.engine.auto_gen();
@@ -7353,10 +7555,12 @@ mod tests {
         let mut ev = Vec::new();
         let mut ring = 0u64;
         stage_track_events(
-            0, &arr, &cache, &live_ev, true, true, 0, 512, 512, 48_000, &mut ev, &mut ring, None,
+            0, &arr, &cache, &[], &live_ev, true, true, 0, 512, 512, 48_000, &mut ev, &mut ring,
+            None,
         );
         stage_track_events(
-            1, &arr, &cache, &live_ev, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring, None,
+            1, &arr, &cache, &[], &live_ev, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring,
+            None,
         );
         ev.sort_unstable();
         let doubled = ev.len();
@@ -7374,7 +7578,8 @@ mod tests {
         let held = vec![(9usize, 3u8, 2u8, 70u8, 90u8)];
         let mut ev = Vec::new();
         stage_track_events(
-            4, &arr, &cache, &held, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring, None,
+            4, &arr, &cache, &[], &held, true, false, 0, 512, 512, 48_000, &mut ev, &mut ring,
+            None,
         );
         assert_eq!(ev, vec![(9, 3, 2, 70, 90)]);
     }
