@@ -9861,6 +9861,11 @@ impl App {
         });
     }
 
+    /// v174 (TS-020): ONE hover copy for the spectrum panel (both
+    /// placements ride it — a forked tooltip drifts, doctrine).
+    const SPEC_HOVER: &str = "live master spectrum \u{b7} 30 Hz\u{2026}20 kHz \
+                              (log) \u{d7} \u{2212}120\u{2026}0 dBFS \u{b7} teal = \
+                              quiet \u{b7} warm = loud";
     /// v39/v44 R4: MASTER OUT — THE master section (the mixer no longer
     /// duplicates any of it). ONE body shared by the floating window and
     /// the docked panel. Order of importance left to right:
@@ -9918,7 +9923,7 @@ impl App {
                     RichText::new("peak L / R (dBFS)")
                         .small()
                         .weak()
-                        .color(Color32::from_rgb(150, 150, 158)),
+                        .color(crate::kit::CAPTION),
                 )
                 .on_hover_text(
                     "Sample peak hold per channel, post master gain (dBFS). \
@@ -9940,7 +9945,7 @@ impl App {
                         ui.painter().rect_filled(
                             r.shrink(1.5),
                             1.0,
-                            Color32::from_rgb(235, 60, 50),
+                            crate::kit::CLIP_LED,
                         );
                         let led = led_r.on_hover_text(
                             "clip LED \u{b7} a sample reached full scale \u{b7} click to clear",
@@ -9993,7 +9998,7 @@ impl App {
                     RichText::new("LUFS \u{b7} live master")
                         .small()
                         .strong()
-                        .color(Color32::from_rgb(178, 178, 186)),
+                        .color(crate::kit::READOUT),
                 )
                 .on_hover_text(
                     "BS.1770-4 loudness of the live master output \
@@ -10057,10 +10062,15 @@ impl App {
                     // consumed height so the panel still GROWS with the
                     // dock 1:1 (v49 pin) without overflowing the floor.
                     let h = (body_h - row_h).max(meter_h).max(60.0);
-                    let (r2, _) = ui.allocate_exact_size(
+                    let (r2, sresp) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width().max(150.0), h),
                         Sense::hover(),
                     );
+                    sresp.on_hover_text(Self::SPEC_HOVER);
+                    #[cfg(test)]
+                    if let Ok(m) = crate::fxgui::KIT_PROBE.lock() {
+                        m.borrow_mut().push(("spectrum".to_string(), r2));
+                    }
                     paint_spectrum(ui, self.meter_state.as_ref(), r2, self.spectrum_line);
                 });
             }
@@ -10069,10 +10079,15 @@ impl App {
             // v163: same inline toggle above the folded spectrum row.
             self.spec_trace_row(ui);
             let h = (ui.available_height() - 8.0).max(46.0);
-            let (r2, _) = ui.allocate_exact_size(
+            let (r2, sresp) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width().max(150.0), h),
                 Sense::hover(),
             );
+            sresp.on_hover_text(Self::SPEC_HOVER);
+            #[cfg(test)]
+            if let Ok(m) = crate::fxgui::KIT_PROBE.lock() {
+                m.borrow_mut().push(("spectrum".to_string(), r2));
+            }
             paint_spectrum(ui, self.meter_state.as_ref(), r2, self.spectrum_line);
         }
     }
@@ -25926,7 +25941,7 @@ fn lufs_row(ui: &mut egui::Ui, cap: &str, val: Option<f64>, unit: &str, tip: &st
             egui::Label::new(
                 RichText::new(cap)
                     .small()
-                    .color(Color32::from_rgb(150, 150, 158)),
+                    .color(crate::kit::CAPTION),
             )
             .selectable(false),
         )
@@ -25976,6 +25991,11 @@ fn master_volume_controls(ui: &mut egui::Ui, app: &mut App) {
         app.note_auto(0, crate::automation::TARGET_MASTER_VOL, amp);
         app.levels_dirty = true;
     }
+    // v174 (TS-020): master fader commits echo name + value (same law as
+    // the track faders; a per-frame drag echo would swamp the status line).
+    if (!msl.dragged() && msl.changed()) || msl.drag_stopped() {
+        app.status = format!("master: vol {} dB", db_num(vol_amp(app.master_midi)));
+    }
     // v20 R3: master volume binds directly too (global target: no
     // owner track — selection's first track or the longest hosts it).
     let mvv = vol_amp(app.master_midi);
@@ -26001,6 +26021,8 @@ fn master_volume_controls(ui: &mut egui::Ui, app: &mut App) {
         app.master_dirty = true; // v35 R1
         app.master_midi = VOL_UNITY_MIDI;
         app.levels_dirty = true;
+        // v174 (TS-020): the reset echoes its outcome (v72 contract).
+        app.status = "master: volume reset to 0 dB".into();
     }
 }
 
@@ -26018,7 +26040,7 @@ fn paint_stereo_meters(
     const TOP_DB: f32 = 6.0;
     const BOT_DB: f32 = -60.0;
     let p = ui.painter();
-    p.rect_filled(rect, 1.0, Color32::from_rgb(30, 30, 34));
+    p.rect_filled(rect, 1.0, crate::kit::METER_BG);
     let y_of = |db: f32| -> f32 {
         let f = ((db - BOT_DB) / (TOP_DB - BOT_DB)).clamp(0.0, 1.0);
         rect.max.y - f * rect.height()
@@ -26028,7 +26050,7 @@ fn paint_stereo_meters(
         p.rect_filled(
             egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), led_h)),
             0.0,
-            Color32::from_rgb(235, 60, 50),
+            crate::kit::CLIP_LED,
         );
     }
     let bar_w = (rect.width() * 0.34).min(16.0);
@@ -26057,9 +26079,9 @@ fn paint_stereo_meters(
                     }
                 }
             };
-            seg(BOT_DB, -12.0, Color32::from_rgb(60, 200, 90));
-            seg(-12.0, -3.0, Color32::from_rgb(224, 204, 70));
-            seg(-3.0, TOP_DB, Color32::from_rgb(232, 84, 60));
+            seg(BOT_DB, -12.0, crate::kit::METER_GREEN);
+            seg(-12.0, -3.0, crate::kit::METER_YELLOW);
+            seg(-3.0, TOP_DB, crate::kit::METER_HOT);
         }
         if *hold > BOT_DB + 0.5 {
             let y = y_of(*hold);
@@ -26070,10 +26092,10 @@ fn paint_stereo_meters(
             egui::Align2::CENTER_BOTTOM,
             if i == 0 { "L" } else { "R" },
             egui::FontId::proportional(9.0),
-            Color32::from_rgb(20, 20, 24),
+            crate::kit::METER_TRACK,
         );
     }
-    let gray = Color32::from_rgb(130, 130, 138);
+    let gray = crate::kit::METER_HOLD;
     for db in [0.0f32, -6.0, -12.0, -24.0, -40.0, -60.0] {
         let y = y_of(db).clamp(rect.min.y + 1.0, rect.max.y - 1.0);
         p.hline(
@@ -26104,14 +26126,14 @@ fn paint_spectrum(
     line_mode: bool,
 ) {
     let p = ui.painter();
-    p.rect_filled(rect, 2.0, Color32::from_rgb(24, 24, 29));
+    p.rect_filled(rect, 2.0, crate::kit::SPEC_BG);
     let (f_min, f_max) = (crate::meter::SPEC_F_MIN, crate::meter::SPEC_F_MAX);
     let x_of = |f: f32| -> f32 {
         rect.min.x + (f.ln() - f_min.ln()) / (f_max / f_min).ln() * rect.width()
     };
     let y_of = |db: f32| -> f32 { rect.max.y - (db.max(-120.0) - -120.0) / 120.0 * rect.height() };
-    let grid = Color32::from_rgb(58, 58, 66);
-    let txt = Color32::from_rgb(120, 120, 128);
+    let grid = crate::kit::SPEC_GRID;
+    let txt = crate::kit::SPEC_TXT;
     // v49 R3: minor decade lines always; extra labels when the panel is
     // wide enough for them to read.
     for f in [100.0f32, 300.0, 1000.0, 3000.0, 10000.0] {
@@ -26476,10 +26498,11 @@ fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
         // an uninitialized outer binding.
 
         ui.spacing_mut().item_spacing.x = 4.0;
+        // v174 (TS-020): kit indicator tokens (values byte-frozen).
         let rec_btn = egui::Button::new(RichText::new(rec_lbl).color(if any_rec {
-            Color32::from_rgb(255, 90, 90)
+            crate::kit::REC_ON
         } else {
-            Color32::from_rgb(220, 180, 120)
+            crate::kit::WARN
         }))
         .small()
         .min_size(egui::vec2(56.0, 0.0));
@@ -26518,12 +26541,14 @@ fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
             // the click MOVES TO (1 = muted).
             app.note_auto(t, crate::automation::TARGET_TRACK_MUTE, if on { 1.0 } else { 0.0 });
             app.backend.cmd(Cmd::ToggleTrackOn { i: t });
+            // v174 (TS-020): parity echo with the dock strip (v72 contract).
+            app.status = format!("track {}: {}", t + 1, if on { "muted" } else { "unmuted" });
         }
     });
     // Fader labels above (auto-state marker parity with the strip).
     let (vshow, vauto) = level_shown(app, t, KIND_VOL);
     let (gshow, gauto) = level_shown(app, t, KIND_GAIN);
-    let auto_col = Color32::from_rgb(120, 210, 140);
+    let auto_col = crate::kit::AUTO;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         ui.add_sized(
@@ -26585,15 +26610,30 @@ fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
     let mut gg = gg_now;
     // Write-through EXACTLY like level_row: fader owns the frame,
     // shared setter, mirror flag dirty.
+    // v174 (TS-020): commits echo name + value (level_row/v99 pattern).
+    let mut echo_f = false;
     if p_changed(&rv, vshow, &mut vv) {
         app.fader_live = Some((t, KIND_VOL));
         app.set_trk_vol(t, vv);
         app.levels_dirty = true;
+        echo_f |= !rv.dragged();
     }
     if p_changed(&rg, gshow, &mut gg) {
         app.fader_live = Some((t, KIND_GAIN));
         app.set_trk_gain(t, gg);
         app.levels_dirty = true;
+        echo_f |= !rg.dragged();
+    }
+    if rv.drag_stopped() || rg.drag_stopped() {
+        echo_f = true;
+    }
+    if echo_f {
+        app.status = format!(
+            "track {}: vol {} dB \u{b7} gain {} dB",
+            t + 1,
+            db_num(vol_amp(vv)),
+            db_num(gain_amp(gg))
+        );
     }
     let tcol = ui.visuals().noninteractive().text_color();
     ui.horizontal(|ui| {
@@ -26641,6 +26681,10 @@ fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
         app.fader_live = Some((t, KIND_PAN));
         app.set_trk_pan(t, pv);
         app.levels_dirty = true;
+    }
+    // v174 (TS-020): pan commit echo (same law as vol/gain above).
+    if (!rp.dragged() && rp.changed()) || rp.drag_stopped() {
+        app.status = format!("track {}: pan {}", t + 1, pan_text(pv));
     }
     ui.horizontal(|ui| {
         ui.add_sized(
@@ -26847,7 +26891,7 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
         ui.painter().hline(
             band.x_range(),
             band.bottom() - 0.5,
-            egui::Stroke::new(1.0, Color32::from_gray(64)),
+            egui::Stroke::new(1.0, crate::kit::SEP),
         );
     }
     // Track strips may only paint BELOW the band — their absolute
@@ -26882,7 +26926,7 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
             ui.painter().hline(
                 r.x_range(),
                 r.max.y + TRACK_SEP_HIT * 0.5,
-                egui::Stroke::new(1.0, Color32::from_gray(48)),
+                egui::Stroke::new(1.0, crate::kit::SEP_SOFT),
             );
         }
         y += th + TRACK_SEP_HIT;
@@ -26950,11 +26994,13 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         // their two labels) — a control that grows when its text changes
         // used to reflow every neighbour in the strip, which read as the
         // UI "auto-rescaling itself".
+        // v174 (TS-020): indicator colors come from kit tokens (values
+        // frozen byte-identical by kit::v174_kit_signal_tokens_frozen).
         let rec_btn =
             egui::Button::new(RichText::new(rec_lbl).color(if any_rec {
-                Color32::from_rgb(255, 90, 90)
+                crate::kit::REC_ON
             } else {
-                Color32::from_rgb(220, 180, 120)
+                crate::kit::WARN
             }))
             .small()
             .min_size(egui::vec2(40.0, 0.0));
@@ -27018,7 +27064,9 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             app.rec_src[t] = src;
             // v52 R4: loop ("l") is the LINKED selector — while several
             // tracks are grouped, toggling it on one member sets it on all.
+            let mut linked = 0usize;
             if lc.changed() && app.rec_group.len() > 1 && app.rec_group.contains(&t) {
+                linked = app.rec_group.len() - 1;
                 for &j in app.rec_group.iter() {
                     if j != t {
                         app.rec_src[j].loop_rec = src.loop_rec;
@@ -27026,6 +27074,39 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 }
             }
             app.save_config();
+            // v174 (TS-020): the tick set IS a state change — echo the
+            // resulting sources (v72 contract: name what changed AND to
+            // what), including the group-loop linkage when it fired.
+            let mut names: Vec<&str> = Vec::new();
+            if src.audio {
+                names.push("audio");
+            }
+            if src.preview {
+                names.push("preview");
+            }
+            if src.loop_rec {
+                names.push("loop");
+            }
+            if src.midi {
+                names.push("midi");
+            }
+            if src.auto {
+                names.push("automation");
+            }
+            app.status = format!(
+                "track {}: REC sources -> {}{}",
+                t + 1,
+                if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join("+")
+                },
+                if linked > 0 {
+                    format!(" \u{b7} loop linked to {} grouped track(s)", linked)
+                } else {
+                    String::new()
+                }
+            );
         }
         // v32: reserved slot — "on"↔"mute" must not move the strip.
         let mute_btn = egui::Button::new(if on { "on" } else { "mute" })
@@ -27054,19 +27135,32 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             // mixer-click mutes wrote the wrong polarity curve).
             app.note_auto(t, crate::automation::TARGET_TRACK_MUTE, if on { 1.0 } else { 0.0 });
             app.backend.cmd(Cmd::ToggleTrackOn { i: t });
+            // v174 (TS-020): name + value of the flip (v72 echo contract).
+            app.status = format!("track {}: {}", t + 1, if on { "muted" } else { "unmuted" });
         }
         if ui
             .small_button("+")
-            .on_hover_text("Add a child lane (stacks additively)")
+            .on_hover_text(
+                "Add a child lane \u{b7} stacked lanes play ADDITIVELY \
+                 through the same instrument and effect chain",
+            )
             .clicked()
         {
             app.arr.add_lane(t);
             app.grow_for_lanes(t, nl);
             app.push_project();
+            // v174 (TS-020): echo the new lane count.
+            app.status = format!(
+                "track {}: child lane added ({} lanes)",
+                t + 1,
+                app.arr.tracks[t].lanes.len()
+            );
         }
         if nl > 1
             && ui
-                .small_button("-")
+                // v174 (TS-020): destructive (removes clips) → kit::DANGER
+                // text + its own explanation (v54 standard).
+                .small_button(RichText::new("-").color(crate::kit::DANGER))
                 .on_hover_text(
                     "Remove the last child lane \u{2014} clips on it are \
                      removed with it (their assets stay in the rack)",
@@ -27078,7 +27172,12 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
             // never-warn option); an empty one goes straight through.
             app.request_lane_removal(t);
         }
-        ui.label(RichText::new(format!("{clips}c/{nl}L")).weak().small());
+        // v174 (TS-020): the readout explains itself.
+        ui.label(RichText::new(format!("{clips}c/{nl}L")).weak().small())
+            .on_hover_text(
+                "clips on this track / stacked lane count \u{b7} '+' adds a \
+                 child lane, '-' removes the last one",
+            );
     });
     level_row(ui, app, t, KIND_VOL);
     // v0.15 UI pass: a one-lane track is 96px tall — the old stack of six
@@ -27099,7 +27198,14 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
                 let more = ui.small_button("\u{2026} more").on_hover_text(
                     "This strip is short \u{2014} click for gain, pan, FX and synth",
                 );
-                egui::Popup::menu(&more).show(|ui| {
+                // v174 (TS-020): the popup hosts sliders + pickers — with
+                // the DEFAULT CloseOnClick the very first press inside
+                // dismisses it (the v47 TextEdit trap class), so a gain
+                // drag or FX click died half-done. Only clicks OUTSIDE
+                // close now.
+                egui::Popup::menu(&more)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| {
                     level_row(ui, app, t, KIND_GAIN);
                     level_row(ui, app, t, KIND_PAN);
                     strip_fx_row(ui, app, t);
@@ -27150,11 +27256,26 @@ fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
     } else {
         cur.clone()
     };
-    if ui
-        .small_button(RichText::new(format!("\u{266a} {show}")))
-        .on_hover_text("This track's synthesizer \u{2014} opens the synth picker")
-        .clicked()
-    {
+    // v174 (TS-020): a long device name must not vanish silently — the row
+    // is width-bound and egui truncates the label, so truncation is
+    // detected PRE-PAINT (v87 rule; kit::label_clipped is the single
+    // pre-paint home).
+    let label_txt = format!("\u{266a} {show}");
+    let avail = ui.available_width() - ui.spacing().button_padding.x * 2.0 - 2.0;
+    let cut = crate::kit::label_clipped(
+        ui,
+        &label_txt,
+        avail.max(12.0),
+        egui::TextStyle::Button,
+        Some(26.0),
+    );
+    let sr = ui.small_button(RichText::new(label_txt));
+    let hover = if cut {
+        format!("synth: {show} \u{2014} name cut by the strip edge \u{b7} click opens the synth picker")
+    } else {
+        "This track's synthesizer \u{2014} opens the synth picker".to_string()
+    };
+    if sr.on_hover_text(hover).clicked() {
         app.synth_pick = Some(t);
     }
     if app.track_synth_inst[t].is_some() {
@@ -27203,9 +27324,9 @@ fn strip_synth_row(ui: &mut egui::Ui, app: &mut App, t: usize) {
         let poly = app.track_poly.get(t).copied().unwrap_or(false);
         let ptxt = if poly { "poly" } else { "mono" };
         let pbtn = egui::Button::new(RichText::new(ptxt).color(if poly {
-            Color32::from_rgb(150, 220, 150)
+            crate::kit::MODE_ON
         } else {
-            Color32::from_rgb(150, 150, 150)
+            crate::kit::MODE_OFF
         }))
         .small()
         .min_size(egui::vec2(38.0, 0.0));
@@ -30438,7 +30559,7 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
                     .monospace()
                     .small()
                     .color(if automated {
-                        egui::Color32::from_rgb(120, 210, 140)
+                        crate::kit::AUTO
                     } else {
                         egui::Visuals::dark().noninteractive().text_color()
                     }),
@@ -30489,6 +30610,7 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
             )
             .selectable(false),
         );
+        let mut echo_lv = false;
         if p_changed(&r, before, &mut v) {
             // v35 R1: dragging THIS fader owns the control this frame —
             // the engine-mirror must not fight the pointer.
@@ -30499,6 +30621,24 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
                 _ => app.set_trk_pan(i, v),
             }
             app.levels_dirty = true;
+            echo_lv = !r.dragged();
+        }
+        // v174 (TS-020): fader commits (click-step or drag release) echo
+        // name + value (the v99 send-out pattern — a per-frame drag echo
+        // would swamp the status line, so only on stop).
+        if r.drag_stopped() {
+            echo_lv = true;
+        }
+        if echo_lv {
+            app.status = if kind == KIND_PAN {
+                format!("track {}: pan {}", i + 1, pan_text(v))
+            } else {
+                let amp = match kind {
+                    KIND_VOL => vol_amp(v),
+                    _ => gain_amp(v),
+                };
+                format!("track {}: {} {} dB", i + 1, label.trim(), db_num(amp))
+            };
         }
         // v20 R3: right-click the slider OR its readout and the automation
         // asset appears directly (vol/pan; double-click sets an exact
@@ -30563,6 +30703,12 @@ fn level_row(ui: &mut egui::Ui, app: &mut App, i: usize, kind: u8) {
                 _ => app.set_trk_pan(i, 64),
             }
             app.levels_dirty = true;
+            // v174 (TS-020): the reset is a state change — echo it.
+            app.status = if kind == KIND_PAN {
+                format!("track {}: pan centered", i + 1)
+            } else {
+                format!("track {}: {} reset to 0 dB", i + 1, label.trim())
+            };
         }
     });
 }
@@ -60269,8 +60415,9 @@ mod tests {
         );
         assert_eq!(
             prod.matches("kit::label_clipped(").count(),
-            1,
-            "the fixed-height ♪ rows are the only pre-paint probe"
+            2,
+            "the fixed-height ♪ rows + the v174 strip device row are the \
+             pre-paint probes"
         );
         assert_eq!(
             prod.matches("row_dir: Some(").count(),
@@ -66756,5 +66903,558 @@ mod tests {
         assert!(tune_src.contains(skrifa_gate), "the scanner validates with egui's own parser");
         // v108 parity: the new Config field is classified LIVE.
         assert!(include_str!("mcp_settings/mod.rs").contains("\"edo_packs\""));
+    }
+
+    // =================================================================
+    // v174 — TS-020: MIXER STRIPS + MASTER OUT GUI pass (epic ts-018).
+    // Surface scope per the ts-019 map @ 0d71dd6: the MIDI MONITOR window
+    // is ts-022's and the SYNTH PICKER window (past strip_synth_row) is
+    // ts-023's — neither belongs in these pins.
+    // Contracts: hover per affordance, echo per state change, kit-token
+    // colors only, destructive = kit::DANGER, fold/clip floor, v87 full
+    // identity for clipped rows.
+    // =================================================================
+
+    /// v174 R1 (hover family): EVERY affordance statement in the strip and
+    /// master regions carries its own hover — same statement-window rule
+    /// as the v86 plugin scan (window ends at the affordance's OWN
+    /// clicked()/changed(), so no neighbour tooltip can leak in).
+    #[test]
+    fn v174_surface_hover_source_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        const REGIONS: [&str; 12] = [
+            "fn mixer_strip(",
+            "fn mix_column(",
+            "fn level_row(",
+            "fn strip_fx_row(",
+            "fn strip_synth_row(",
+            "fn track_head_menu(",
+            "fn track_color_submenu(",
+            "fn master_out_body(",
+            "fn spec_trace_row(",
+            "fn master_volume_controls(",
+            "fn lufs_row(",
+            "fn mixer_body(",
+        ];
+        let mut checked = 0usize;
+        for anchor in REGIONS {
+            let region = v86_fn_region(prod, anchor);
+            let lines: Vec<&str> = region.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") || line.contains("fx_buttons(") {
+                    continue;
+                }
+                let is_aff = line.contains("_button(")
+                    || line.contains(".button(")
+                    || line.contains(".checkbox(")
+                    || line.contains("Button::selectable")
+                    || line.contains("selectable_label");
+                if !is_aff {
+                    continue;
+                }
+                let mut win = String::new();
+                let mut seen_click = false;
+                for l in lines.iter().skip(i).take(48) {
+                    win.push_str(l);
+                    if l.contains(".clicked()") || l.contains(".changed()") {
+                        seen_click = true;
+                        break;
+                    }
+                }
+                // A popup ANCHOR has no own clicked() (the popup opens from
+                // its response) — require its hover inside the 4-line
+                // statement, then count it.
+                if win.contains("Popup::menu(&") {
+                    let near: String =
+                        lines.iter().skip(i).take(4).copied().collect::<Vec<_>>().join("\n");
+                    assert!(
+                        near.contains("on_hover"),
+                        "{anchor}: popup anchor lacks its own hover: {line}"
+                    );
+                    checked += 1;
+                    continue;
+                }
+                assert!(
+                    seen_click,
+                    "{anchor}: affordance at +{i} never clicked: {line}"
+                );
+                assert!(
+                    win.contains("on_hover"),
+                    "{anchor}: affordance has no own hover: {line}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 25, "hover scan went hollow: checked {checked}");
+        // v174: BOTH spectrum placements ride ONE SPEC_HOVER constant.
+        let master = v86_fn_region(prod, "fn master_out_body(");
+        assert_eq!(
+            master.matches("Self::SPEC_HOVER").count(),
+            2,
+            "inline and folded spectrum must share the one hover copy"
+        );
+    }
+
+    /// v174 R2 (echo family, strip side): every state change on a strip
+    /// echoes name + value into the status line.
+    #[test]
+    fn v174_strip_echo_inventory() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        let cases: [(&str, &[&str]); 5] = [
+            (
+                "fn mixer_strip(",
+                &[
+                    "REC sources -> ",
+                    "loop linked to",
+                    "\"muted\" } else { \"unmuted\"",
+                    "child lane added (",
+                    "CloseOnClickOutside",
+                    "kit::DANGER",
+                    "clips on this track",
+                ],
+            ),
+            (
+                "fn level_row(",
+                &[
+                    "reset to 0 dB",
+                    "pan centered",
+                    "track {}: {} {} dB",
+                ],
+            ),
+            (
+                "fn mix_column(",
+                &[
+                    "\"muted\" } else { \"unmuted\"",
+                    "track {}: vol {} dB \\u{b7} gain",
+                    "track {}: pan {}",
+                ],
+            ),
+            ("fn toggle_record_all(", &["recording\u{2026}"]),
+            (
+                "fn strip_synth_row(",
+                &["name cut by the strip edge"],
+            ),
+            // (kept inside the array type; the head menu + color submenu ride below)
+        ];
+        for (anchor, needles) in cases {
+            let region = v86_fn_region(prod, anchor);
+            for n in needles {
+                assert!(region.contains(n), "{anchor}: echo/hover needle {n:?} gone");
+            }
+        }
+        let menu = v86_fn_region(prod, "fn track_head_menu(");
+        assert!(menu.contains("REC group (selection)"), "shared head menu");
+        let col = v86_fn_region(prod, "fn track_color_submenu(");
+        assert!(
+            col.contains("track {} color:") && col.contains("color reset"),
+            "color picks echo (and the reset explains itself)"
+        );
+    }
+
+    /// v174 R2 (echo family, master side): master-out state changes echo;
+    /// the v163 trace seam keeps its exact verdicts.
+    #[test]
+    fn v174_master_echo_inventory() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        let body = v86_fn_region(prod, "fn master_out_body(");
+        for n in [
+            "integrated loudness + clip LED reset",
+            "clip LED cleared",
+            "clip LED was not lit",
+            "click to clear the clip LED",
+        ] {
+            assert!(body.contains(n), "master-out echo/copy {n:?} gone");
+        }
+        let vol = v86_fn_region(prod, "fn master_volume_controls(");
+        for n in ["master: volume reset to 0 dB", "master: vol {} dB"] {
+            assert!(vol.contains(n), "master volume echo {n:?} gone");
+        }
+        let seam = v86_fn_region(prod, "fn set_spectrum_line(");
+        for n in ["spectrum trace: smooth line", "spectrum trace: points"] {
+            assert!(seam.contains(n), "v163 trace seam verdict {n:?} gone");
+        }
+    }
+
+    /// v174 R3 (one design language): the strip + master surfaces paint
+    /// ONLY through kit tokens — zero local color literals.
+    #[test]
+    fn v174_surface_kit_only_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        const REGIONS: [&str; 12] = [
+            "fn mixer_strip(",
+            "fn mix_column(",
+            "fn mixer_body(",
+            "fn level_row(",
+            "fn strip_fx_row(",
+            "fn strip_synth_row(",
+            "fn master_out_body(",
+            "fn spec_trace_row(",
+            "fn lufs_row(",
+            "fn master_volume_controls(",
+            "fn paint_stereo_meters(",
+            "fn paint_spectrum(",
+        ];
+        for anchor in REGIONS {
+            let region = v86_fn_region(prod, anchor);
+            for lit in ["Color32::from_rgb", "Color32::from_gray", "Color32::from_rgba"] {
+                assert_eq!(
+                    region.matches(lit).count(),
+                    0,
+                    "{anchor}: local color literal {lit:?} — extend the kit instead"
+                );
+            }
+        }
+        // The one hairline tone is a token, and there is exactly one.
+        let kit = include_str!("kit.rs");
+        assert_eq!(
+            kit.matches("pub(crate) const SEP: Color32").count(),
+            1,
+            "SEP is the single hairline home"
+        );
+        assert_eq!(
+            kit.matches("pub(crate) const SEP_SOFT: Color32").count(),
+            1,
+            "SEP_SOFT is the single dim-rule home"
+        );
+    }
+
+    /// v174 R3 (destructive = DANGER, and it explains itself): the lane
+    /// '-' rides kit::DANGER; the sibling '+' must NOT (color carries
+    /// meaning, not decoration).
+    #[test]
+    fn v174_destructive_danger_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        let region = v86_fn_region(prod, "fn mixer_strip(");
+        let lines: Vec<&str> = region.lines().collect();
+        let mut minus = None;
+        let mut plus = None;
+        for (i, l) in lines.iter().enumerate() {
+            if l.contains(".small_button(\"+\")") {
+                plus = Some(i);
+            }
+            if l.contains(".small_button(RichText::new(\"-\")") {
+                minus = Some(i);
+            }
+        }
+        let m = minus.expect("lane remove button exists");
+        let win: String = lines[m..m + 8].join("\n");
+        assert!(win.contains("kit::DANGER"), "destructive '-' must ride kit::DANGER");
+        assert!(win.contains("on_hover"), "destructive '-' must explain itself");
+        let p = plus.expect("lane add button exists");
+        let win: String = lines[p..p + 8].join("\n");
+        assert!(!win.contains("kit::DANGER"), "the '+' sibling must NOT wear DANGER");
+    }
+
+    /// v174 runtime: the source checkboxes round-trip through real UI and
+    /// every flip echoes the resulting source list.
+    #[test]
+    fn v174_strip_source_echo() {
+        let mut app = headless_app("v174src");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.status = String::new();
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let a = galley_centers(&mut app, &ctx, "a", true);
+        assert!(!a.is_empty(), "source checkboxes paint");
+        click_pt(&mut app, &ctx, a[0]);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let s1 = app.status.clone();
+        assert!(s1.contains("REC sources -> "), "source flip echoes: {s1:?}");
+        click_pt(&mut app, &ctx, a[0]);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let s2 = app.status.clone();
+        assert!(s2.contains("REC sources -> "), "flip back echoes too: {s2:?}");
+        assert_ne!(s1, s2, "the echo carries the NEW state, not a fixed phrase");
+    }
+
+    /// v174 runtime: mute echoes name + state from BOTH entry points (dock
+    /// strip and mix-page column) — the v68 shared-body promise. The mute
+    /// FLAG itself is engine-side and the NULL backend never drains the cmd
+    /// queue (skill lore), so the pins assert the ECHO contract, which is
+    /// what the status bar shows the user.
+    #[test]
+    fn v174_strip_mute_echo_parity() {
+        let mut app = headless_app("v174mute");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.status = String::new();
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // Dock strip entry (right side): topmost "on" = track 1.
+        let mut ons = galley_centers(&mut app, &ctx, "on", true);
+        assert!(ons.len() >= 3, "strips paint live mute cells: {ons:?}");
+        ons.sort_by(|p, q| p.y.total_cmp(&q.y));
+        click_pt(&mut app, &ctx, ons[0]);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.status, "track 1: muted", "dock strip mute echoes");
+        // Mix-page column entry: the leftmost "on" is track 1's column.
+        app.mix_tab = true;
+        app.status = String::new();
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let mut cols = galley_centers(&mut app, &ctx, "on", true);
+        cols.retain(|p| p.x < 1000.0); // mix page lives LEFT of the dock
+        assert!(!cols.is_empty(), "mix columns paint mute cells");
+        cols.sort_by(|p, q| p.x.total_cmp(&q.x));
+        click_pt(&mut app, &ctx, cols[0]);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.status, "track 1: muted", "mix column mutes + echoes alike");
+    }
+
+    /// v174 runtime: '+' adds a child lane with an echo naming the NEW
+    /// lane count; the level reset echoes name + value.
+    #[test]
+    fn v174_strip_lane_add_and_reset_echo() {
+        let mut app = headless_app("v174lane");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.status = String::new();
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let plus = galley_at(&mut app, &ctx, "+").expect("'+' paints on the strip");
+        click_pt(&mut app, &ctx, plus.center());
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(
+            app.status.contains("child lane added (2 lanes)"),
+            "lane add echoes the new count: {:?}",
+            app.status
+        );
+        let zeros = galley_centers(&mut app, &ctx, "0", true);
+        assert!(!zeros.is_empty(), "level reset buttons paint");
+        click_pt(&mut app, &ctx, zeros[0]);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(
+            app.status.contains("reset to 0 dB"),
+            "reset echoes name + value: {:?}",
+            app.status
+        );
+    }
+
+    /// v174 runtime: the clip/lane counter explains itself on hover.
+    #[test]
+    fn v174_strip_counter_explains() {
+        let mut app = headless_app("v174cnt");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let c = galley_at(&mut app, &ctx, "0c/1L").expect("counter readout paints");
+        let texts = hover_until_tip(
+            &mut app,
+            &ctx,
+            c.center(),
+            &["clips on this track"],
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("clips on this track")),
+            "counter must explain '+'/'-' meaning on hover"
+        );
+    }
+
+    /// v174 runtime: the "… more" fold opens its popup, and an INSIDE
+    /// click keeps it open (CloseOnClickOutside) while an outside click
+    /// closes it — the TextEdit-survival contract (v47 rule) for the
+    /// rows folded into the popup.
+    #[test]
+    fn v174_more_popup_stays_open() {
+        let mut app = headless_app("v174more");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let texts = painted_texts(&mut app, &ctx);
+        assert!(
+            !texts.iter().any(|t| t.contains("gain")),
+            "a short strip FOLDS the gain row (negative control)"
+        );
+        let more = galley_at(&mut app, &ctx, "\u{2026} more").expect("fold control paints");
+        click_pt(&mut app, &ctx, more.center());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let texts = painted_texts(&mut app, &ctx);
+        assert!(
+            texts.iter().any(|t| t.contains("gain")),
+            "the popup carries the folded gain row"
+        );
+        // Inside click (on the popup's own label) must NOT dismiss it.
+        let g = galley_at(&mut app, &ctx, "gain").expect("gain label in popup");
+        click_pt(&mut app, &ctx, g.center());
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let texts = painted_texts(&mut app, &ctx);
+        assert!(
+            texts.iter().any(|t| t.contains("gain")),
+            "CloseOnClickOutside: inside clicks keep the popup alive"
+        );
+        // Outside click closes.
+        click_pt(&mut app, &ctx, egui::pos2(700.0, 820.0));
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let texts = painted_texts(&mut app, &ctx);
+        assert!(
+            !texts.iter().any(|t| t.contains("gain")),
+            "outside click dismisses the popup"
+        );
+    }
+
+    /// v174 runtime: master-out controls round-trip — the reset button,
+    /// both trace modes through the v163 seam, and the spectrum panel
+    /// hover (the ONE SPEC_HOVER copy) on its probed rect.
+    #[test]
+    fn v174_master_panel_roundtrip() {
+        let mut app = headless_app("v174mst");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = true;
+        app.status = String::new();
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let reset = galley_at(&mut app, &ctx, "reset I").expect("reset button paints");
+        click_pt(&mut app, &ctx, reset.center());
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(
+            app.status.contains("integrated loudness + clip LED reset"),
+            "reset echoes: {:?}",
+            app.status
+        );
+        let line = galley_centers(&mut app, &ctx, "line", true);
+        assert_eq!(line.len(), 1, "trace 'line' button paints");
+        click_pt(&mut app, &ctx, line[0]);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.status.contains("spectrum trace: smooth line"), "line mode echoes");
+        let pts = galley_centers(&mut app, &ctx, "points", true);
+        assert_eq!(pts.len(), 1, "trace 'points' button paints");
+        click_pt(&mut app, &ctx, pts[0]);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.status.contains("spectrum trace: points"), "points mode echoes");
+        // The spectrum panel itself explains itself (probe-then-act, v82).
+        kit_clear();
+        frame(&mut app, &ctx, vec![]);
+        let rects = kit_probe("spectrum");
+        assert_eq!(rects.len(), 1, "the panel registers its rect once: {rects:?}");
+        let texts = hover_until_tip(
+            &mut app,
+            &ctx,
+            rects[0].center(),
+            &["live master spectrum"],
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("live master spectrum")),
+            "the spectrum panel must explain axes + colors on hover"
+        );
+    }
+
+    /// v174 runtime (alignment floor): at the default strip height nothing
+    /// overflows — the overflow-capable rows are FOLDED ("… more" per
+    /// strip) and every right-edge readout still paints (a clipped galley
+    /// would vanish — skill lore). Strip heads stay strictly ordered.
+    #[test]
+    fn v174_strip_fold_and_clip_floor() {
+        let mut app = headless_app("v174fold");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let texts = painted_texts(&mut app, &ctx);
+        let cnt = |needle: &str| texts.iter().filter(|t| t.contains(needle)).count();
+        let strips = cnt("0c/1L");
+        assert!(strips >= 3, "counters paint per strip");
+        // Every strip either FOLDS ("… more") or has room for the full
+        // stack (the FX chip is its tell) — none overflows into the next.
+        let folded = cnt("\u{2026} more");
+        let full = cnt("FX");
+        // The dock viewport may clip the LAST strip's fold control (the
+        // dock scrolls — legit), so every strip but at most one must
+        // visibly fold or show the full stack.
+        assert!(
+            folded + full >= strips - 1 && folded + full <= strips,
+            "strips fold or stack visibly: {folded}+{full} vs {strips}"
+        );
+        let mut ys: Vec<f32> = (1..=strips)
+            .filter_map(|i| {
+                let n = format!("Track {i}");
+                galley_centers(&mut app, &ctx, &n, true).first().map(|p| p.y)
+            })
+            .collect();
+        ys.sort_by(|a, b| a.total_cmp(b));
+        for w in ys.windows(2) {
+            assert!(w[1] - w[0] > 30.0, "strip heads must not bleed: {ys:?}");
+        }
+    }
+
+    /// v174 runtime (v87 on the strip): a clipped device row carries the
+    /// FULL identity; a fitting row stays plain.
+    #[test]
+    fn v174_strip_synth_identity_when_clipped() {
+        let mut app = headless_app("v174id");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.trk_height[0] = 340.0;
+        app.track_synth[0] = Some("ZZ".repeat(60));
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let g = galley_at(&mut app, &ctx, "\u{266a} Z").expect("the device row paints");
+        let p = g.center();
+        let texts = hover_until_tip(&mut app, &ctx, p, &["name cut by the strip edge"]);
+        assert!(
+            texts.iter().any(|t| t.contains("name cut by the strip edge")
+                && t.contains("synth: ZZ")),
+            "clipped device row must carry the full identity"
+        );
+        // Negative polarity: a fitting row stays plain.
+        let mut app = headless_app("v174id2");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.trk_height[0] = 340.0;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let g = galley_at(&mut app, &ctx, "\u{266a}").expect("synth row paints");
+        let texts = hover_until_tip(&mut app, &ctx, g.center(), &["synthesizer"]);
+        assert!(
+            texts.iter().any(|t| t.contains("synthesizer")),
+            "the row keeps its base hover"
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("name cut by")),
+            "a fitting row must NOT claim truncation"
+        );
     }
 }
