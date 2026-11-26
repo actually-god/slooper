@@ -25,6 +25,16 @@
  * getState/setState carry (int32 program, double level) so chunk rebuilds
  * keep the program. process() outputs silence.
  *
+ * v165 EXTENSION — MIDI observer (w6-style, for the VST3 MIDI-wire pins):
+ * process() scans ProcessData.inputEvents (crate IEventList vtable:
+ * getEventCount @ slot 3, getEvent @ slot 4) and records every raw
+ * kLegacyMIDICCOutEvent (type 65535; legacy controlNumber scheme
+ * 128=chAT, 129=bend LSB/MSB, 130=PC, else CC) plus a native-event count
+ * as a control channel. getState appends the 13 int32 observer fields
+ * AFTER the original 12-byte program+level block (append-only keeps the
+ * legacy field offsets; slooper's v66_state guard is re-targeted to the
+ * new exact length in the same commit).
+ *
  * Build: scripts/porting/v66_build_fixtures.sh (host cc + llvm-mingw gcc,
  * same pattern as w6 — static-linked on Windows so a clean CI runner loads
  * it). NO C++ runtime, NO SDK — plain C like the VST2 fixture.
@@ -118,6 +128,23 @@ typedef struct { int32_t processMode; int32_t symbolicSampleSize; int32_t numSam
                  void* outputParameterChanges; void* inputEvents; void* outputEvents; void* processContext; } ProcessData;
 typedef struct { int32_t processMode; int32_t symbolicSampleSize; int32_t maxSamplesPerBlock; double sampleRate; } ProcessSetup;
 typedef struct { int32_t numChannels; uint64_t silenceFlags; void* channelBuffers; } AudioBusBuffers;
+
+/* v165: mirror of the `vst3` 0.3.0 bindings' Event (repr C:
+ * i32 bus, i32 sampleOffset, f64 ppq, u16 flags, u16 type, union @24).
+ * The crate copies its own 56-byte Event into whatever pointer getEvent
+ * hands it, so this buffer must be AT LEAST that big: 24 + 64 = 88.
+ * LegacyMIDICCOutEvent lives at payload offset 0 (4 x int8-ish:
+ * controlNumber, channel, value, value2). */
+typedef struct {
+    int32_t busIndex;
+    int32_t sampleOffset;
+    double ppqPosition;
+    uint16_t flags;
+    uint16_t type;
+    uint8_t pad[4];
+    uint8_t payload[64];
+} VEvent;
+#define kLegacyMidiType 65535u /* EventTypes::kLegacyMIDICCOutEvent */
 typedef char char8;
 typedef struct { char8 vendor[64]; char8 url[256]; char8 email[128]; int32_t flags; } PFactoryInfo;
 typedef struct { uint8_t cid[16]; int32_t cardinality; char8 category[32]; char8 name[64]; } PClassInfo;
@@ -131,6 +158,13 @@ struct Fixture {
     int program;      /* shared: controller AND processor converge here */
     double level;
     double sample_rate;
+    /* v165 MIDI observer: raw legacy-MIDI (type 65535) tallies from
+     * inputEvents + last legacy quadruple + value sums (pin content
+     * proof), plus native note/polyAT count as a control. */
+    int32_t mo_legacy, mo_cc, mo_bend, mo_at, mo_pc, mo_native;
+    int32_t mo_num, mo_ch, mo_val, mo_val2;
+    int32_t mo_cc_sum, mo_bend_lsb, mo_bend_msb;
+    int32_t mo_rpn_msb, mo_rpn_active; /* learned RPN0 (CC101/100 then CC6) */
     Slot comp;        /* FUnknown / IPluginBase / IComponent */
     Slot ap;          /* IAudioProcessor */
     Slot ec;          /* IEditController */
@@ -226,6 +260,30 @@ static tresult ap_process(void* s, ProcessData* d) {
             }
             if (id == PID_PROGRAM) f->program = clamp_program(last);
             else if (id == PID_LEVEL) f->level = last;
+        }
+    }
+    /* v165 MIDI observer: tally raw legacy-MIDI bytes in inputEvents.
+     * IEventList vtable (crate bindings): QI/addRef/release, then
+     * getEventCount(3), getEvent(4). */
+    void* evl = d->inputEvents;
+    if (evl) {
+        void** evt = *(void***)evl;
+        int32_t n = ((int32_t (*)(void*))evt[3])(evl);
+        for (int32_t i = 0; i < n; i++) {
+            VEvent e; memset(&e, 0, sizeof e);
+            if (((tresult (*)(void*, int32_t, void*))evt[4])(evl, i, &e) != kResultOk) continue;
+            if (e.type == kLegacyMidiType) {
+                int32_t num = e.payload[0], ch = (int32_t)e.payload[1],
+                        val = (int32_t)e.payload[2], val2 = (int32_t)e.payload[3];
+                f->mo_legacy++;
+                f->mo_num = num; f->mo_ch = ch; f->mo_val = val; f->mo_val2 = val2;
+                if (num == 129) { f->mo_bend++; f->mo_bend_lsb += val; f->mo_bend_msb += val2; }
+                else if (num == 128) f->mo_at++;
+                else if (num == 130) f->mo_pc++;
+                else { f->mo_cc++; f->mo_cc_sum += val; }
+            } else if (e.type == 0 || e.type == 1 || e.type == 3) {
+                f->mo_native++; /* noteOn / noteOff / polyPressure (this crate's IDs) */
+            }
         }
     }
     /* silence every configured channel (a silent instrument is fine:
@@ -367,6 +425,13 @@ static tresult c_getState(void* s, void* stream) {
     int32_t prog = (int32_t)f->program; double level = f->level; uint64_t written = 0;
     if (stream_write(stream, &prog, 4, &written) != kResultOk) return kResultFalse;
     if (stream_write(stream, &level, 8, &written) != kResultOk) return kResultFalse;
+    /* v165 observer block: 13 x int32, order MUST match v165_midi_state
+     * in src/vsthost.rs: legacy, cc, bend, at, pc, native, num, ch, val,
+     * val2, cc_sum, bend_lsb, bend_msb. */
+    int32_t obs[13] = { f->mo_legacy, f->mo_cc, f->mo_bend, f->mo_at, f->mo_pc,
+                        f->mo_native, f->mo_num, f->mo_ch, f->mo_val, f->mo_val2,
+                        f->mo_cc_sum, f->mo_bend_lsb, f->mo_bend_msb };
+    if (stream_write(stream, obs, (int32_t)sizeof(obs), &written) != kResultOk) return kResultFalse;
     return kResultOk;
 }
 

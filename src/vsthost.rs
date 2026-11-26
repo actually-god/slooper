@@ -6872,17 +6872,18 @@ mod tests {
     /// Parse the saved stream. vst3-host wraps the plugin's bytes in its
     /// documented envelope (magic | u32 version | u32 component_len |
     /// u32 controller_len | payload...) — unwrap it, then parse the
-    /// fixture payload [i32 program, f64 level] (12 bytes). Every shape
-    /// guard is explicit so a foreign or truncated stream can never
-    /// false-pass a program assert.
+    /// fixture payload. v165 appended the MIDI observer block after the
+    /// original [i32 program, f64 level] (payload now 64 bytes; the first
+    /// 12 keep their offsets). Every shape guard is explicit so a foreign
+    /// or truncated stream can never false-pass a program assert.
     fn v66_state(save: &[u8]) -> Option<i32> {
-        if save.len() < 40 || &save[0..16] != b"VST3HOST_STATE\0\0" {
+        if save.len() < 92 || &save[0..16] != b"VST3HOST_STATE\0\0" {
             return None;
         }
         if u32::from_le_bytes(save[16..20].try_into().ok()?) != 1 {
             return None;
         }
-        if u32::from_le_bytes(save[20..24].try_into().ok()?) != 12 {
+        if u32::from_le_bytes(save[20..24].try_into().ok()?) != 64 {
             return None;
         }
         // save[24..28] = controller-state length (u32::MAX = absent; this
@@ -7653,5 +7654,142 @@ mod tests {
         assert_eq!(rt.v2_probe(9007), 300, "the future-due half lands in its own block: deferred, never dropped");
         assert_eq!(rt.v2_probe(9008), 150, "and in one batch of its own, still correctly sized");
         assert_eq!(e.midi_drops(), 0, "the drop-free invariant holds above 64 events/block");
+    }
+
+    // ---- v165: raw MIDI reaches raw-MIDI VST3 plugins (card t_8d4e7e7a) ----
+    // Before the vendored-crate patch (vendor/vst3-host, SLOOPER-PATCH.md
+    // v1), vst3-host's send_midi_event_at routed CC/PitchBend/ChannelAT/
+    // ProgramChange ONLY through the IMidiMapping parameter table; a plugin
+    // that maps nothing (Nekobi/JS80P class — they parse raw bytes from the
+    // input EventList) answered Ok(()) and the event vanished: no bytes,
+    // no error, no counter. The fixture below implements NO IMidiMapping,
+    // so EVERY legacy counter sits at zero on the unpatched crate — the
+    // pins' RED polarity — while NoteOn/Off/PolyAT (native events) pass.
+
+    /// Parse the v165 MIDI observer block appended to the v66 fixture's
+    /// getState: 13 x i32 after [i32 program, f64 level] (payload 64 B,
+    /// envelope total 28 + 64 = 92). Field order MUST match c_getState in
+    /// scripts/porting/v66_vst3_fixture.c.
+    fn v165_midi_state(save: &[u8]) -> Option<[i32; 13]> {
+        if save.len() < 92 || &save[0..16] != b"VST3HOST_STATE\0\0" {
+            return None;
+        }
+        if u32::from_le_bytes(save[16..20].try_into().ok()?) != 1 {
+            return None;
+        }
+        if u32::from_le_bytes(save[20..24].try_into().ok()?) != 64 {
+            return None;
+        }
+        let level = f64::from_le_bytes(save[32..40].try_into().ok()?);
+        if (level - 0.5).abs() > f64::EPSILON {
+            return None;
+        }
+        let mut obs = [0i32; 13];
+        for (k, v) in obs.iter_mut().enumerate() {
+            *v = i32::from_le_bytes(save[40 + k * 4..44 + k * 4].try_into().ok()?);
+        }
+        Some(obs)
+    }
+
+    /// THE acceptance pin: CC + pitch bend + channel-AT + the v103 RPN0
+    /// bursts arrive at the plugin's input event list as raw
+    /// kLegacyMIDICCOutEvent bytes — exact counts, exact sums, exact last
+    /// event. On the UNPATCHED crate every legacy counter reads 0 (RED),
+    /// while the native note count stays correct (the pin's own
+    /// plumbing-control).
+    #[test]
+    fn v165_vst3_unmapped_bend_cc_at_arrive_as_raw_midi() {
+        let file = if cfg!(windows) { "v66-vst3.dll" } else { "v66-vst3.so" };
+        let load = open(v66_fixture(file).as_path(), VstKind::V3, 48_000, None)
+            .expect("v66 fixture opens");
+        let e = &load.entry;
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        let inp = vec![0.0f32; VST_BLOCK];
+        let mut outp = vec![0.0f32; VST_BLOCK];
+        // Block 0: bare process — the v103 wire's eager ch0 RPN0 burst
+        // (6 CCs) must be delivered at the init block.
+        e.process(&inp, &mut outp);
+        // Block 1: note + CC7 + channel-AT + full-scale ch1 bend + note-off.
+        // queue() rescales the bend to the track range and PRE-announces
+        // RPN0 for ch1 (6 more CCs) before the bend itself.
+        e.process_with_midi(
+            &inp,
+            &mut outp,
+            &[
+                (8, [0x91, 60, 100]), // note-on  ch1
+                (16, [0xB1, 7, 99]),  // CC7 = 99 ch1
+                (24, [0xD2, 77, 0]),  // channel-AT ch2, pressure 77
+                (28, [0xE1, 127, 127]), // roll-space max bend ch1
+                (32, [0x81, 60, 0]), // note-off  ch1
+            ],
+        );
+        e.process(&inp, &mut outp); // quiet drain block
+        let save = rt.save_state().expect("fixture state save");
+        let Some([legacy, cc, bend, at, pc, native, num, ch, val, val2, cc_sum, blsb, bmsb]) =
+            v165_midi_state(&save)
+        else {
+            panic!("observer block must parse (state stream = {save:?})");
+        };
+        // Legacy totals: burst ch0 (6) + CC7 + burst ch1 (6) + AT + bend.
+        assert_eq!(legacy, 15, "every raw-MIDI message must reach the plugin");
+        assert_eq!(cc, 13, "11 RPN0-burst CCs + the ch1 CC7");
+        let br = DEFAULT_BEND_RANGE as i32;
+        assert_eq!(cc_sum, 2 * (254 + br) + 99, "CC value bytes arrive intact");
+        assert_eq!(bend, 1, "the rescaled bend must arrive");
+        // Full scale (16383) at the default 2-st range maps to +2 st = the
+        // very same 16383 wire value -> LSB 127, MSB 127.
+        assert_eq!((blsb, bmsb), (127, 127), "14-bit bend bytes");
+        assert_eq!(at, 1, "channel pressure must arrive as raw controlNumber 128");
+        assert_eq!(pc, 0, "no program change was sent in this block");
+        assert_eq!(native, 2, "note-on/off ride native events — unaffected control");
+        assert_eq!(
+            (num, ch, val, val2),
+            (129, 1, 127, 127),
+            "the LAST raw event is the ch1 bend (controlNumber 129)"
+        );
+        assert_eq!(e.midi_drops(), 0, "delivery must stay drop-free");
+    }
+
+    /// Patch v2 law: mapped-parameter routes STAY (library program moves
+    /// via the IUnitInfo param mirror on this fixture) AND the raw legacy
+    /// byte is delivered too — DPF-class plugins advertise mappings onto
+    /// display-only params and consume PC only from raw events. Double
+    /// delivery is same-value/idempotent.
+    #[test]
+    fn v165_vst3_program_change_keeps_the_parameter_route() {
+        let file = if cfg!(windows) { "v66-vst3.dll" } else { "v66-vst3.so" };
+        let load = open(v66_fixture(file).as_path(), VstKind::V3, 48_000, None)
+            .expect("v66 fixture opens");
+        let e = &load.entry;
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        let inp = vec![0.0f32; VST_BLOCK];
+        let mut outp = vec![0.0f32; VST_BLOCK];
+        e.process_with_midi(&inp, &mut outp, &[(4, [0xC3, 2, 0])]); // PC ch3 prog 2
+        e.process(&inp, &mut outp);
+        let save = rt.save_state().expect("fixture state save");
+        assert_eq!(v66_state(&save), Some(2), "PC reached the LIBRARY via the parameter mirror");
+        let Some([_legacy, _cc, _bend, _at, pc, _native, ..]) = v165_midi_state(&save) else {
+            panic!("observer block must parse (state stream = {save:?})");
+        };
+        assert_eq!(pc, 1, "the raw program-change byte is delivered ALONGSIDE the mapped route");
+    }
+
+    /// Append-only contract of the extended state stream: the legacy
+    /// program+level prefix still parses, and a fresh fixture instance
+    /// carries an all-zero observer block (per-instance counters).
+    #[test]
+    fn v165_vst3_state_stream_prefix_unchanged() {
+        let file = if cfg!(windows) { "v66-vst3.dll" } else { "v66-vst3.so" };
+        let load = open(v66_fixture(file).as_path(), VstKind::V3, 48_000, None)
+            .expect("v66 fixture opens");
+        let rt = load
+            .entry
+            .as_any()
+            .downcast_ref::<RtStageEntry>()
+            .expect("RtStageEntry");
+        let save = rt.save_state().expect("fixture state save");
+        assert_eq!(v66_state(&save), Some(0), "program/level prefix intact");
+        let obs = v165_midi_state(&save).expect("observer block parses");
+        assert_eq!(obs, [0i32; 13], "fresh instance has observed nothing");
     }
 }
