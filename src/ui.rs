@@ -53895,7 +53895,7 @@ mod tests {
             );
         }));
         std::fs::remove_file(&junk).unwrap();
-        let _ = res.unwrap_or_else(|e| std::panic::resume_unwind(e));
+        res.unwrap_or_else(|e| std::panic::resume_unwind(e));
     }
 
     /// v176 (ts-028): the rack kind palette has ONE home

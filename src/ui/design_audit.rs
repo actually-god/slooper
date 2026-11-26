@@ -45,8 +45,7 @@ fn strip_line(l: &str) -> String {
     let mut out = String::new();
     let mut instr = false;
     let mut esc = false;
-    let mut it = l.char_indices().peekable();
-    while let Some((i, c)) = it.next() {
+    for (i, c) in l.char_indices() {
         if instr {
             out.push(c);
             if esc {
