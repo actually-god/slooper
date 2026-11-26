@@ -858,6 +858,44 @@ const COL_BEAT_LINE: Color32 = Color32::from_gray(78);
 /// subdivision" report).
 const COL_SNAP_LINE: Color32 = Color32::from_gray(44);
 
+// v175 (ts-028 design-language audit): arrangement data tints — ONE home.
+// The piano roll paints the same yellow-cap/gold values; adoption on the
+// roll side is a ts-022 rebase to-do — do NOT add forked literals of these
+// values on either side (tripwired by v175_arrangement_tints_single_home).
+/// Ruler-strip background (the lane bg below it is kit::SPEC_BG).
+const COL_RULER_BG: Color32 = Color32::from_rgb(34, 34, 40);
+/// "original length" ghost line + "original" label (trimmed past the loop
+/// region): the muted gold of "what the asset used to be".
+const COL_ORIG_LEN: Color32 = Color32::from_rgb(250, 200, 90);
+/// Clip resize end caps + loop-region handles — the shared "yellow handle"
+/// language.
+const COL_RESIZE_CAP: Color32 = Color32::from_rgb(250, 200, 50);
+/// A yellow handle grabbed RIGHT NOW (ruler loop handles).
+const COL_RESIZE_CAP_HELD: Color32 = Color32::from_rgb(255, 235, 120);
+/// The selected-clip "x" hint top-right: Delete removes these.
+const COL_DEL_HINT: Color32 = Color32::from_rgb(235, 120, 120);
+/// Pattern-asset note dots inside a clip (selected = the brighter twin).
+const COL_CLIP_NOTES: Color32 = Color32::from_rgb(120, 205, 255);
+const COL_CLIP_NOTES_SEL: Color32 = Color32::from_rgb(180, 235, 255);
+/// The automation curve drawn over automation-asset clips.
+const COL_AUTO_CURVE: Color32 = Color32::from_rgb(255, 130, 130);
+const COL_AUTO_CURVE_SEL: Color32 = Color32::from_rgb(255, 190, 190);
+/// Track separation bar: resting / hot-under-the-grab.
+const COL_SEP_BAR: Color32 = Color32::from_rgb(56, 56, 64);
+const COL_SEP_BAR_HOT: Color32 = Color32::from_rgb(96, 96, 116);
+/// Skip-to-start/-end button glyphs: resting / hover. Kept in the palette
+/// (not kit): transport chrome with a single use site — an exemption with
+/// its reason, per the ts-028 "token or exempt-with-reason" rule.
+const COL_SKIP_FG: Color32 = Color32::from_rgb(205, 210, 226);
+const COL_SKIP_FG_HOVER: Color32 = Color32::from_rgb(240, 244, 255);
+/// Row-edge grab tolerance — shared HOME for the two historical values.
+/// The arrangement lane grabs 1 px WIDER than a piano-roll note: lanes are
+/// big targets with dense content beside them, notes need tighter
+/// precision in a dense roll. Deliberate divergence — changing either one
+/// is a design decision, so both live here, not in the call sites.
+const GRAB_EDGE_LANE: f32 = 7.0;
+const GRAB_EDGE_NOTE: f32 = 6.0;
+
 /// v112: the arrangement's asset-length lookup (asset id → timeline
 /// samples) as a borrow-cheap closure for `place_auto`/`Lane::occupied`.
 /// Takes the table + sample rate as plain args so callers can pass
@@ -13124,7 +13162,7 @@ impl App {
         }
         // notes (+ yellow end caps on the selected ones — the
         // resize handles, same language as the loop-area handles)
-        const EDGE_PX: f32 = 6.0;
+        const EDGE_PX: f32 = GRAB_EDGE_NOTE;
         // v105 (pb-3, spec docs/SAMPLER-PITCH.md § 4 VISUAL): per-note
         // pitch-curve trail geometry. The trail rides the note's ROW:
         // ±trail_half px around the row center = ±1200 ¢.
@@ -23473,6 +23511,15 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
                 }
             } else {
                 let title = ui.label(RichText::new(win_title(app, idx)).strong());
+                // v175 (TS-021 R7): lone titles explain themselves like the tab
+                // group's tabs already do — hover identity + the slot-menu pointer.
+                title
+                    .clone()
+                    .on_hover_text(format!(
+                        "{} \u{b7} right-click for dock/tab/close \u{b7} drag out of the \
+                         dock to float",
+                        win_title(app, idx)
+                    ));
                 // v30-batch-2: one-stop dock menu on the header title — every
                 // window can be re-slotted (or floated out) without a precise
                 // drag; the drag-to-edge gesture stays as the quick path.
@@ -27736,18 +27783,29 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
             .on_hover_text("Quantize each fresh recording's content onto the metronome grid")
             .changed()
         {
+            app.status = format!(
+                "auto-quantize: {} \u{b7} onto the {} grid",
+                if app.auto_quantize { "on" } else { "off" },
+                SUBDIVISIONS[app.q_sub].1
+            );
             app.save_config();
         }
         ui.label("quantize");
-        egui::ComboBox::from_id_salt("q_sub_cb")
+        let qresp = egui::ComboBox::from_id_salt("q_sub_cb")
             .selected_text(SUBDIVISIONS[app.q_sub].1)
             .show_ui(ui, |ui| {
                 for (n, s) in SUBDIVISIONS.iter().enumerate() {
                     if ui.selectable_value(&mut app.q_sub, n, s.1).changed() {
+                        app.status =
+                            format!("quantize grid: {} \u{b7} fresh recordings snap onto it", s.1);
                         app.save_config();
                     }
                 }
             });
+        qresp.response.on_hover_text(
+            "The subdivision auto-quantize snaps a fresh recording's notes onto \u{b7} pair it \
+             with the checkbox to the left",
+        );
         ui.label("snap");
         // Master snap switch (requirement: OFF = snap to the program's
         // minimum resolution — one sample — not to a subdivision).
@@ -27759,18 +27817,28 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
             )
             .changed()
         {
+            app.status = if app.snap_on {
+                format!("snap: on \u{b7} {} grid", SUBDIVISIONS[app.snap_sub].1)
+            } else {
+                "snap: off \u{b7} placement lands on any sample".into()
+            };
             app.save_config();
         }
         ui.add_enabled_ui(app.snap_on, |ui| {
-            egui::ComboBox::from_id_salt("snap_sub_cb")
+            let sresp = egui::ComboBox::from_id_salt("snap_sub_cb")
                 .selected_text(SUBDIVISIONS[app.snap_sub].1)
                 .show_ui(ui, |ui| {
                     for (n, s) in SUBDIVISIONS.iter().enumerate() {
                         if ui.selectable_value(&mut app.snap_sub, n, s.1).changed() {
+                            app.status = format!("snap grid: {}", s.1);
                             app.save_config();
                         }
                     }
                 });
+            sresp.response.on_hover_text(
+                "Snap resolution: while snap is on, placement, drags and clip resize jump \
+                 to this grid",
+            );
         });
         if !app.snap_on {
             ui.label(RichText::new("(off: 1 sample)").weak().small());
@@ -27787,13 +27855,18 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
             .changed()
         {
             app.loop_tl = lt;
+            app.status = if lt {
+                "loop: on \u{b7} playhead wraps at the loop region end".into()
+            } else {
+                "loop: off \u{b7} playhead parks at the project end".into()
+            };
             app.backend.cmd(Cmd::SetLoop(app.loop_tl));
             app.send_loop_region();
             app.save_config();
         }
         let mut mch = false;
         ui.add_enabled_ui(app.loop_tl, |ui| {
-            egui::ComboBox::from_id_salt("loop_mode_cb")
+            let lresp = egui::ComboBox::from_id_salt("loop_mode_cb")
                 .selected_text(LOOP_MODES[app.loop_mode.min(2)])
                 .show_ui(ui, |ui| {
                     for (n, s) in LOOP_MODES.iter().enumerate() {
@@ -27802,8 +27875,13 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                         }
                     }
                 });
+            lresp.response.on_hover_text(
+                "What the loop wraps: the area you drag on the ruler, the current longest \
+                 clip, or the whole song",
+            );
         });
         if mch {
+            app.status = format!("loop mode: {}", LOOP_MODES[app.loop_mode.min(2)]);
             app.send_loop_region();
             app.save_config();
         }
@@ -27836,7 +27914,7 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
         if ui
             .button(RichText::new("\u{2702} split").strong())
             .on_hover_text(
-                "Split the selected clip(s) at the playhead (key: S). The two \\
+                "Split the selected clip(s) at the playhead (key: S). The two \
                  halves keep playing seamlessly; fades stay on the left half.",
             )
             .clicked()
@@ -27853,8 +27931,15 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                 Slider::new(&mut app.px_per_sec, ZOOM_MIN..=ZOOM_MAX)
                     .logarithmic(true)
                     .show_value(false),
+            )
+            .on_hover_text(
+                "Timeline zoom in pixels per second. Ctrl+wheel over the grid zooms the \
+                 same way; Shift+wheel pans the view.",
             );
         let _ = p_changed(&rz, before_z, &mut app.px_per_sec);
+        if rz.drag_stopped() {
+            app.status = format!("zoom: {:.0} px/s", app.px_per_sec);
+        }
     });
 }
 
@@ -28035,7 +28120,14 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
             RichText::new(format!("{name} \u{b7} {:.2}s", span as f64 / sr))
                 .strong()
                 .small(),
-        );
+        )
+        .on_hover_text(format!(
+            "{name} \u{b7} {:.2}s \u{b7} track {} \u{b7} lane {} \u{b7} the sliders below \
+             change THIS clip only \u{b7} the asset itself is untouched",
+            span as f64 / sr,
+            t + 1,
+            k + 1
+        ));
         // gain, in dB (the house convention: everything the user edits is dB)
         let mut db: f32 = (20.0f32 * cl.gain.max(1e-4).log10()).clamp(-60.0, 12.0);
         // v30-batch-2: FINITE slider widths. A Slider's text label wraps
@@ -28050,12 +28142,17 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
                 .step_by(0.5)
                 .trailing_fill(true),
         );
+        r.clone().on_hover_text(
+            "This clip's own gain in dB \u{b7} other clips of the same asset keep their own \
+             \u{b7} commits when you release the slider",
+        );
         if p_changed(&r, before_g, &mut db) {
             if let Some(cl) = app.arr.tracks[t].lanes[k].clips.get_mut(c) {
                 cl.gain = 10f32.powf(db / 20.0);
             }
         }
         if r.drag_stopped() {
+            app.status = format!("{name}: gain {db:+.1} dB");
             app.push_project();
         }
         for (label, cur, is_in) in [
@@ -28071,6 +28168,11 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
                     .step_by(5.0)
                     .trailing_fill(true),
             );
+            r.clone().on_hover_text(if is_in {
+                "Fade-IN over the first N milliseconds of this clip \u{b7} commits on release"
+            } else {
+                "Fade-OUT over the last N milliseconds of this clip \u{b7} commits on release"
+            });
             if p_changed(&r, before_f, &mut ms) {
                 if let Some(cl) = app.arr.tracks[t].lanes[k].clips.get_mut(c) {
                     let samples = (ms * sr / 1000.0) as u64;
@@ -28082,6 +28184,7 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
                 }
             }
             if r.drag_stopped() {
+                app.status = format!("{name}: {label} {ms:.0} ms");
                 app.push_project();
             }
         }
@@ -28096,6 +28199,7 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
                 cl.fade_in = 0;
                 cl.fade_out = 0;
             }
+            app.status = format!("{name}: clip props reset \u{b7} unity gain, no fades");
             app.push_project();
         }
     });
@@ -28208,9 +28312,9 @@ fn paint_grid(
         rect,
         0.0,
         if ruler {
-            Color32::from_rgb(34, 34, 40)
+            COL_RULER_BG
         } else {
-            Color32::from_rgb(24, 24, 29)
+            crate::kit::SPEC_BG
         },
     );
     let beat_px = quantize::beat_samples(sr as u32, app.bpm()) * (px / sr);
@@ -28302,9 +28406,9 @@ fn skip_button(ui: &mut egui::Ui, to_start: bool) -> egui::Response {
         );
     }
     let fg = if resp.hovered() {
-        egui::Color32::from_rgb(240, 244, 255)
+        COL_SKIP_FG_HOVER
     } else {
-        egui::Color32::from_rgb(205, 210, 226)
+        COL_SKIP_FG
     };
     let c = r.center().y;
     let (tb, tip) = if to_start {
@@ -28371,9 +28475,9 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
                         ),
                         1.0,
                         if held {
-                            Color32::from_rgb(255, 235, 120)
+                            COL_RESIZE_CAP_HELD
                         } else {
-                            Color32::from_rgb(250, 200, 50)
+                            COL_RESIZE_CAP
                         },
                     );
                 }
@@ -28472,9 +28576,9 @@ fn track_block(ui: &mut egui::Ui, app: &mut App, t: usize, w: f32, px: f64, sr: 
         ),
         0.0,
         if hot {
-            Color32::from_rgb(96, 96, 116)
+            COL_SEP_BAR_HOT
         } else {
-            Color32::from_rgb(56, 56, 64)
+            COL_SEP_BAR
         },
     );
     if sep.drag_started_by(egui::PointerButton::Primary) {
@@ -28580,7 +28684,7 @@ fn lane_row(
     // Edge zones become trim/extend handles on ANY clip (grabbing an edge
     // selects the clip on the way — the old "only selected clips resize"
     // rule made the feature undiscoverable and read as broken).
-    const EDGE_PX: f32 = 7.0;
+    const EDGE_PX: f32 = GRAB_EDGE_LANE;
     let edge_at = |app: &App, pt: egui::Pos2| -> Option<(usize, u8)> {
         let mut best: Option<(f32, usize, u8)> = None;
         for (ci, (c, _)) in clips.iter().enumerate() {
@@ -28626,7 +28730,7 @@ fn lane_row(
         egui::Align2::LEFT_TOP,
         format!("T{} {}", t + 1, if k == 0 { "track" } else { "child" }),
         egui::FontId::proportional(9.0),
-        Color32::from_gray(110),
+        crate::kit::MUTED,
     );
     for (ci, (c, name)) in clips.iter().enumerate() {
         let alen = app.asset_len(c.asset);
@@ -28823,7 +28927,7 @@ fn lane_row(
                 let _ = right_of_clip;
                 ui.painter().line_segment(
                     [egui::pos2(x, cres.min.y), egui::pos2(x, cres.max.y)],
-                    egui::Stroke::new(1.0, Color32::from_rgb(250, 200, 90)),
+                    egui::Stroke::new(1.0, COL_ORIG_LEN),
                 );
             }
             ui.painter().text(
@@ -28831,7 +28935,7 @@ fn lane_row(
                 egui::Align2::RIGHT_BOTTOM,
                 "original",
                 egui::FontId::proportional(8.0),
-                Color32::from_rgb(250, 200, 90),
+                COL_ORIG_LEN,
             );
         }
         if sel {
@@ -28844,7 +28948,7 @@ fn lane_row(
                         egui::pos2(ex + 2.0, cres.max.y),
                     ),
                     1.0,
-                    Color32::from_rgb(250, 200, 50),
+                    COL_RESIZE_CAP,
                 );
             }
             // Selection hint: these clips are what Delete removes.
@@ -28853,7 +28957,7 @@ fn lane_row(
                 egui::Align2::RIGHT_TOP,
                 "\u{d7}",
                 egui::FontId::proportional(13.0),
-                Color32::from_rgb(235, 120, 120),
+                COL_DEL_HINT,
             );
         }
     }
@@ -28902,7 +29006,7 @@ fn lane_row(
                 ui.painter().rect_stroke(
                     gres,
                     2.0,
-                    egui::Stroke::new(1.5, Color32::from_rgb(255, 90, 90)),
+                    egui::Stroke::new(1.5, crate::kit::REC_ON),
                     egui::StrokeKind::Inside,
                 );
                 // Peak columns: a bounded scan (>=1 sample per column,
@@ -30219,6 +30323,7 @@ fn grid_context_menu(
                         moved.push((tt, nl, nc));
                     }
                 }
+                let n_moved = moved.len();
                 for m in moved {
                     app.sel_clips.push(m);
                 }
@@ -30226,6 +30331,11 @@ fn grid_context_menu(
                 app.sel_clips.dedup();
                 app.sel_anchor = app.sel_clips.first().copied();
                 app.push_project();
+                app.status = format!(
+                    "moved {} clip(s) to Track {} \u{b7} selection follows",
+                    n_moved,
+                    tt + 1
+                );
                 ui.close();
             }
         }
@@ -30291,7 +30401,14 @@ fn grid_context_menu(
             ui.close();
         }
     }
-    if ui.button("Select all clips").clicked() {
+    if ui
+        .button("Select all clips")
+        .on_hover_text(
+            "select EVERY clip on EVERY track (key: Ctrl+A) \u{b7} replaces the current \
+             selection",
+        )
+        .clicked()
+    {
         app.select_all_clips();
         ui.close();
     }
@@ -30341,9 +30458,9 @@ fn draw_asset_clip(
             let (lo_n, hi_n) = (24i32, 108i32);
             let h = rect.height().max(6.0);
             let col = if sel {
-                Color32::from_rgb(180, 235, 255)
+                COL_CLIP_NOTES_SEL
             } else {
-                Color32::from_rgb(120, 205, 255)
+                COL_CLIP_NOTES
             };
             for note in pat.notes.iter() {
                 let n = note.note as i32;
@@ -30401,9 +30518,9 @@ fn draw_asset_clip(
                 hi += 0.5;
             }
             let col = if sel {
-                Color32::from_rgb(255, 190, 190)
+                COL_AUTO_CURVE_SEL
             } else {
-                Color32::from_rgb(255, 130, 130)
+                COL_AUTO_CURVE
             };
             let steps = (body.width() / 2.0).max(2.0) as i64;
             let h = rect.height().max(6.0);
@@ -67583,6 +67700,596 @@ mod tests {
         assert!(
             !texts.iter().any(|t| t.contains("name cut by")),
             "a fitting row must NOT claim truncation"
+        );
+    }
+
+    // =====================================================================
+    // v175 (TS-021): arrangement pass — hover/echo/identity on the grid
+    // toolbar, the clip-props strip, the clip context menu and dock
+    // titles. Contract = REQUIREMENTS.md R1-R8 (card t_d9969eb5).
+    // =====================================================================
+
+    /// v175 R2 (hover family, source): every affordance statement inside
+    /// grid_toolbar carries its OWN hover — buttons/checkboxes/toggles,
+    /// the three ComboBoxes AND the zoom Slider. The statement window
+    /// ENDS at the next trigger line, so a neighbour's tooltip can never
+    /// cover a silent control (v174 rule + ComboBox/Slider triggers).
+    #[test]
+    fn v175_grid_toolbar_hover_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        let region = v86_fn_region(prod, "fn grid_toolbar(");
+        let lines: Vec<&str> = region.lines().collect();
+        let is_trig = |l: &str| -> bool {
+            let t = l.trim_start();
+            if t.starts_with("//") {
+                return false;
+            }
+            l.contains(".button(")
+                || l.contains("_button(")
+                || l.contains(".checkbox(")
+                || l.contains(".toggle_value(")
+                || l.contains("ComboBox::from_id_salt")
+                || l.contains("Slider::new")
+        };
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if !is_trig(l) {
+                continue;
+            }
+            checked += 1;
+            let mut found = false;
+            for l2 in lines.iter().skip(i + 1) {
+                if is_trig(l2) {
+                    break;
+                }
+                if l2.contains("on_hover_text") {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                offenders.push(format!("line {}: {}", i + 1, l.trim()));
+            }
+        }
+        assert!(checked >= 12, "grid_toolbar affordance triggers: {checked}");
+        assert!(
+            offenders.is_empty(),
+            "grid_toolbar affordances WITHOUT hover:\n{offenders:#?}"
+        );
+    }
+
+    /// v175 R1 (runtime, split tooltip): the hover text renders as prose —
+    /// the historical `\\`+newline painted a LITERAL backslash plus a
+    /// long whitespace run into the tooltip galley.
+    #[test]
+    fn v175_split_hover_paints_clean_prose() {
+        let mut app = headless_app("v175split");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        // The toolbar row is UNWRAPPED (v30 trap): free the canvas so the
+        // split button and the zoom slider at its tail get galleys.
+        // One boot frame FIRST: dyn windows (incl. the docked MASTER OUT
+        // slot) materialize only on the first frame — win_count before it
+        // undercounts and the 540-px master dock keeps the toolbar tail
+        // clipped (DIAG D5b 11-26).
+        frame(&mut app, &ctx, vec![]);
+        for w in 0..win_count(&app) {
+            set_visible(&mut app, w, false);
+        }
+        frame(&mut app, &ctx, vec![]);
+        let sp = painted_text_rect(&ctx, &mut app, "split").expect("split button painted");
+        let texts =
+            hover_until_tip(&mut app, &ctx, sp.center(), &["keep playing seamlessly"]);
+        let tip = texts
+            .iter()
+            .map(|t| t.replace('\n', " "))
+            .find(|t| t.contains("Split the selected clip(s)"))
+            .unwrap_or_else(|| panic!("split tooltip painted: {texts:?}"));
+        assert!(tip.contains("keep playing seamlessly"), "tooltip body: {tip:?}");
+        assert!(!tip.contains('\\'), "no literal backslash in tooltip: {tip:?}");
+        assert!(!tip.contains("    "), "no collapsed-continuation whitespace run: {tip:?}");
+    }
+
+    /// v175 R3 (runtime): snap, loop and auto-quantize flips AND a zoom
+    /// slider release echo into the status field.
+    #[test]
+    fn v175_toolbar_toggle_echoes() {
+        let mut app = headless_app("v175tbecho");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        // One boot frame FIRST: dyn windows (incl. the docked MASTER OUT
+        // slot) materialize only on the first frame — win_count before it
+        // undercounts and the 540-px master dock keeps the toolbar tail
+        // clipped (DIAG D5b 11-26).
+        frame(&mut app, &ctx, vec![]);
+        for w in 0..win_count(&app) {
+            set_visible(&mut app, w, false);
+        }
+        frame(&mut app, &ctx, vec![]);
+        // Snap checkbox has NO label of its own: the "snap" caption sits
+        // LEFT of the box (right edge + item spacing + half a checkbox).
+        let lbl = painted_text_rect(&ctx, &mut app, "snap").expect("snap label painted");
+        let box_p = egui::pos2(lbl.max.x + 15.0, lbl.center().y);
+        let before = app.snap_on;
+        click_pt(&mut app, &ctx, box_p);
+        assert_eq!(app.snap_on, !before, "snap checkbox hit at {box_p:?}");
+        assert!(app.status.contains("snap:"), "snap echo: {}", app.status);
+        // Loop checkbox: its label IS the click target. The header
+        // transport also paints a "loop" caption — the toolbar box is the
+        // match INSIDE the grid-toolbar row (y > 40).
+        let lp = galley_centers(&mut app, &ctx, "loop", true)
+            .into_iter()
+            .find(|p| p.y > 40.0);
+        let lpp = lp.expect("loop checkbox galley in the toolbar row");
+        let before = app.loop_tl;
+        click_pt(&mut app, &ctx, lpp);
+        assert_eq!(app.loop_tl, !before, "loop toggled");
+        assert!(app.status.contains("loop:"), "loop echo: {}", app.status);
+        // Auto-quantize checkbox.
+        let ap = galley_centers(&mut app, &ctx, "auto-quantize new recordings", true);
+        assert!(!ap.is_empty(), "auto-quantize galley");
+        let before = app.auto_quantize;
+        click_pt(&mut app, &ctx, ap[0]);
+        assert_eq!(app.auto_quantize, !before, "auto-quantize toggled");
+        assert!(
+            app.status.contains("auto-quantize:"),
+            "auto-quantize echo: {}",
+            app.status
+        );
+        // Zoom slider: press the rail right of the "zoom" caption, drag,
+        // release — the commit echo fires on drag stop.
+        let zl = painted_text_rect(&ctx, &mut app, "zoom").expect("zoom label painted");
+        let p1 = egui::pos2(zl.max.x + 30.0, zl.center().y);
+        let before = app.px_per_sec;
+        frame(&mut app, &ctx, vec![moved(p1)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p1), btn(p1, egui::PointerButton::Primary, true)],
+        );
+        let p2 = egui::pos2(p1.x + 60.0, p1.y);
+        frame(&mut app, &ctx, vec![moved(p2)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p2, egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            (app.px_per_sec - before).abs() > 1.0,
+            "zoom changed by the drag: {before} -> {}",
+            app.px_per_sec
+        );
+        assert!(app.status.contains("zoom:"), "zoom echo: {}", app.status);
+    }
+
+    /// v175 R3 (runtime, combos): the quantize combo opens, the pick
+    /// lands in state AND names the new grid in the echo.
+    #[test]
+    fn v175_toolbar_combo_echoes() {
+        let mut app = headless_app("v175combo");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        // One boot frame FIRST: dyn windows (incl. the docked MASTER OUT
+        // slot) materialize only on the first frame — win_count before it
+        // undercounts and the 540-px master dock keeps the toolbar tail
+        // clipped (DIAG D5b 11-26).
+        frame(&mut app, &ctx, vec![]);
+        for w in 0..win_count(&app) {
+            set_visible(&mut app, w, false);
+        }
+        frame(&mut app, &ctx, vec![]);
+        let cur = SUBDIVISIONS[app.q_sub].1;
+        let tgt = (app.q_sub + 3) % SUBDIVISIONS.len();
+        let tgt_name = SUBDIVISIONS[tgt].1;
+        // Both subdivision combos render the same value text; the
+        // QUANTIZE combo is the LEFTMOST galley (paint order = x order).
+        let cbs = galley_centers(&mut app, &ctx, cur, true);
+        assert!(cbs.len() >= 2, "both subdivision combos paint {cur:?}");
+        click_pt(&mut app, &ctx, cbs[0]);
+        frame(&mut app, &ctx, vec![]); // popup opens + settles
+        frame(&mut app, &ctx, vec![]);
+        let picks = galley_centers(&mut app, &ctx, tgt_name, true);
+        assert!(!picks.is_empty(), "popup lists {tgt_name:?}");
+        click_pt(&mut app, &ctx, *picks.last().unwrap());
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.q_sub, tgt, "pick landed in state");
+        assert!(
+            app.status.contains("quantize grid:"),
+            "combo echo: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains(tgt_name),
+            "echo names the grid: {}",
+            app.status
+        );
+    }
+
+    /// v175 R4 (hover family, source): every affordance of the clip-props
+    /// strip — identity label, three sliders, reset — carries its own
+    /// hover (the strip had ZERO pins before this pass).
+    #[test]
+    fn v175_clip_props_hover_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        let region = v86_fn_region(prod, "fn clip_props_strip(");
+        let lines: Vec<&str> = region.lines().collect();
+        let is_trig = |l: &str| -> bool {
+            let t = l.trim_start();
+            if t.starts_with("//") {
+                return false;
+            }
+            l.contains(".button(") || l.contains("Slider::new") || l.contains("ui.label(")
+        };
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if !is_trig(l) {
+                continue;
+            }
+            checked += 1;
+            let mut found = false;
+            for l2 in lines.iter().skip(i + 1).take(14) {
+                if is_trig(l2) {
+                    break;
+                }
+                if l2.contains("on_hover_text") {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                offenders.push(format!("line {}: {}", i + 1, l.trim()));
+            }
+        }
+        // 4 statements drive the 5 affordances: ONE Slider stmt inside the
+        // (fade-in, fade-out) loop covers both fade sliders.
+        assert_eq!(checked, 4, "strip affordances = label + gain + fade-loop + reset");
+        assert!(
+            offenders.is_empty(),
+            "clip_props_strip affordances WITHOUT hover:\n{offenders:#?}"
+        );
+    }
+
+    /// v175 R4 (runtime): the strip paints on exactly ONE selected clip;
+    /// gain slider and identity label carry their tooltips.
+    #[test]
+    fn v175_clip_props_hover_paints() {
+        let mut app = headless_app("v175strip");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        // Dock-free: with the MIXER docked its master "gain" galley wins
+        // the probe and the squeezed central strip wraps its tail away
+        // (DIAG 11-26) — close every side window for a full-width strip.
+        // One boot frame FIRST: dyn windows (incl. the docked MASTER OUT
+        // slot) materialize only on the first frame — win_count before it
+        // undercounts and the 540-px master dock keeps the toolbar tail
+        // clipped (DIAG D5b 11-26).
+        frame(&mut app, &ctx, vec![]);
+        for w in 0..win_count(&app) {
+            set_visible(&mut app, w, false);
+        }
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        app.select_one((0, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        let g = painted_text_rect(&ctx, &mut app, "gain").expect("gain slider painted");
+        // `Slider::text()` paints the label at the RIGHT end of the rail:
+        // the interactive rect sits LEFT of the label galley (DIAG D5f —
+        // the tip only appears left of `g.min`).
+        let gp = egui::pos2(g.min.x - 30.0, g.center().y);
+        let texts = hover_until_tip(&mut app, &ctx, gp, &["own gain in dB"]);
+        let tip = texts
+            .iter()
+            .map(|t| t.replace('\n', " "))
+            .find(|t| t.contains("own gain in dB"))
+            .unwrap_or_else(|| panic!("gain tooltip painted: {texts:?}"));
+        assert!(
+            tip.contains("commits when you release"),
+            "gain tooltip explains the commit gesture: {tip:?}"
+        );
+        // Identity label → full-identity tooltip (name · length · place).
+        let idl = painted_text_rect(&ctx, &mut app, "kick \u{b7}").expect("strip identity painted");
+        let texts2 = hover_until_tip(&mut app, &ctx, idl.center(), &["asset itself is untouched"]);
+        let tip2 = texts2
+            .iter()
+            .map(|t| t.replace('\n', " "))
+            .find(|t| t.contains("asset itself is untouched"))
+            .unwrap_or_else(|| panic!("identity tooltip painted: {texts2:?}"));
+        assert!(tip2.contains("track 1"), "identity names the track: {tip2:?}");
+        assert!(tip2.contains("lane 1"), "identity names the lane: {tip2:?}");
+    }
+
+    /// v175 R4 (runtime): the reset button restores state AND echoes what
+    /// it did (unity gain, no fades).
+    #[test]
+    fn v175_clip_props_reset_echo() {
+        let mut app = headless_app("v175rst");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        {
+            let cl = app.arr.tracks[0].lanes[0].clips.get_mut(0).unwrap();
+            cl.gain = 0.5;
+            cl.fade_in = 4410;
+        }
+        app.select_one((0, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        let r = painted_text_rect(&ctx, &mut app, "reset").expect("reset button painted");
+        click_pt(&mut app, &ctx, r.center());
+        frame(&mut app, &ctx, vec![]);
+        let cl = &app.arr.tracks[0].lanes[0].clips[0];
+        assert_eq!(cl.gain, 1.0, "gain reset");
+        assert_eq!(cl.fade_in, 0, "fade reset");
+        assert!(
+            app.status.contains("clip props reset"),
+            "reset echo: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("unity gain"),
+            "reset echo explains itself: {}",
+            app.status
+        );
+    }
+
+    /// v175 R5 (runtime): the clip context menu's "Select all clips" —
+    /// the menu's one silent item — explains scope, key, and that the
+    /// click REPLACES the current selection.
+    #[test]
+    fn v175_select_all_hover_paints() {
+        let mut app = headless_app("v175selall");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        // Empty canvas: a BARE right-click on a lane point opens the
+        // ELSE-branch menu. (A preceding left-click at the same point eats
+        // the menu on the test clock — DIAG4 11-26; use the bare gesture,
+        // which is also what the v0.15 doctrine describes.)
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(900.0, top0 + app.track_h(0) * 0.5);
+        rmb(&mut app, &ctx, p);
+        let g = painted_text_rect(&ctx, &mut app, "Select all clips")
+            .expect("menu lists Select all clips");
+        let texts = hover_until_tip(&mut app, &ctx, g.center(), &["EVERY clip"]);
+        let tip = texts
+            .iter()
+            .map(|t| t.replace('\n', " "))
+            .find(|t| t.contains("EVERY clip on EVERY track"))
+            .unwrap_or_else(|| panic!("hover tip painted: {texts:?}"));
+        assert!(tip.contains("Ctrl+A"), "hover names the key: {tip:?}");
+        assert!(tip.contains("replaces"), "hover warns about replacement: {tip:?}");
+    }
+
+    /// v175 R6 (runtime): Move-to-track — the menu's one silent success
+    /// path — echoes destination and count.
+    #[test]
+    fn v175_move_to_track_echo() {
+        let mut app = headless_app("v175mv");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        rmb(&mut app, &ctx, p);
+        let mv = galley_centers(&mut app, &ctx, "Move to track", false);
+        let mvp = *mv.last().expect("Move-to-track item present");
+        click_pt(&mut app, &ctx, mvp);
+        let t3 = galley_centers(&mut app, &ctx, "Track 3", true);
+        // Other panels paint "Track 3" too — the submenu row is the hit
+        // NEAREST the menu anchor (v29 law).
+        let pick = t3
+            .into_iter()
+            .min_by(|a1, b1| {
+                (*a1 - mvp)
+                    .length_sq()
+                    .partial_cmp(&(*b1 - mvp).length_sq())
+                    .unwrap()
+            })
+            .expect("submenu lists Track 3");
+        click_pt(&mut app, &ctx, pick);
+        frame(&mut app, &ctx, vec![]);
+        let lanes = galley_centers(&mut app, &ctx, "lane 1 (parent)", true);
+        let lane = lanes
+            .into_iter()
+            .min_by(|a1, b1| {
+                (*a1 - pick)
+                    .length_sq()
+                    .partial_cmp(&(*b1 - pick).length_sq())
+                    .unwrap()
+            })
+            .unwrap();
+        click_pt(&mut app, &ctx, lane);
+        frame(&mut app, &ctx, vec![]);
+        let ids = clip_ids(&app);
+        assert_eq!(
+            ids.iter().filter(|(t, _, _, _)| *t == 2).count(),
+            1,
+            "clip now on track 2 (Track 3): {ids:?}"
+        );
+        assert!(
+            app.status.contains("moved 1 clip(s) to Track 3"),
+            "move echo: {}",
+            app.status
+        );
+    }
+
+    /// v175 R7 (runtime): a docked window's LONE title carries the same
+    /// identity hover the tab group's tabs already have.
+    #[test]
+    fn v175_dock_title_hover_paints() {
+        let mut app = headless_app("v175title");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let t = painted_text_rect(&ctx, &mut app, "ASSET RACK").expect("rack dock title painted");
+        let texts = hover_until_tip(&mut app, &ctx, t.center(), &["right-click for dock"]);
+        let tip = texts
+            .iter()
+            .map(|x| x.replace('\n', " "))
+            .find(|x| x.contains("right-click for dock"))
+            .unwrap_or_else(|| panic!("title tooltip painted: {texts:?}"));
+        assert!(tip.contains("ASSET RACK"), "tooltip names the window: {tip:?}");
+    }
+
+    /// v175 R9 (source, ts-028 design-language audit): the arrangement
+    /// corridor's data tints are bound to the ONE COL_* palette (kit tokens
+    /// where kit owns the value), the palette holds the historical values
+    /// verbatim, and the two grab-edge tolerances live in one home.
+    #[test]
+    fn v175_arrangement_tints_single_home() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        // (a) The palette home pins the historical values verbatim.
+        let home: [(&str, &str); 13] = [
+            ("COL_RULER_BG", "Color32::from_rgb(34, 34, 40)"),
+            ("COL_ORIG_LEN", "Color32::from_rgb(250, 200, 90)"),
+            ("COL_RESIZE_CAP", "Color32::from_rgb(250, 200, 50)"),
+            ("COL_RESIZE_CAP_HELD", "Color32::from_rgb(255, 235, 120)"),
+            ("COL_DEL_HINT", "Color32::from_rgb(235, 120, 120)"),
+            ("COL_CLIP_NOTES", "Color32::from_rgb(120, 205, 255)"),
+            ("COL_CLIP_NOTES_SEL", "Color32::from_rgb(180, 235, 255)"),
+            ("COL_AUTO_CURVE", "Color32::from_rgb(255, 130, 130)"),
+            ("COL_AUTO_CURVE_SEL", "Color32::from_rgb(255, 190, 190)"),
+            ("COL_SEP_BAR", "Color32::from_rgb(56, 56, 64)"),
+            ("COL_SEP_BAR_HOT", "Color32::from_rgb(96, 96, 116)"),
+            ("COL_SKIP_FG", "Color32::from_rgb(205, 210, 226)"),
+            ("COL_SKIP_FG_HOVER", "Color32::from_rgb(240, 244, 255)"),
+        ];
+        for (name, val) in home {
+            assert!(
+                prod.contains(&format!("const {name}: Color32 = {val};")),
+                "palette home {name} must stay exactly {val}"
+            );
+        }
+        // (b) The corridor fns carry NONE of those literals inline anymore.
+        let banned: [&str; 13] = [
+            "from_rgb(34, 34, 40)",
+            "from_rgb(250, 200, 90)",
+            "from_rgb(250, 200, 50)",
+            "from_rgb(255, 235, 120)",
+            "from_rgb(235, 120, 120)",
+            "from_rgb(120, 205, 255)",
+            "from_rgb(180, 235, 255)",
+            "from_rgb(255, 130, 130)",
+            "from_rgb(255, 190, 190)",
+            "from_rgb(56, 56, 64)",
+            "from_rgb(96, 96, 116)",
+            "from_rgb(205, 210, 226)",
+            "from_rgb(240, 244, 255)",
+        ];
+        for anchor in [
+            "fn paint_grid(",
+            "fn ruler_row(",
+            "fn lane_row(",
+            "fn track_block(",
+            "fn skip_button(",
+            "fn draw_asset_clip(",
+        ] {
+            let region = v86_fn_region(prod, anchor);
+            for b in banned.iter() {
+                assert!(!region.contains(*b), "{anchor} still forks literal {b}");
+            }
+        }
+        // (c) Where KIT owns the value, the corridor calls kit.
+        assert!(
+            v86_fn_region(prod, "fn paint_grid(").contains("crate::kit::SPEC_BG"),
+            "grid lane bg must read kit::SPEC_BG"
+        );
+        let lane = v86_fn_region(prod, "fn lane_row(");
+        assert!(lane.contains("crate::kit::MUTED"), "lane tag text -> kit::MUTED");
+        assert!(lane.contains("crate::kit::REC_ON"), "lane rec stroke -> kit::REC_ON");
+        // (d) Grab-edge tolerances: ONE home, divergence deliberate, and no
+        // call site may re-declare its own value again.
+        assert!(prod.contains("const GRAB_EDGE_LANE: f32 = 7.0;"));
+        assert!(prod.contains("const GRAB_EDGE_NOTE: f32 = 6.0;"));
+        assert_eq!(
+            prod.matches("const EDGE_PX: f32 =").count(),
+            2,
+            "EDGE_PX may exist ONLY as the two palette-bound aliases"
+        );
+        assert!(prod.contains("const EDGE_PX: f32 = GRAB_EDGE_NOTE;"));
+        assert!(prod.contains("const EDGE_PX: f32 = GRAB_EDGE_LANE;"));
+    }
+
+    /// v175 R8 (runtime paint): the marquee rubber band (1.2 px ACCENT
+    /// hairline) and the selection outline (2.0 px clip-sel blue) are
+    /// DISTINCT visual languages — mid-drag both paint, after release
+    /// only the committed outlines remain.
+    #[test]
+    fn v175_marquee_vs_selection_paint() {
+        let mut app = headless_app("v175marq");
+        let ctx = egui::Context::default();
+        let end_x = v161_seed_two_track_clips(&mut app, &ctx);
+        let top = app.grid_anchor - app.vscroll;
+        let y0 = top + app.track_h(0) * 0.5;
+        let y1 = top + app.track_h(0) + 3.0 + app.track_h(1) * 0.5;
+        let end = egui::pos2(end_x * 0.5, y1);
+        v161_drag(&mut app, &ctx, egui::pos2(end_x + 40.0, y0), end);
+        let count = |app: &mut App, ctx: &egui::Context, w: f32, col: egui::Color32| -> usize {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let n = out
+                .shapes
+                .iter()
+                .filter(|cs| {
+                    if let egui::epaint::Shape::Rect(r) = &cs.shape {
+                        (r.stroke.width - w).abs() < 0.01 && r.stroke.color == col
+                    } else {
+                        false
+                    }
+                })
+                .count();
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            n
+        };
+        // MID-drag (v161_drag never releases): band + live selection coexist.
+        assert!(
+            count(&mut app, &ctx, 1.2, crate::kit::ACCENT) >= 1,
+            "mid-drag marquee band (1.2 px ACCENT) painted"
+        );
+        assert!(
+            count(&mut app, &ctx, 2.0, COL_CLIP_SEL) >= 1,
+            "live selection outlines coexist with the band"
+        );
+        // Release: the band is gone, only the committed outlines remain.
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(end, egui::PointerButton::Primary, false)],
+        );
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(
+            count(&mut app, &ctx, 1.2, crate::kit::ACCENT),
+            0,
+            "band retires with the gesture"
+        );
+        assert!(
+            count(&mut app, &ctx, 2.0, COL_CLIP_SEL) >= 2,
+            "both crossed clips carry the selection outline"
         );
     }
 }
