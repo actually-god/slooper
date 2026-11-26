@@ -126,9 +126,19 @@ septabee's). The glide lane strip is REPLACED by on-note curves.
   septabee's Alt+Z curve adjust). Right-click note = menu: *clear pitch
   curve*, *numeric editor* (replaces the v52 glide numeric rows; reuse
   that widget). Shift+RMB on the curve = delete (existing language).
-- **Visual**: note body grows a curve trail (cents ↕, note row = 0;
-  ±1200 ¢ fills the trail box; auto-scales past ±1200 up to ±2400).
-  Trail painted per note, follows the note on move/clone/resize.
+- **Visual**: note body grows a curve trail (cents ↕, note row = 0).
+  v168 (pbc-2): the axis is LINEAR — ±1200 ¢ = trail_half px
+  (= max(2·row_h, 24)), px-per-cent CONSTANT, and the trail EXTENDS
+  with the curve up to the model cap ±2400 ¢ (no compressing
+  auto-scale); "zoom rows" (Alt+wheel / slider) doubles as the
+  curve-zoom knob. Trail painted per note, follows the note on
+  move/clone/resize.
+- **Echo** (v168, pbc-2): every aim reads back — drag (draw/dot/warp)
+  echoes the live pitch as the tune.rs EDO-aware label + cents in the
+  status line, hovering a control dot reads that point's pitch on the
+  canvas, and the release echoes carry the label. `tune::label_pitch*`
+  is the one label home for CONTINUOUS pitches (rows beyond the
+  keyboard included).
 - **Audition**: commit (mouse-up after draw/edit) auto-previews the note
   once through the TRACK's synth — this is what makes the feature
   "tellable". Live preview during drag is the pb-3 stretch goal.
