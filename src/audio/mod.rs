@@ -3235,6 +3235,35 @@ pub(crate) fn curve_st(d1: u8, d2: u8) -> f32 {
     ((d1 as u16 | ((d2 as u16) << 8)) as i16) as f32 * 0.001
 }
 
+/// v167 (pbc-1): the HOSTED wire form of a curve bend — the 3-byte form
+/// every hosted queue choke point accepts and re-pushes as real 14-bit
+/// pitch bend. The internal tuple carries full decicents, but the pitch-
+/// bend wire has only a 14-bit pair, so the wire quantizes to QUARTER
+/// DECICENTS (0.004 st = 0.4 ¢ steps — 10× below the ~5 ¢ JND, while the
+/// scripted path keeps full 0.001 st). Payload: standard MIDI 14-bit
+/// pair, OFFSET-BINARY (8192 = 0 st, range ±8191×0.004 = ±32.76 st —
+/// covers the ±24 st curve bound). Marker: byte-2 bit 7 — legacy roll
+/// writers always mask d2 to 7 bits, so it can only originate here.
+/// RT-safe.
+#[inline]
+pub(crate) fn curve_wire(ch: u8, st: f32) -> [u8; 3] {
+    let q = (st * 250.0).round().clamp(-8191.0, 8191.0) as i16;
+    let raw = (q + 8192) as u16;
+    [
+        0xE0 | ch & 0x0F,
+        (raw & 0x7F) as u8,
+        (((raw >> 7) & 0x7F) as u8) | 0x80,
+    ]
+}
+
+/// Decode [`curve_wire`]'s payload to semitones (0.004 st quantum).
+/// Callers must first check `msg[2] & 0x80 != 0`. RT-safe.
+#[inline]
+pub(crate) fn curve_wire_st(msg: [u8; 3]) -> f32 {
+    let raw = (((msg[2] & 0x7F) as u16) << 7 | (msg[1] & 0x7F) as u16) as i16;
+    (raw - 8192) as f32 * 0.004
+}
+
 /// v167: materialize every active curve of `pat` that overlaps the ABSOLUTE
 /// sample window [w0, w1) into kind-7 events via [`note_curve_events`] —
 /// the single per-note generator shared by both staging passes, the roll
@@ -3384,14 +3413,13 @@ fn midi3_raw(kind: u8, ch: u8, d1: u8, d2: u8) -> [u8; 3] {
         4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
         5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
         // v167 (pbc-1): kind 7 (drawn-curve bend) rides the pitch-bend
-        // wire with its DECICENT payload IN PLACE (d1/d2 = i16 LE, ±32.767
-        // st span covers the ±24 st curve bound) and d2 bit-7 as the
-        // DIRECT-CURRENCY marker: the queue choke points decode the
-        // semitones, AUTO-WIDEN the RPN0 range and push the plugin-
-        // currency 14-bit value verbatim — never the roll-law rescale
-        // (which physically walls at ±12 st). Legacy roll writers always
-        // mask d2 to 7 bits, so bit 7 can only ever originate here.
-        7 => [0xE0 | ch & 0x0F, d1, d2 | 0x80],
+        // wire via `curve_wire` (14-bit offset-binary, 0.004 st quantum,
+        // byte-2 bit-7 DIRECT-CURRENCY marker): the queue choke points
+        // decode the semitones, AUTO-WIDEN the RPN0 range and push the
+        // plugin-currency 14-bit value verbatim — never the roll-law
+        // rescale (which physically walls at ±12 st). Legacy roll writers
+        // always mask d2 to 7 bits, so bit 7 can only ever originate here.
+        7 => curve_wire(ch, curve_st(d1, d2)),
         _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
     }
 }
@@ -3468,20 +3496,14 @@ pub(crate) fn stage_edo(
                 midi3_raw(5, ch, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8),
             ));
         }
-        // v167 (pbc-1): curve bends (decicent payload, direct currency)
-        // compose the same v164 residual law as lane bends above — the
-        // channel already carries the last played key's residual, so the
-        // curve shifts RELATIVE to the EDO offset instead of erasing it.
-        // The payload is re-encoded and the direct-currency marker (d2
-        // bit-7) re-asserted for the queue choke point.
+        // v167 (pbc-1): curve bends (decicent tuple payload) compose the
+        // same v164 residual law as lane bends above — the channel already
+        // carries the last played key's residual, so the curve shifts
+        // RELATIVE to the EDO offset instead of erasing it. Re-encoded to
+        // the hosted wire form (see `curve_wire`) for the queue choke point.
         7 => {
             let st = crate::audio::curve_st(d1, d2) + res[c];
-            let c10 = (st * 1000.0).round().clamp(-32768.0, 32767.0) as i16;
-            let u = c10 as u16;
-            evq.push((
-                off,
-                [0xE0 | ch & 0x0F, (u & 0xFF) as u8, ((u >> 8) as u8) | 0x80],
-            ));
+            evq.push((off, curve_wire(ch, st)));
         }
         _ => evq.push((off, midi3_raw(kind, ch, d1, d2))),
     }

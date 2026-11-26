@@ -3994,18 +3994,18 @@ impl RtStageEntry {
         if msg[0] & 0xF0 == 0xE0 {
             let raw = ((msg[2] as u16) << 7) | (msg[1] as u16);
             // v167 (pbc-1, card t_879a77ef): DIRECT-CURRENCY bend — d2
-            // bit-7 set means the 14-bit payload is DECI-SEMITONES from a
-            // drawn pitch curve (kind 7), NOT a roll-space wheel value.
-            // Roll law physically walls at ±12 st (see bend_rescale), so
-            // the curve first AUTO-WIDENS the announced RPN0 range to
-            // ceil(|st|) capped 24 (clearing this channel's announce mask
-            // so RPN0 re-fires BEFORE the bend; the block-head adopt then
-            // re-arms every other channel), and the plugin-currency 14-bit
-            // value is pushed VERBATIM — no rescale, no ±12 clamp. Legacy
-            // roll writers always mask d2 to 7 bits, so bit-7 cannot
-            // collide with a wheel/lane bend.
+            // bit-7 set means the 14-bit payload is a DRAWN-CURVE bend in
+            // `curve_wire` currency (offset-binary, 0.004 st steps), NOT a
+            // roll-space wheel value. Roll law physically walls at ±12 st
+            // (see bend_rescale), so the curve first AUTO-WIDENS the
+            // announced RPN0 range to ceil(|st|) capped 24 (clearing this
+            // channel's announce mask so RPN0 re-fires BEFORE the bend;
+            // the block-head adopt then re-arms every other channel), and
+            // the plugin-currency 14-bit value is pushed VERBATIM — no
+            // rescale, no ±12 clamp. Legacy roll writers always mask d2
+            // to 7 bits, so bit-7 cannot collide with a wheel/lane bend.
             if msg[2] & 0x80 != 0 {
-                let st = (raw as i16) as f32 * 0.001;
+                let st = crate::audio::curve_wire_st(msg);
                 let need = st.abs().ceil().clamp(1.0, 24.0) as u8;
                 let cur = s.bend_range.load(Ordering::Relaxed);
                 let r = cur.max(need);

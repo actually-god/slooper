@@ -1437,12 +1437,13 @@ impl ClapStageEntry {
         // per channel before the first bend since the last change.
         if m[0] & 0xF0 == 0xE0 {
             let raw = ((m[2] as u16) << 7) | (m[1] as u16);
-            // v167 (pbc-1): DIRECT-CURRENCY curve bend (d2 bit-7 = decicent
-            // payload) — same law as vsthost::queue: auto-widen the RPN0
-            // range, push plugin-currency bytes verbatim (roll rescale
-            // walls at ±12 st and must NEVER touch the curve).
+            // v167 (pbc-1): DIRECT-CURRENCY curve bend (byte-2 bit-7,
+            // `curve_wire` currency) — same law as vsthost::queue:
+            // auto-widen the RPN0 range, push plugin-currency bytes
+            // verbatim (roll rescale walls at ±12 st and must NEVER
+            // touch the curve).
             if m[2] & 0x80 != 0 {
-                let st = (raw as i16) as f32 * 0.001;
+                let st = crate::audio::curve_wire_st(m);
                 let need = st.abs().ceil().clamp(1.0, 24.0) as u8;
                 let cur = s.bend_range.load(Ordering::Relaxed);
                 let r = cur.max(need);
