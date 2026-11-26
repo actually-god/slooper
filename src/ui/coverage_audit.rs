@@ -78,8 +78,8 @@ fn strip_line(l: &str) -> String {
     let mut out = String::with_capacity(l.len());
     let mut instr = false;
     let mut inesc = false;
-    let mut it = l.char_indices().peekable();
-    while let Some((i, c)) = it.next() {
+    let it = l.char_indices();
+    for (i, c) in it {
         if instr {
             out.push(c);
             if inesc {
@@ -421,8 +421,9 @@ fn extend_for_builder(lines: &[String], end: usize, var: &Option<String>) -> usi
     let mut end = end;
     let mut started = false;
     let cap = (end + 21).min(lines.len());
-    for k in (end + 1)..cap {
-        let row = &lines[k];
+    let base = end; // frozen: `end` advances inside the loop
+    for (off, row) in lines[base + 1..cap].iter().enumerate() {
+        let k = base + 1 + off;
         let s = row.trim();
         if row.contains(var) {
             started = true;
@@ -581,10 +582,15 @@ fn hover_audit(files: &[AF]) -> HoverAudit {
                     // lines carry no tokens, so hovers in comments never
                     // count (the echo scan's comment strip is sabotage-
                     // proved the same way, polarity B).
+                    assert!(
+                        end < f.lines.len(),
+                        "statement window OOB: file={} li={} end={} len={}",
+                        f.name,
+                        li,
+                        end,
+                        f.lines.len()
+                    );
                     let stmt = f.lines[li..=end].join("\n");
-                    let core = strip_closures(&stmt);
-                    let core = strip_closures(&stmt);
-                    let core = strip_closures(&stmt);
                     let core = strip_closures(&stmt);
                     triggers += 1;
                     if !core.contains("on_hover") {
