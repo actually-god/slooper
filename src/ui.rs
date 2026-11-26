@@ -59,8 +59,10 @@ use crate::synth;
 pub(crate) mod mcp_windows;
 
 /// v173 (TS-027): whole-program hover + status-echo invariant harness.
-/// Test-only: it audits the render files below, ships in no binary.
-#[cfg(test)]
+/// Test-only (module carries `#![cfg(test)]`): audits the render files, ships
+/// in no binary. NO `#[cfg(test)]` attr HERE — a top-level `\n#[cfg(test)]`
+/// line ahead of the tests seam truncates the seam tests' `code_lines()`
+/// view of this file's production region (v173 CI lesson).
 mod coverage_audit;
 
 /// Keys a user may plausibly bind to a shortcut.

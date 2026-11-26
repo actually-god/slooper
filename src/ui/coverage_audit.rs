@@ -53,6 +53,8 @@
 //! roster pin asserts no block comments; raw-string hovers would only
 //! *widen* a window, never fake one).
 
+#![cfg(test)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 // ------------------------------------------------------------------
