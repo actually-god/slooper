@@ -23460,6 +23460,15 @@ fn docked_head(ui: &mut egui::Ui, app: &mut App, idx: usize) {
                 }
             } else {
                 let title = ui.label(RichText::new(win_title(app, idx)).strong());
+                // v175 (TS-021 R7): lone titles explain themselves like the tab
+                // group's tabs already do — hover identity + the slot-menu pointer.
+                title
+                    .clone()
+                    .on_hover_text(format!(
+                        "{} \u{b7} right-click for dock/tab/close \u{b7} drag out of the \
+                         dock to float",
+                        win_title(app, idx)
+                    ));
                 // v30-batch-2: one-stop dock menu on the header title — every
                 // window can be re-slotted (or floated out) without a precise
                 // drag; the drag-to-edge gesture stays as the quick path.
@@ -27701,18 +27710,29 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
             .on_hover_text("Quantize each fresh recording's content onto the metronome grid")
             .changed()
         {
+            app.status = format!(
+                "auto-quantize: {} \u{b7} onto the {} grid",
+                if app.auto_quantize { "on" } else { "off" },
+                SUBDIVISIONS[app.q_sub].1
+            );
             app.save_config();
         }
         ui.label("quantize");
-        egui::ComboBox::from_id_salt("q_sub_cb")
+        let qresp = egui::ComboBox::from_id_salt("q_sub_cb")
             .selected_text(SUBDIVISIONS[app.q_sub].1)
             .show_ui(ui, |ui| {
                 for (n, s) in SUBDIVISIONS.iter().enumerate() {
                     if ui.selectable_value(&mut app.q_sub, n, s.1).changed() {
+                        app.status =
+                            format!("quantize grid: {} \u{b7} fresh recordings snap onto it", s.1);
                         app.save_config();
                     }
                 }
             });
+        qresp.response.on_hover_text(
+            "The subdivision auto-quantize snaps a fresh recording's notes onto \u{b7} pair it \
+             with the checkbox to the left",
+        );
         ui.label("snap");
         // Master snap switch (requirement: OFF = snap to the program's
         // minimum resolution — one sample — not to a subdivision).
@@ -27724,18 +27744,28 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
             )
             .changed()
         {
+            app.status = if app.snap_on {
+                format!("snap: on \u{b7} {} grid", SUBDIVISIONS[app.snap_sub].1)
+            } else {
+                "snap: off \u{b7} placement lands on any sample".into()
+            };
             app.save_config();
         }
         ui.add_enabled_ui(app.snap_on, |ui| {
-            egui::ComboBox::from_id_salt("snap_sub_cb")
+            let sresp = egui::ComboBox::from_id_salt("snap_sub_cb")
                 .selected_text(SUBDIVISIONS[app.snap_sub].1)
                 .show_ui(ui, |ui| {
                     for (n, s) in SUBDIVISIONS.iter().enumerate() {
                         if ui.selectable_value(&mut app.snap_sub, n, s.1).changed() {
+                            app.status = format!("snap grid: {}", s.1);
                             app.save_config();
                         }
                     }
                 });
+            sresp.response.on_hover_text(
+                "Snap resolution: while snap is on, placement, drags and clip resize jump \
+                 to this grid",
+            );
         });
         if !app.snap_on {
             ui.label(RichText::new("(off: 1 sample)").weak().small());
@@ -27752,13 +27782,18 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
             .changed()
         {
             app.loop_tl = lt;
+            app.status = if lt {
+                "loop: on \u{b7} playhead wraps at the loop region end".into()
+            } else {
+                "loop: off \u{b7} playhead parks at the project end".into()
+            };
             app.backend.cmd(Cmd::SetLoop(app.loop_tl));
             app.send_loop_region();
             app.save_config();
         }
         let mut mch = false;
         ui.add_enabled_ui(app.loop_tl, |ui| {
-            egui::ComboBox::from_id_salt("loop_mode_cb")
+            let lresp = egui::ComboBox::from_id_salt("loop_mode_cb")
                 .selected_text(LOOP_MODES[app.loop_mode.min(2)])
                 .show_ui(ui, |ui| {
                     for (n, s) in LOOP_MODES.iter().enumerate() {
@@ -27767,8 +27802,13 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                         }
                     }
                 });
+            lresp.response.on_hover_text(
+                "What the loop wraps: the area you drag on the ruler, the current longest \
+                 clip, or the whole song",
+            );
         });
         if mch {
+            app.status = format!("loop mode: {}", LOOP_MODES[app.loop_mode.min(2)]);
             app.send_loop_region();
             app.save_config();
         }
@@ -27801,7 +27841,7 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
         if ui
             .button(RichText::new("\u{2702} split").strong())
             .on_hover_text(
-                "Split the selected clip(s) at the playhead (key: S). The two \\
+                "Split the selected clip(s) at the playhead (key: S). The two \
                  halves keep playing seamlessly; fades stay on the left half.",
             )
             .clicked()
@@ -27818,8 +27858,15 @@ fn grid_toolbar(ui: &mut egui::Ui, app: &mut App) {
                 Slider::new(&mut app.px_per_sec, ZOOM_MIN..=ZOOM_MAX)
                     .logarithmic(true)
                     .show_value(false),
+            )
+            .on_hover_text(
+                "Timeline zoom in pixels per second. Ctrl+wheel over the grid zooms the \
+                 same way; Shift+wheel pans the view.",
             );
         let _ = p_changed(&rz, before_z, &mut app.px_per_sec);
+        if rz.drag_stopped() {
+            app.status = format!("zoom: {:.0} px/s", app.px_per_sec);
+        }
     });
 }
 
@@ -28000,7 +28047,14 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
             RichText::new(format!("{name} \u{b7} {:.2}s", span as f64 / sr))
                 .strong()
                 .small(),
-        );
+        )
+        .on_hover_text(format!(
+            "{name} \u{b7} {:.2}s \u{b7} track {} \u{b7} lane {} \u{b7} the sliders below \
+             change THIS clip only \u{b7} the asset itself is untouched",
+            span as f64 / sr,
+            t + 1,
+            k + 1
+        ));
         // gain, in dB (the house convention: everything the user edits is dB)
         let mut db: f32 = (20.0f32 * cl.gain.max(1e-4).log10()).clamp(-60.0, 12.0);
         // v30-batch-2: FINITE slider widths. A Slider's text label wraps
@@ -28015,12 +28069,17 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
                 .step_by(0.5)
                 .trailing_fill(true),
         );
+        r.clone().on_hover_text(
+            "This clip's own gain in dB \u{b7} other clips of the same asset keep their own \
+             \u{b7} commits when you release the slider",
+        );
         if p_changed(&r, before_g, &mut db) {
             if let Some(cl) = app.arr.tracks[t].lanes[k].clips.get_mut(c) {
                 cl.gain = 10f32.powf(db / 20.0);
             }
         }
         if r.drag_stopped() {
+            app.status = format!("{name}: gain {db:+.1} dB");
             app.push_project();
         }
         for (label, cur, is_in) in [
@@ -28036,6 +28095,11 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
                     .step_by(5.0)
                     .trailing_fill(true),
             );
+            r.clone().on_hover_text(if is_in {
+                "Fade-IN over the first N milliseconds of this clip \u{b7} commits on release"
+            } else {
+                "Fade-OUT over the last N milliseconds of this clip \u{b7} commits on release"
+            });
             if p_changed(&r, before_f, &mut ms) {
                 if let Some(cl) = app.arr.tracks[t].lanes[k].clips.get_mut(c) {
                     let samples = (ms * sr / 1000.0) as u64;
@@ -28047,6 +28111,7 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
                 }
             }
             if r.drag_stopped() {
+                app.status = format!("{name}: {label} {ms:.0} ms");
                 app.push_project();
             }
         }
@@ -28061,6 +28126,7 @@ fn clip_props_strip(ui: &mut egui::Ui, app: &mut App) {
                 cl.fade_in = 0;
                 cl.fade_out = 0;
             }
+            app.status = format!("{name}: clip props reset \u{b7} unity gain, no fades");
             app.push_project();
         }
     });
@@ -30184,6 +30250,7 @@ fn grid_context_menu(
                         moved.push((tt, nl, nc));
                     }
                 }
+                let n_moved = moved.len();
                 for m in moved {
                     app.sel_clips.push(m);
                 }
@@ -30191,6 +30258,11 @@ fn grid_context_menu(
                 app.sel_clips.dedup();
                 app.sel_anchor = app.sel_clips.first().copied();
                 app.push_project();
+                app.status = format!(
+                    "moved {} clip(s) to Track {} \u{b7} selection follows",
+                    n_moved,
+                    tt + 1
+                );
                 ui.close();
             }
         }
@@ -30256,7 +30328,14 @@ fn grid_context_menu(
             ui.close();
         }
     }
-    if ui.button("Select all clips").clicked() {
+    if ui
+        .button("Select all clips")
+        .on_hover_text(
+            "select EVERY clip on EVERY track (key: Ctrl+A) \u{b7} replaces the current \
+             selection",
+        )
+        .clicked()
+    {
         app.select_all_clips();
         ui.close();
     }
@@ -67462,6 +67541,471 @@ mod tests {
         assert!(
             !texts.iter().any(|t| t.contains("name cut by")),
             "a fitting row must NOT claim truncation"
+        );
+    }
+
+    // =====================================================================
+    // v175 (TS-021): arrangement pass — hover/echo/identity on the grid
+    // toolbar, the clip-props strip, the clip context menu and dock
+    // titles. Contract = REQUIREMENTS.md R1-R8 (card t_d9969eb5).
+    // =====================================================================
+
+    /// v175 R2 (hover family, source): every affordance statement inside
+    /// grid_toolbar carries its OWN hover — buttons/checkboxes/toggles,
+    /// the three ComboBoxes AND the zoom Slider. The statement window
+    /// ENDS at the next trigger line, so a neighbour's tooltip can never
+    /// cover a silent control (v174 rule + ComboBox/Slider triggers).
+    #[test]
+    fn v175_grid_toolbar_hover_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        let region = v86_fn_region(prod, "fn grid_toolbar(");
+        let lines: Vec<&str> = region.lines().collect();
+        let is_trig = |l: &str| -> bool {
+            let t = l.trim_start();
+            if t.starts_with("//") {
+                return false;
+            }
+            l.contains(".button(")
+                || l.contains("_button(")
+                || l.contains(".checkbox(")
+                || l.contains(".toggle_value(")
+                || l.contains("ComboBox::from_id_salt")
+                || l.contains("Slider::new")
+        };
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if !is_trig(l) {
+                continue;
+            }
+            checked += 1;
+            let mut found = false;
+            for l2 in lines.iter().skip(i + 1) {
+                if is_trig(l2) {
+                    break;
+                }
+                if l2.contains("on_hover_text") {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                offenders.push(format!("line {}: {}", i + 1, l.trim()));
+            }
+        }
+        assert!(checked >= 12, "grid_toolbar affordance triggers: {checked}");
+        assert!(
+            offenders.is_empty(),
+            "grid_toolbar affordances WITHOUT hover:\n{offenders:#?}"
+        );
+    }
+
+    /// v175 R1 (runtime, split tooltip): the hover text renders as prose —
+    /// the historical `\\`+newline painted a LITERAL backslash plus a
+    /// long whitespace run into the tooltip galley.
+    #[test]
+    fn v175_split_hover_paints_clean_prose() {
+        let mut app = headless_app("v175split");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        // The toolbar row is UNWRAPPED (v30 trap): free the canvas so the
+        // split button and the zoom slider at its tail get galleys.
+        set_visible(&mut app, 0, false);
+        set_visible(&mut app, 3, false);
+        frame(&mut app, &ctx, vec![]);
+        let sp = painted_text_rect(&ctx, &mut app, "split").expect("split button painted");
+        let texts =
+            hover_until_tip(&mut app, &ctx, sp.center(), &["keep playing seamlessly"]);
+        let tip = texts
+            .iter()
+            .map(|t| t.replace('\n', " "))
+            .find(|t| t.contains("Split the selected clip(s)"))
+            .unwrap_or_else(|| panic!("split tooltip painted: {texts:?}"));
+        assert!(tip.contains("keep playing seamlessly"), "tooltip body: {tip:?}");
+        assert!(!tip.contains('\\'), "no literal backslash in tooltip: {tip:?}");
+        assert!(!tip.contains("    "), "no collapsed-continuation whitespace run: {tip:?}");
+    }
+
+    /// v175 R3 (runtime): snap, loop and auto-quantize flips AND a zoom
+    /// slider release echo into the status field.
+    #[test]
+    fn v175_toolbar_toggle_echoes() {
+        let mut app = headless_app("v175tbecho");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        set_visible(&mut app, 0, false);
+        set_visible(&mut app, 3, false);
+        frame(&mut app, &ctx, vec![]);
+        // Snap checkbox has NO label of its own: the "snap" caption sits
+        // LEFT of the box (right edge + item spacing + half a checkbox).
+        let lbl = painted_text_rect(&ctx, &mut app, "snap").expect("snap label painted");
+        let box_p = egui::pos2(lbl.max.x + 15.0, lbl.center().y);
+        let before = app.snap_on;
+        click_pt(&mut app, &ctx, box_p);
+        assert_eq!(app.snap_on, !before, "snap checkbox hit at {box_p:?}");
+        assert!(app.status.contains("snap:"), "snap echo: {}", app.status);
+        // Loop checkbox: its label IS the click target.
+        let lp = galley_centers(&mut app, &ctx, "loop", true);
+        assert!(!lp.is_empty(), "loop checkbox galley");
+        let before = app.loop_tl;
+        click_pt(&mut app, &ctx, lp[0]);
+        assert_eq!(app.loop_tl, !before, "loop toggled");
+        assert!(app.status.contains("loop:"), "loop echo: {}", app.status);
+        // Auto-quantize checkbox.
+        let ap = galley_centers(&mut app, &ctx, "auto-quantize new recordings", true);
+        assert!(!ap.is_empty(), "auto-quantize galley");
+        let before = app.auto_quantize;
+        click_pt(&mut app, &ctx, ap[0]);
+        assert_eq!(app.auto_quantize, !before, "auto-quantize toggled");
+        assert!(
+            app.status.contains("auto-quantize:"),
+            "auto-quantize echo: {}",
+            app.status
+        );
+        // Zoom slider: press the rail right of the "zoom" caption, drag,
+        // release — the commit echo fires on drag stop.
+        let zl = painted_text_rect(&ctx, &mut app, "zoom").expect("zoom label painted");
+        let p1 = egui::pos2(zl.max.x + 30.0, zl.center().y);
+        let before = app.px_per_sec;
+        frame(&mut app, &ctx, vec![moved(p1)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(p1), btn(p1, egui::PointerButton::Primary, true)],
+        );
+        let p2 = egui::pos2(p1.x + 60.0, p1.y);
+        frame(&mut app, &ctx, vec![moved(p2)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(p2, egui::PointerButton::Primary, false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            (app.px_per_sec - before).abs() > 1.0,
+            "zoom changed by the drag: {before} -> {}",
+            app.px_per_sec
+        );
+        assert!(app.status.contains("zoom:"), "zoom echo: {}", app.status);
+    }
+
+    /// v175 R3 (runtime, combos): the quantize combo opens, the pick
+    /// lands in state AND names the new grid in the echo.
+    #[test]
+    fn v175_toolbar_combo_echoes() {
+        let mut app = headless_app("v175combo");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        set_visible(&mut app, 0, false);
+        set_visible(&mut app, 3, false);
+        frame(&mut app, &ctx, vec![]);
+        let cur = SUBDIVISIONS[app.q_sub].1;
+        let tgt = (app.q_sub + 3) % SUBDIVISIONS.len();
+        let tgt_name = SUBDIVISIONS[tgt].1;
+        let cb = painted_text_rect(&ctx, &mut app, cur).expect("quantize combo shows its value");
+        click_pt(&mut app, &ctx, cb.center());
+        frame(&mut app, &ctx, vec![]); // the popup opens one frame later
+        let picks = galley_centers(&mut app, &ctx, tgt_name, true);
+        assert!(!picks.is_empty(), "popup lists {tgt_name:?}");
+        click_pt(&mut app, &ctx, *picks.last().unwrap());
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.q_sub, tgt, "pick landed in state");
+        assert!(
+            app.status.contains("quantize grid:"),
+            "combo echo: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains(tgt_name),
+            "echo names the grid: {}",
+            app.status
+        );
+    }
+
+    /// v175 R4 (hover family, source): every affordance of the clip-props
+    /// strip — identity label, three sliders, reset — carries its own
+    /// hover (the strip had ZERO pins before this pass).
+    #[test]
+    fn v175_clip_props_hover_scan() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        let region = v86_fn_region(prod, "fn clip_props_strip(");
+        let lines: Vec<&str> = region.lines().collect();
+        let is_trig = |l: &str| -> bool {
+            let t = l.trim_start();
+            if t.starts_with("//") {
+                return false;
+            }
+            l.contains(".button(") || l.contains("Slider::new") || l.contains("ui.label(")
+        };
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if !is_trig(l) {
+                continue;
+            }
+            checked += 1;
+            let mut found = false;
+            for l2 in lines.iter().skip(i + 1).take(14) {
+                if is_trig(l2) {
+                    break;
+                }
+                if l2.contains("on_hover_text") {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                offenders.push(format!("line {}: {}", i + 1, l.trim()));
+            }
+        }
+        assert_eq!(checked, 5, "strip affordances = label + 3 sliders + reset");
+        assert!(
+            offenders.is_empty(),
+            "clip_props_strip affordances WITHOUT hover:\n{offenders:#?}"
+        );
+    }
+
+    /// v175 R4 (runtime): the strip paints on exactly ONE selected clip;
+    /// gain slider and identity label carry their tooltips.
+    #[test]
+    fn v175_clip_props_hover_paints() {
+        let mut app = headless_app("v175strip");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        app.select_one((0, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        let g = painted_text_rect(&ctx, &mut app, "gain").expect("gain slider painted");
+        let texts = hover_until_tip(&mut app, &ctx, g.center(), &["own gain in dB"]);
+        let tip = texts
+            .iter()
+            .map(|t| t.replace('\n', " "))
+            .find(|t| t.contains("own gain in dB"))
+            .unwrap_or_else(|| panic!("gain tooltip painted: {texts:?}"));
+        assert!(
+            tip.contains("commits when you release"),
+            "gain tooltip explains the commit gesture: {tip:?}"
+        );
+        // Identity label → full-identity tooltip (name · length · place).
+        let idl = painted_text_rect(&ctx, &mut app, "kick \u{b7}").expect("strip identity painted");
+        let texts2 = hover_until_tip(&mut app, &ctx, idl.center(), &["asset itself is untouched"]);
+        let tip2 = texts2
+            .iter()
+            .map(|t| t.replace('\n', " "))
+            .find(|t| t.contains("asset itself is untouched"))
+            .unwrap_or_else(|| panic!("identity tooltip painted: {texts2:?}"));
+        assert!(tip2.contains("track 1"), "identity names the track: {tip2:?}");
+        assert!(tip2.contains("lane 1"), "identity names the lane: {tip2:?}");
+    }
+
+    /// v175 R4 (runtime): the reset button restores state AND echoes what
+    /// it did (unity gain, no fades).
+    #[test]
+    fn v175_clip_props_reset_echo() {
+        let mut app = headless_app("v175rst");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        {
+            let cl = app.arr.tracks[0].lanes[0].clips.get_mut(0).unwrap();
+            cl.gain = 0.5;
+            cl.fade_in = 4410;
+        }
+        app.select_one((0, 0, 0));
+        frame(&mut app, &ctx, vec![]);
+        let r = painted_text_rect(&ctx, &mut app, "reset").expect("reset button painted");
+        click_pt(&mut app, &ctx, r.center());
+        frame(&mut app, &ctx, vec![]);
+        let cl = &app.arr.tracks[0].lanes[0].clips[0];
+        assert_eq!(cl.gain, 1.0, "gain reset");
+        assert_eq!(cl.fade_in, 0, "fade reset");
+        assert!(
+            app.status.contains("clip props reset"),
+            "reset echo: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("unity gain"),
+            "reset echo explains itself: {}",
+            app.status
+        );
+    }
+
+    /// v175 R5 (runtime): the clip context menu's "Select all clips" —
+    /// the menu's one silent item — explains scope, key, and that the
+    /// click REPLACES the current selection.
+    #[test]
+    fn v175_select_all_hover_paints() {
+        let mut app = headless_app("v175selall");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        // Empty canvas: any lane point opens the ELSE-branch menu.
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(900.0, top0 + app.track_h(0) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        rmb(&mut app, &ctx, p);
+        let g = painted_text_rect(&ctx, &mut app, "Select all clips")
+            .expect("menu lists Select all clips");
+        let texts = hover_until_tip(&mut app, &ctx, g.center(), &["EVERY clip"]);
+        let tip = texts
+            .iter()
+            .map(|t| t.replace('\n', " "))
+            .find(|t| t.contains("EVERY clip on EVERY track"))
+            .unwrap_or_else(|| panic!("hover tip painted: {texts:?}"));
+        assert!(tip.contains("Ctrl+A"), "hover names the key: {tip:?}");
+        assert!(tip.contains("replaces"), "hover warns about replacement: {tip:?}");
+    }
+
+    /// v175 R6 (runtime): Move-to-track — the menu's one silent success
+    /// path — echoes destination and count.
+    #[test]
+    fn v175_move_to_track_echo() {
+        let mut app = headless_app("v175mv");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        let kick = app.rack[0].files[0].path.clone();
+        let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
+        app.arr.insert(0, 0, Clip::new(a, 0));
+        frame(&mut app, &ctx, vec![]);
+        let top0 = app.grid_anchor - app.vscroll;
+        let p = egui::pos2(250.0, top0 + app.track_h(0) * 0.5);
+        click_pt(&mut app, &ctx, p);
+        rmb(&mut app, &ctx, p);
+        let mv = galley_centers(&mut app, &ctx, "Move to track", false);
+        let mvp = *mv.last().expect("Move-to-track item present");
+        click_pt(&mut app, &ctx, mvp);
+        let t3 = galley_centers(&mut app, &ctx, "Track 3", true);
+        // Other panels paint "Track 3" too — the submenu row is the hit
+        // NEAREST the menu anchor (v29 law).
+        let pick = t3
+            .into_iter()
+            .min_by(|a1, b1| {
+                (*a1 - mvp)
+                    .length_sq()
+                    .partial_cmp(&(*b1 - mvp).length_sq())
+                    .unwrap()
+            })
+            .expect("submenu lists Track 3");
+        click_pt(&mut app, &ctx, pick);
+        frame(&mut app, &ctx, vec![]);
+        let lanes = galley_centers(&mut app, &ctx, "lane 1 (parent)", true);
+        let lane = lanes
+            .into_iter()
+            .min_by(|a1, b1| {
+                (*a1 - pick)
+                    .length_sq()
+                    .partial_cmp(&(*b1 - pick).length_sq())
+                    .unwrap()
+            })
+            .unwrap();
+        click_pt(&mut app, &ctx, lane);
+        frame(&mut app, &ctx, vec![]);
+        let ids = clip_ids(&app);
+        assert_eq!(
+            ids.iter().filter(|(t, _, _, _)| *t == 2).count(),
+            1,
+            "clip now on track 2 (Track 3): {ids:?}"
+        );
+        assert!(
+            app.status.contains("moved 1 clip(s) to Track 3"),
+            "move echo: {}",
+            app.status
+        );
+    }
+
+    /// v175 R7 (runtime): a docked window's LONE title carries the same
+    /// identity hover the tab group's tabs already have.
+    #[test]
+    fn v175_dock_title_hover_paints() {
+        let mut app = headless_app("v175title");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let t = painted_text_rect(&ctx, &mut app, "ASSET RACK").expect("rack dock title painted");
+        let texts = hover_until_tip(&mut app, &ctx, t.center(), &["right-click for dock"]);
+        let tip = texts
+            .iter()
+            .map(|x| x.replace('\n', " "))
+            .find(|x| x.contains("right-click for dock"))
+            .unwrap_or_else(|| panic!("title tooltip painted: {texts:?}"));
+        assert!(tip.contains("ASSET RACK"), "tooltip names the window: {tip:?}");
+    }
+
+    /// v175 R8 (runtime paint): the marquee rubber band (1.2 px ACCENT
+    /// hairline) and the selection outline (2.0 px clip-sel blue) are
+    /// DISTINCT visual languages — mid-drag both paint, after release
+    /// only the committed outlines remain.
+    #[test]
+    fn v175_marquee_vs_selection_paint() {
+        let mut app = headless_app("v175marq");
+        let ctx = egui::Context::default();
+        let end_x = v161_seed_two_track_clips(&mut app, &ctx);
+        let top = app.grid_anchor - app.vscroll;
+        let y0 = top + app.track_h(0) * 0.5;
+        let y1 = top + app.track_h(0) + 3.0 + app.track_h(1) * 0.5;
+        let end = egui::pos2(end_x * 0.5, y1);
+        v161_drag(&mut app, &ctx, egui::pos2(end_x + 40.0, y0), end);
+        let count = |app: &mut App, ctx: &egui::Context, w: f32, col: egui::Color32| -> usize {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1440.0, 853.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let n = out
+                .shapes
+                .iter()
+                .filter(|cs| {
+                    if let egui::epaint::Shape::Rect(r) = &cs.shape {
+                        (r.stroke.width - w).abs() < 0.01 && r.stroke.color == col
+                    } else {
+                        false
+                    }
+                })
+                .count();
+            let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            drop(prims);
+            out.textures_delta.clear();
+            n
+        };
+        // MID-drag (v161_drag never releases): band + live selection coexist.
+        assert!(
+            count(&mut app, &ctx, 1.2, crate::kit::ACCENT) >= 1,
+            "mid-drag marquee band (1.2 px ACCENT) painted"
+        );
+        assert!(
+            count(&mut app, &ctx, 2.0, COL_CLIP_SEL) >= 1,
+            "live selection outlines coexist with the band"
+        );
+        // Release: the band is gone, only the committed outlines remain.
+        frame(
+            &mut app,
+            &ctx,
+            vec![btn(end, egui::PointerButton::Primary, false)],
+        );
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(
+            count(&mut app, &ctx, 1.2, crate::kit::ACCENT),
+            0,
+            "band retires with the gesture"
+        );
+        assert!(
+            count(&mut app, &ctx, 2.0, COL_CLIP_SEL) >= 2,
+            "both crossed clips carry the selection outline"
         );
     }
 }
