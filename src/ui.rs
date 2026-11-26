@@ -64764,14 +64764,19 @@ mod tests {
             app.status
         );
         // Zoom knob: row_h 22 → trail_half 44 px → 11 px = 300¢ (not 550¢).
+        // The row law is row_c = max.y − 10 + vscroll_px − 60.5·row_h, so
+        // doubling the row height would scroll row 60 ABOVE the canvas at
+        // the old vscroll — compensate it (60.5·(22−11) = 665.5 px) to keep
+        // the dot under the pointer at the SAME painted spot as before.
         {
             let r = app.piano_roll.as_mut().unwrap();
             r.row_h = 22.0;
+            r.vscroll_px = 500.0 + 665.5;
             r.pat.note_bends[0].pts = vec![(0.0, 0.0), (1.0, 1200.0)];
             r.pat.bake_bends();
         }
         frame(&mut app, &ctx, vec![]);
-        let row_c = c.max.y - 10.0 + 500.0 - 22.0 * 60.5;
+        let row_c = c.max.y - 10.0 + 1165.5 - 22.0 * 60.5;
         let dot = egui::pos2(grid_x0 + 160.0 - 2.0, row_c - 44.0);
         let up = egui::pos2(dot.x, dot.y - 11.0);
         frame(&mut app, &ctx, vec![moved(dot), btn(dot, egui::PointerButton::Primary, true)]);
