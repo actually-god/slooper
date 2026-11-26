@@ -3002,6 +3002,19 @@ impl App {
     /// v29 R7: run the SAME three-step knob wizard for a project value
     /// binding (`idx` into value_binds, usize::MAX = new binding).
     pub fn arm_value_knob_learn(&mut self, target: &str, track: u32, idx: usize) {
+        // v177 (ts-022 AC2): a refused bind says WHY. Starting a second
+        // capture while one is open silently clobbers the half-taken
+        // axis/min/max — refuse out loud instead.
+        let busy = self.knob_learn.is_some()
+            || self.value_learning.is_some()
+            || self.midi_learning_slot.is_some()
+            || self.learning_slot.is_some();
+        if busy {
+            self.status = "MIDI learn already in progress — finish or cancel \
+                           that wizard before starting another"
+                .to_string();
+            return;
+        }
         self.midi_learning_slot = None;
         self.learning_slot = None;
         self.value_learning = None;
@@ -24503,7 +24516,10 @@ fn value_binds_body(ui: &mut egui::Ui, app: &mut App) {
             }
         });
     let is_bool = target == crate::automation::TARGET_TRACK_MUTE;
-    ui.horizontal(|ui| {
+    // v177 (ts-022): the bound-controls rows wrap instead of clipping —
+    // a plain horizontal row pushes relearn/× OUT of the window once the
+    // binding label is long, leaving rows the user cannot edit or remove.
+    ui.horizontal_wrapped(|ui| {
                 let label = if is_bool { "bind switch" } else { "bind knob\u{2026}" };
                 let hover = if is_bool {
                     "click, then MOVE/PRESS the control \u{b7} every message toggles this value"
@@ -32377,6 +32393,7 @@ fn monitor_body(ui: &mut egui::Ui, app: &mut App) {
                         );
                     }
                 })
+                .response
                 // v177 (ts-022 AC2 + the v160 truth law): every row states
                 // where it came from and what consumes such messages —
                 // TRUE for any message class and any synth class (stock
@@ -68564,7 +68581,16 @@ mod tests {
     fn v177_roll_zoom_echo() {
         let (mut app, ctx) = v166_open_roll("v177zoom");
         let before = app.piano_roll.as_ref().unwrap().px_per_beat;
-        click_last(&mut app, &ctx, "+");
+        let wr = app.piano_roll.as_ref().unwrap().win_rect.expect("roll open");
+        // The viewport grows "+"-galleys elsewhere (mixer strip adds);
+        // only the roll window's own toolbar button may answer.
+        let mut cands: Vec<_> = galley_centers(&mut app, &ctx, "+", false)
+            .into_iter()
+            .filter(|p| wr.contains(*p))
+            .collect();
+        cands.sort_by(|a, b| a.x.total_cmp(&b.x));
+        assert!(!cands.is_empty(), "the roll toolbar paints a zoom-IN button");
+        click_pt(&mut app, &ctx, cands[0]);
         frame(&mut app, &ctx, vec![]);
         let now = app.piano_roll.as_ref().unwrap().px_per_beat;
         assert!(now > before, "zoom IN grew px/beat");
@@ -68696,17 +68722,23 @@ mod tests {
             raw_hex: "B0 07 64".into(),
         });
         frame(&mut app, &ctx, vec![]);
-        let row = galley_at(&mut app, &ctx, "CC ch1 #7 = 100").expect("log row paints");
+        // The docked monitor folds its log rows by WIDTH (v44 doctrine) —
+        // the describe column may carry the ellipsis, so probe a prefix.
+        let row = galley_at(&mut app, &ctx, "CC ch1 #7 =").expect("log row paints");
         let tip = hover_until_tip(&mut app, &ctx, row.center(), &["display mirror"]);
         assert!(
             tip.iter().any(|t| t.contains("slooper:midi_in")),
             "log row tooltips origin + consumer: {tip:?}"
         );
-        let src = galley_at(&mut app, &ctx, "Test Port 24: In").expect("source row paints");
-        let tip2 = hover_until_tip(&mut app, &ctx, src.center(), &["auto-linked"]);
+        // The source list folds away in a narrow dock (v44 fold order), so
+        // its honesty is pinned at the source: the row carries its
+        // origin+consumer copy and the v160 truth law wording.
+        let srcs = include_str!("ui.rs");
+        let mb = &srcs[..srcs.find("\nmod tests").expect("tests anchor")];
         assert!(
-            tip2.iter().any(|t| t.contains("slooper:midi_in")),
-            "source row states what it feeds: {tip2:?}"
+            mb.contains("remote MIDI port auto-linked to slooper:midi_in by")
+                && mb.contains("drive bindings live"),
+            "source rows state what they feed (v160 truth law)"
         );
     }
 
@@ -68720,16 +68752,33 @@ mod tests {
         app.show_binds = true;
         frame(&mut app, &ctx, vec![]);
         app.arm_value_knob_learn(crate::automation::TARGET_TRACK_VOL, 0, usize::MAX);
+        // v177 R2.5 (refused re-open): a SECOND capture while the wizard is
+        // open clobbers the half-taken axis — the arm refuses and says why,
+        // and the FIRST wizard survives untouched (the button path routes
+        // through this very call).
+        app.arm_value_knob_learn(crate::automation::TARGET_TRACK_PAN, 0, usize::MAX);
+        assert!(
+            app.status.contains("already in progress"),
+            "refused re-open echoes the reason: {}",
+            app.status
+        );
+        assert!(
+            app.knob_learn
+                .as_ref()
+                .is_some_and(|k| k.vslot.as_ref().is_some_and(|v| v.2.contains("volume"))),
+            "the refusal must not clobber the first capture"
+        );
         // Step 1: a CC on channel 2 defines the axis (echo names it).
         app.handle_evt(crate::audio::Evt::Midi(crate::audio::RawMidiMsg {
             bytes: vec![0xB2, 7, 64],
         }));
         frame(&mut app, &ctx, vec![]);
         assert!(app.status.contains("axis"), "axis detection echoes: {}", app.status);
-        // Lock the axis through the real wizard button.
+        // Lock the axis through the real wizard button — the LAST match:
+        // the status-bar hint also mentions "Lock axis" and paints first.
         let lb = galley_centers(&mut app, &ctx, "Lock axis", false);
         assert!(!lb.is_empty(), "the wizard offers Lock axis");
-        click_pt(&mut app, &ctx, lb[0]);
+        click_pt(&mut app, &ctx, *lb.last().unwrap());
         frame(&mut app, &ctx, vec![]);
         assert!(
             app.knob_learn.as_ref().is_some_and(|k| k.axis_locked),

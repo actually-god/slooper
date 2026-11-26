@@ -560,7 +560,10 @@ const GEOM_BASE: &[(&str, &str, usize)] = &[
 fn v176_color_literal_tripwire() {
     // TS-028 criterion 5: a NEW local Color32 literal outside the token
     // homes fails here; frozen sites live in COLOR_BASE with reasons.
-    assert!(COLOR_BASE.len() > 150, "baseline roster was emptied");
+    // (v177 ts-022 lowered the floor 150→120: the ts-022/ts-026 filed rows
+    // it drains are legitimate — the guard guards roster DESTRUCTION, not
+    // a count floor; current roster 148.)
+    assert!(COLOR_BASE.len() > 120, "baseline roster was emptied");
     let (new_sites, stale) = diff(COLOR_BASE, true);
     assert!(
         new_sites.is_empty() && stale.is_empty(),
