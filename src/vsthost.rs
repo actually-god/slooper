@@ -1690,9 +1690,6 @@ fn probe_timeout_secs() -> u64 {
 /// True while running INSIDE an isolated probe child (belt-and-braces:
 /// nothing in the child re-forks, but plugins sometimes spawn helpers).
 static PROBE_CHILD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub fn in_probe_child() -> bool {
-    PROBE_CHILD.load(Ordering::Relaxed)
-}
 
 /// W7: hidden re-exec flag of the Windows probe child, matched FIRST ARG
 /// only by `main` (`--slooper-probe <kind> <path>`). Kind is `kind_code`.
@@ -2859,31 +2856,13 @@ pub fn post(f: impl FnOnce() + Send + 'static) {
     let _ = gui_tx().send(Box::new(f));
 }
 
-/// v16: start a plugin load on the GUI thread and return immediately.
+/// v16/v176: start a plugin load on the GUI thread and return immediately.
 /// The caller polls the receiver (the UI thread must never block on an
 /// instantiation: a Vitalium-class load measured 180 ms of frozen app).
-pub fn open_async(
-    path: &Path,
-    kind: VstKind,
-    sample_rate: u32,
-    saved: Option<&[f32]>,
-) -> std::sync::mpsc::Receiver<Result<Arc<dyn StageEntry>, String>> {
-    open_async_pid(path, kind, None, sample_rate, saved, None)
-}
-
-/// [`open_async`] carrying a VST3 patch (see [`open_with_state`]).
-pub fn open_async_with_state(
-    path: &Path,
-    kind: VstKind,
-    sample_rate: u32,
-    saved: Option<&[f32]>,
-    patch: Option<&VstPatch>,
-) -> std::sync::mpsc::Receiver<Result<Arc<dyn StageEntry>, String>> {
-    open_async_pid(path, kind, None, sample_rate, saved, patch)
-}
-
-/// [`open_async_with_state`] addressing a plugin inside a multi-plugin
-/// file (CLAP) — one shared body for both spellings.
+/// v176: the thin `open_async`/`open_async_with_state` wrappers (no
+/// plugin_id argument) lost their last caller in the v23/v60 opener
+/// unification — this is the one body; `patch: Some(..)` is the old
+/// with-state spelling (see [`open_with_state`] for the sync variant).
 pub fn open_async_pid(
     path: &Path,
     kind: VstKind,
