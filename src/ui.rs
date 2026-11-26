@@ -64,6 +64,7 @@ pub(crate) mod mcp_windows;
 /// line ahead of the tests seam truncates the seam tests' `code_lines()`
 /// view of this file's production region (v173 CI lesson).
 mod coverage_audit;
+mod design_audit;
 
 /// Keys a user may plausibly bind to a shortcut.
 /// v108: Home/End joined this list — SHORTCUT_DEFAULTS has bound them since
@@ -53900,7 +53901,8 @@ mod tests {
     /// v176 (ts-028): the rack kind palette has ONE home
     /// (rack_kind_color) and the rack's destructive labels paint with
     /// kit::DESTROY — a re-forked badge/header/delete color fails here.
-    /// Scan window = [rack_kind_color home .. end of rack_body]; needles
+    /// Scan window = [rack_file_row (first rack renderer) .. end of
+    /// rack_body]; needles
     /// are concat!-split and this pin lives in `mod tests` (below the
     /// window cut), so it can never match its own literals.
     #[test]
@@ -53912,10 +53914,20 @@ mod tests {
             .expect("v176 kind-color home missing");
         let body_at = home_at + prod[home_at..].find('{').unwrap();
         let body_end = body_at + prod[body_at..].find("\n}").unwrap();
+        let rack_start = prod
+            .find("fn rack_file_row")
+            .expect("rack_file_row missing")
+            .min(home_at);
         let rack_body_at = prod.find("fn rack_body").expect("rack_body missing");
         let rack_end = rack_body_at + prod[rack_body_at..].find("\nfn ").unwrap_or(0);
         let home = &prod[body_at..body_end];
-        let rack = &prod[home_at..rack_end];
+        // Count CODE only: doc/prose mentions of the token must not
+        // inflate the usage count.
+        let rack: String = prod[rack_start..rack_end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let red = concat!("from_rgb(255, ", "120, 120)");
         let violet = concat!("from_rgb(19", "0, 150, 255)");
         let tan = concat!("from_rgb(2", "10, 175, 120)");
