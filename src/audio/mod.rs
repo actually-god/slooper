@@ -3237,23 +3237,20 @@ pub(crate) fn curve_st(d1: u8, d2: u8) -> f32 {
 
 /// v167 (pbc-1): the HOSTED wire form of a curve bend — the 3-byte form
 /// every hosted queue choke point accepts and re-pushes as real 14-bit
-/// pitch bend. The internal tuple carries full decicents, but the pitch-
-/// bend wire has only a 14-bit pair, so the wire quantizes to QUARTER
-/// DECICENTS (0.004 st = 0.4 ¢ steps — 10× below the ~5 ¢ JND, while the
-/// scripted path keeps full 0.001 st). Payload: standard MIDI 14-bit
-/// pair, OFFSET-BINARY (8192 = 0 st, range ±8191×0.004 = ±32.76 st —
-/// covers the ±24 st curve bound). Marker: byte-2 bit 7 — legacy roll
-/// writers always mask d2 to 7 bits, so it can only originate here.
-/// RT-safe.
+/// pitch bend. Thin wrapper over the `midi3_raw` kind-7 arm (the SOLE
+/// 0xE0 curve constructor — v150 byte-map doctrine; do not hand-build
+/// 0xE0 bytes elsewhere). The internal tuple carries full decicents, but
+/// the pitch-bend wire has only a 14-bit pair, so the wire quantizes to
+/// QUARTER DECICENTS (0.004 st = 0.4 ¢ steps — 10x below the ~5 ¢ JND,
+/// while the scripted path keeps full 0.001 st). Payload: standard MIDI
+/// 14-bit pair, OFFSET-BINARY (8192 = 0 st, range +-8191x0.004 =
+/// +-32.76 st — covers the +-24 st curve bound). Marker: byte-2 bit 7 —
+/// legacy roll writers always mask d2 to 7 bits, so it can only
+/// originate in the kind-7 arm. RT-safe.
 #[inline]
 pub(crate) fn curve_wire(ch: u8, st: f32) -> [u8; 3] {
-    let q = (st * 250.0).round().clamp(-8191.0, 8191.0) as i16;
-    let raw = (q + 8192) as u16;
-    [
-        0xE0 | ch & 0x0F,
-        (raw & 0x7F) as u8,
-        (((raw >> 7) & 0x7F) as u8) | 0x80,
-    ]
+    let ev = curve_ev(0, ch, st);
+    midi3_raw(7, ch, ev.3, ev.4)
 }
 
 /// Decode [`curve_wire`]'s payload to semitones (0.004 st quantum).
@@ -3413,13 +3410,20 @@ pub(crate) fn midi3_raw(kind: u8, ch: u8, d1: u8, d2: u8) -> [u8; 3] {
         4 => [0xA0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
         5 => [0xE0 | ch & 0x0F, d1 & 0x7F, d2 & 0x7F],
         // v167 (pbc-1): kind 7 (drawn-curve bend) rides the pitch-bend
-        // wire via `curve_wire` (14-bit offset-binary, 0.004 st quantum,
-        // byte-2 bit-7 DIRECT-CURRENCY marker): the queue choke points
-        // decode the semitones, AUTO-WIDEN the RPN0 range and push the
-        // plugin-currency 14-bit value verbatim — never the roll-law
-        // rescale (which physically walls at ±12 st). Legacy roll writers
-        // always mask d2 to 7 bits, so bit 7 can only ever originate here.
-        7 => curve_wire(ch, curve_st(d1, d2)),
+        // wire in OFFSET-BINARY 14-bit currency (quantum 0.004 st = 0.4 ¢,
+        // +-8191 units = +-32.76 st covers the +-24 st curve bound;
+        // 8192 = 0 st) with byte-2 bit-7 as the DIRECT-CURRENCY marker:
+        // the queue choke points decode the semitones, AUTO-WIDEN the RPN0
+        // range and push the plugin-currency 14-bit value verbatim — never
+        // the roll-law rescale (which physically walls at +-12 st). Legacy
+        // roll writers always mask d2 to 7 bits, so bit 7 can only ever
+        // originate here. THIS arm is the sole 0xE0 curve constructor
+        // (v150 byte-map doctrine); `curve_wire` wraps it.
+        7 => {
+            let q = (curve_st(d1, d2) * 250.0).round().clamp(-8191.0, 8191.0) as i16;
+            let raw = (q + 8192) as u16;
+            [0xE0 | ch & 0x0F, (raw & 0x7F) as u8, (((raw >> 7) & 0x7F) as u8) | 0x80]
+        }
         _ => [0x90 | ch & 0x0F, d1 & 0x7F, d2.clamp(1, 127)],
     }
 }
@@ -10322,14 +10326,16 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         );
         assert_eq!(
             src.matches(concat!("0xE0 ", "| ch & 0x0F")).count(),
-            1,
-            "bend staging must live only in midi3_raw"
+            2,
+            "bend staging must live only in midi3_raw (v167: arm 5 roll + \
+             arm 7 offset-binary curve are the two sanctioned siblings)"
         );
         assert_eq!(
             src.matches(concat!("mi", "di3_raw(")).count(),
-            7,
-            "one definition + six call sites, ALL inside stage_edo (v164: the \
-             EDO pass owns every mapper call; feed sites call only the wrapper)"
+            13,
+            "one definition + six stage_edo sites + curve_wire wrapper + \
+             five v167 wire-law pin sites (v164: the EDO pass owns every \
+             mapper call; feed sites call only the wrapper)"
         );
         assert_eq!(
             src.matches(concat!("0x90 ", "| ch & 0x0F")).count(),
