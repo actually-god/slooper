@@ -45896,6 +45896,179 @@ mod tests {
         assert!(scan_ghost(&mut app, &ctx).is_none(), "no ghost survives the final take");
     }
 
+    /// v172 AC (GUI half): a fan-out take with three ticked devices
+    /// materializes as exactly three clips on the armed track, named
+    /// `[project]-[device]-Track N` per component-sanitized part
+    /// (`system:capture_2` folds the colon, `Mix: master` →
+    /// `Mix- master`), one WAV each in the rack folder, lanes stacked by
+    /// place_auto (all starts equal, so each take opens its own lane).
+    #[test]
+    fn v172_three_devices_three_named_clips() {
+        let mut app = headless_app("v172fan3");
+        app.sample_rate = 48_000;
+        app.auto_quantize = false;
+        app.proj_name = "Live set".into();
+        let dir = std::env::temp_dir().join("slooper-v172-ui-fan3");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.rack.clear();
+        app.rack.push(RackFolder::new(dir.to_string_lossy().into_owned()));
+        let n0 = app.assets.len();
+        for (dev, v) in [
+            ("Motif M2", 0.25f32),
+            ("system:capture_2", -0.5),
+            ("Mix: master", 0.125),
+        ] {
+            app.handle_evt(crate::audio::Evt::Take {
+                track: 0,
+                at: 4800,
+                data: Arc::from(vec![v; 240]),
+                preview: false,
+                device: Some(dev.into()),
+            });
+        }
+        assert_eq!(app.assets.len(), n0 + 3, "one asset per ticked device");
+        let names: Vec<&str> = app.assets[n0..].iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Live set-Motif M2-Track 1",
+                "Live set-system-capture_2-Track 1",
+                "Live set-Mix- master-Track 1",
+            ]
+        );
+        let n_clips: usize = app
+            .arr
+            .tracks
+            [0]
+            .lanes
+            .iter()
+            .map(|l| l.clips.len())
+            .sum();
+        assert_eq!(n_clips, 3, "all three takes land on the armed track");
+        let files: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files.len(), 3, "one WAV per device in the rack folder");
+        assert!(files
+            .iter()
+            .all(|f| f.starts_with("Live set-") && f.ends_with(".wav")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v172 AC: re-recording the same device gets the folder's unique-name
+    /// suffix (`-2`, the MIDI-take "take"/"take-2" convention) — the first
+    /// take's WAV is never overwritten.
+    #[test]
+    fn v172_recording_collision_gets_suffix() {
+        let mut app = headless_app("v172collide");
+        app.sample_rate = 48_000;
+        app.auto_quantize = false;
+        app.proj_name = "Set".into();
+        let dir = std::env::temp_dir().join("slooper-v172-ui-collide");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.rack.clear();
+        app.rack.push(RackFolder::new(dir.to_string_lossy().into_owned()));
+        let take = |app: &mut App| {
+            app.handle_evt(crate::audio::Evt::Take {
+                track: 2,
+                at: 0,
+                data: Arc::from(vec![0.25f32; 120]),
+                preview: false,
+                device: Some("Mic 1".into()),
+            })
+        };
+        take(&mut app);
+        let i1 = app.assets.len() - 1;
+        take(&mut app);
+        let i2 = app.assets.len() - 1;
+        assert_eq!(app.assets[i1].name, "Set-Mic 1-Track 3");
+        assert_eq!(app.assets[i2].name, "Set-Mic 1-Track 3-2");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "both WAVs kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v172 AC: empty or punctuation-only project/device parts are skipped
+    /// — never a `--Track 3` seam, never a leading dash. (No rack folder
+    /// here: the dirty asset keeps the plain base name — uniqueness is a
+    /// folder convention, and there is no folder.)
+    #[test]
+    fn v172_empty_name_parts_seam_nothing() {
+        let mut app = headless_app("v172empty");
+        app.sample_rate = 48_000;
+        app.auto_quantize = false;
+        app.proj_name = "".into();
+        app.rack.clear();
+        let n0 = app.assets.len();
+        for dev in [None, Some("".to_string()), Some("::".to_string())] {
+            app.handle_evt(crate::audio::Evt::Take {
+                track: 1,
+                at: 0,
+                data: Arc::from(vec![0.1f32; 120]),
+                preview: false,
+                device: dev,
+            });
+        }
+        let names: Vec<&str> = app.assets[n0..].iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["Track 2", "Track 2", "Track 2"]);
+        assert!(names.iter().all(|n| !n.starts_with('-') && !n.contains("--")));
+    }
+
+    /// v172 AC: preview takes keep the old timestamped bounce name and the
+    /// device segment never leaks into them; a plain take with no device
+    /// (loop take / zero-device case) names as `[project]-Track N`.
+    #[test]
+    fn v172_preview_take_keeps_legacy_name() {
+        let mut app = headless_app("v172pvname");
+        app.sample_rate = 48_000;
+        app.auto_quantize = false;
+        app.proj_name = "Live set".into();
+        app.rack.clear();
+        let n0 = app.assets.len();
+        app.handle_evt(crate::audio::Evt::Take {
+            track: 0,
+            at: 0,
+            data: Arc::from(vec![0.2f32; 120]),
+            preview: true,
+            device: None,
+        });
+        assert!(
+            app.assets[n0].name.starts_with("preview-t1-"),
+            "{}",
+            app.assets[n0].name
+        );
+        app.handle_evt(crate::audio::Evt::Take {
+            track: 0,
+            at: 0,
+            data: Arc::from(vec![0.2f32; 120]),
+            preview: false,
+            device: None,
+        });
+        assert_eq!(app.assets[n0 + 1].name, "Live set-Track 1");
+    }
+
+    /// v172: the naming seam's full matrix — per-component sanitize, skip
+    /// rules for empty / separator-only parts, and the 1-based Track suffix.
+    #[test]
+    fn v172_take_asset_name_matrix() {
+        assert_eq!(
+            take_asset_name("Live set", Some("Motif M2"), 2),
+            "Live set-Motif M2-Track 3"
+        );
+        assert_eq!(take_asset_name("", None, 0), "Track 1");
+        assert_eq!(take_asset_name("  ", Some(":"), 0), "Track 1");
+        assert_eq!(
+            take_asset_name("Mix: master", Some("a/b"), 0),
+            "Mix- master-a-b-Track 1"
+        );
+        assert_eq!(
+            take_asset_name("p", Some("Con: trol: one"), 4),
+            "p-Con- trol- one-Track 5"
+        );
+    }
+
     /// v29: untick EVERYTHING and REC refuses with a hint instead of
     /// silently arming nothing.
     #[test]

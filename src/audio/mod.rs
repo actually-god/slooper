@@ -7456,9 +7456,9 @@ mod tests {
     fn v169_empty_stop_discards() {
         let e = Engine::new();
         let (tx, rx) = std::sync::mpsc::sync_channel::<Evt>(32);
-        toggle_record(&e, 2, &tx);
+        toggle_record(&e, 2, &NullSession, &tx);
         assert_eq!(e.rec_state_of(2), TR_REC, "first press arms");
-        toggle_record(&e, 2, &tx);
+        toggle_record(&e, 2, &NullSession, &tx);
         assert_eq!(e.rec_state_of(2), TR_IDLE, "second press stops");
         let mut notice = false;
         let mut discarded = false;
@@ -7471,6 +7471,208 @@ mod tests {
         }
         assert!(notice, "the existing discard notice still ships");
         assert!(discarded, "the ghost-kill event ships alongside it");
+    }
+
+    /// v172 test-only backend: reports a fixed slot→name table (the
+    /// per-device take labels the manager ships with); otherwise a park.
+    struct NamedSession(Vec<Option<String>>);
+    impl ManagerBackend for NamedSession {
+        fn refresh(&mut self, _tx: &SyncSender<Evt>) {}
+        fn apply(&mut self, _ins: &[String], _outs: &[(String, u8)], _tx: &SyncSender<Evt>) {}
+        fn idle(&mut self, _tx: &SyncSender<Evt>) {}
+        fn teardown(&mut self) {}
+        fn input_names(&self) -> Vec<Option<String>> {
+            self.0.clone()
+        }
+    }
+
+    /// v172 R1: a stopped fan take ships ONE `Evt::Take` per captured slot,
+    /// each carrying that device's own frames (not the summed mix) and its
+    /// port name. Slots 0+2 ticked → exactly two takes.
+    #[test]
+    fn v172_ship_fans_one_take_per_device() {
+        let e = Engine::new();
+        e.ensure_dev_bufs();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Evt>(32);
+        e.start_rec(0);
+        e.fan_start[0].store(0, Ordering::Relaxed);
+        e.fan_live[0].store(true, Ordering::Relaxed);
+        e.fan_mask.store(0b101, Ordering::Relaxed);
+        for k in 0..64u32 {
+            e.dev_write(0, k, 0.25);
+            e.dev_write(2, k, -0.5);
+        }
+        e.dev_len.store(64, Ordering::Relaxed);
+        e.rec_state[0].store(TR_IDLE, Ordering::Relaxed);
+        ship_take(
+            &e,
+            0,
+            &NamedSession(vec![
+                Some("Motif M2:capture-1".into()),
+                None,
+                Some("system:capture_2".into()),
+            ]),
+            &tx,
+        );
+        let mut got: Vec<(Option<String>, Vec<f32>)> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Evt::Take {
+                track,
+                data,
+                preview,
+                device,
+                ..
+            } = ev
+            {
+                assert_eq!(track, 0);
+                assert!(!preview);
+                got.push((device, data.to_vec()));
+            } else {
+                panic!("only takes expected, got {ev:?}");
+            }
+        }
+        assert_eq!(got.len(), 2, "one clip per ticked device, not one mix");
+        assert_eq!(got[0].0.as_deref(), Some("Motif M2:capture-1"));
+        assert_eq!(got[1].0.as_deref(), Some("system:capture_2"));
+        assert!(got[0].1.iter().all(|&v| (v - 0.25).abs() < 1e-6));
+        assert!(got[1].1.iter().all(|&v| (v + 0.5).abs() < 1e-6));
+    }
+
+    /// v172 R7: with nothing ticked the run still advanced slot 0 on the
+    /// summed (silent) dry input — a stopped take is exactly ONE clip with
+    /// no device label.
+    #[test]
+    fn v172_ship_zero_devices_is_one_silent_clip() {
+        let e = Engine::new();
+        e.ensure_dev_bufs();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Evt>(32);
+        e.start_rec(0);
+        e.fan_start[0].store(0, Ordering::Relaxed);
+        e.fan_live[0].store(true, Ordering::Relaxed);
+        e.fan_mask.store(0, Ordering::Relaxed);
+        for k in 0..32u32 {
+            e.dev_write(0, k, 0.0);
+        }
+        e.dev_len.store(32, Ordering::Relaxed);
+        e.rec_state[0].store(TR_IDLE, Ordering::Relaxed);
+        ship_take(&e, 0, &NamedSession(vec![]), &tx);
+        let mut n = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let Evt::Take { data, device, .. } = ev {
+                assert_eq!(data.len(), 32);
+                assert!(device.is_none(), "no device ticked → no name part");
+                n += 1;
+            } else {
+                panic!("exactly one take expected, got {ev:?}");
+            }
+        }
+        assert_eq!(n, 1, "zero devices → exactly one clip");
+    }
+
+    /// v172 (root cause of the "recording always makes 2 clips" report):
+    /// a user-stopped take must ship exactly once AND leave the capacity
+    /// claim empty. The v0.10 64→128 widening inverted the stop path's
+    /// clear into `mark_take_pending` (a SET), so the next idle claim
+    /// shipped the same take a second time.
+    #[test]
+    fn v172_user_stop_ships_once_not_twice() {
+        let e = Engine::new();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Evt>(32);
+        toggle_record(&e, 2, &NullSession, &tx); // arm
+        assert_eq!(e.rec_state_of(2), TR_REC);
+        for k in 0..128u32 {
+            assert!(!e.rec_sample(2, 0.5));
+        }
+        toggle_record(&e, 2, &NullSession, &tx); // stop + ship
+        let mut takes = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, Evt::Take { .. }) {
+                takes += 1;
+            }
+        }
+        assert_eq!(takes, 1, "the stop ships exactly one take");
+        assert_eq!(
+            e.claim_takes(),
+            0,
+            "the stop must CLEAR the pending bit — a set bit re-ships the same take"
+        );
+    }
+
+    /// v172 R9: the v169 live ghost follows a rolling fan take by reading
+    /// the PRIMARY (lowest ticked) device slot — the per-track buffer stays
+    /// empty for a fan take, so a pump that still read it would stream
+    /// silence.
+    #[test]
+    fn v172_pump_streams_primary_device_slot() {
+        let e = Engine::new();
+        e.ensure_dev_bufs();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Evt>(32);
+        e.start_rec(3);
+        e.rec_at[3].store(500, Ordering::Relaxed);
+        e.fan_start[3].store(0, Ordering::Relaxed);
+        e.fan_live[3].store(true, Ordering::Relaxed);
+        e.fan_mask.store(0b110, Ordering::Relaxed); // slots 1+2 ticked: primary = 1
+        for k in 0..40u32 {
+            e.dev_write(1, k, 0.75);
+            e.dev_write(2, k, -0.75);
+        }
+        e.dev_len.store(40, Ordering::Relaxed);
+        let mut sent = [(0u64, 0u64); MAX_LOOPS];
+        pump_live_takes(&e, &tx, &mut sent);
+        let mut streamed = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let Evt::TakeProgress { track, at, frames } = ev {
+                assert_eq!((track, at), (3, 500));
+                assert_eq!(frames.len(), 40);
+                assert!(frames.iter().all(|&v| (v - 0.75).abs() < 1e-6),
+                    "ghost streams the PRIMARY slot (slot 1), not slot 2");
+                streamed = true;
+            } else {
+                panic!("only progress expected, got {ev:?}");
+            }
+        }
+        assert!(streamed, "the ghost grows from the fan table");
+        // No new frames -> no re-stream (sent bookkeeping advanced).
+        pump_live_takes(&e, &tx, &mut sent);
+        assert!(rx.try_recv().is_err(), "no delta -> no progress event");
+    }
+
+    /// v172: the RT half of the fan capture cannot be unit-driven (Proc is
+    /// built in the JACK activation factory — w4 doctrine), so the wiring
+    /// is source-pinned: plain takes skip the summed capture, the shared
+    /// cursor writes every snapshotted slot, and the run bookkeeping
+    /// (start snapshot / freeze / capacity stop) is in place.
+    #[test]
+    fn v172_rt_fan_capture_wired() {
+        let src = include_str!("mod.rs").replace("\r\n", "\n");
+        let body = super::w4_tests::extract_fn(&src, "pub fn process_block(");
+        // Plain audio takes must NOT get the summed dry sample any more…
+        assert!(
+            body.contains("if fan_now & (1u128 << t) != 0 {"),
+            "fan tracks must skip the summed rec_sample capture"
+        );
+        // …they are captured per slot under the shared cursor instead.
+        assert!(
+            body.contains("if self.dev_run {") && body.contains("self.engine.dev_write(s, off, v);"),
+            "per-slot fan capture must write under the shared cursor"
+        );
+        assert!(
+            body.contains("if fan_mask_run == 0 {"),
+            "the zero-device fallback (slot 0 on the summed dry) must stay wired"
+        );
+        // Run bookkeeping: in_mask snapshot at start, cursor reset, capacity stop.
+        assert!(
+            body.contains(".fan_mask\n                        .store(in_mask & ((1u64 << MAX_SLOTS) - 1)"),
+            "the run must snapshot the connected slots (selection locked at start)"
+        );
+        assert!(
+            body.contains("self.engine.dev_len.store(0, Ordering::Relaxed);"),
+            "a fresh run must reset the shared cursor"
+        );
+        assert!(
+            body.contains("if self.dev_run && self.engine.dev_len_of() >= LOOP_CAP {"),
+            "the shared capacity stop must end every rolling fan take"
+        );
     }
 
     /// Latency compensation is a START-of-take skip: a fresh recording
