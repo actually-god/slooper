@@ -67611,8 +67611,14 @@ mod tests {
         clear_canvas(&mut app);
         // The toolbar row is UNWRAPPED (v30 trap): free the canvas so the
         // split button and the zoom slider at its tail get galleys.
-        set_visible(&mut app, 0, false);
-        set_visible(&mut app, 3, false);
+        // One boot frame FIRST: dyn windows (incl. the docked MASTER OUT
+        // slot) materialize only on the first frame — win_count before it
+        // undercounts and the 540-px master dock keeps the toolbar tail
+        // clipped (DIAG D5b 11-26).
+        frame(&mut app, &ctx, vec![]);
+        for w in 0..win_count(&app) {
+            set_visible(&mut app, w, false);
+        }
         frame(&mut app, &ctx, vec![]);
         let sp = painted_text_rect(&ctx, &mut app, "split").expect("split button painted");
         let texts =
@@ -67634,8 +67640,14 @@ mod tests {
         let mut app = headless_app("v175tbecho");
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
-        set_visible(&mut app, 0, false);
-        set_visible(&mut app, 3, false);
+        // One boot frame FIRST: dyn windows (incl. the docked MASTER OUT
+        // slot) materialize only on the first frame — win_count before it
+        // undercounts and the 540-px master dock keeps the toolbar tail
+        // clipped (DIAG D5b 11-26).
+        frame(&mut app, &ctx, vec![]);
+        for w in 0..win_count(&app) {
+            set_visible(&mut app, w, false);
+        }
         frame(&mut app, &ctx, vec![]);
         // Snap checkbox has NO label of its own: the "snap" caption sits
         // LEFT of the box (right edge + item spacing + half a checkbox).
@@ -67645,11 +67657,15 @@ mod tests {
         click_pt(&mut app, &ctx, box_p);
         assert_eq!(app.snap_on, !before, "snap checkbox hit at {box_p:?}");
         assert!(app.status.contains("snap:"), "snap echo: {}", app.status);
-        // Loop checkbox: its label IS the click target.
-        let lp = galley_centers(&mut app, &ctx, "loop", true);
-        assert!(!lp.is_empty(), "loop checkbox galley");
+        // Loop checkbox: its label IS the click target. The header
+        // transport also paints a "loop" caption — the toolbar box is the
+        // match INSIDE the grid-toolbar row (y > 40).
+        let lp = galley_centers(&mut app, &ctx, "loop", true)
+            .into_iter()
+            .find(|p| p.y > 40.0);
+        let lpp = lp.expect("loop checkbox galley in the toolbar row");
         let before = app.loop_tl;
-        click_pt(&mut app, &ctx, lp[0]);
+        click_pt(&mut app, &ctx, lpp);
         assert_eq!(app.loop_tl, !before, "loop toggled");
         assert!(app.status.contains("loop:"), "loop echo: {}", app.status);
         // Auto-quantize checkbox.
@@ -67697,15 +67713,25 @@ mod tests {
         let mut app = headless_app("v175combo");
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
-        set_visible(&mut app, 0, false);
-        set_visible(&mut app, 3, false);
+        // One boot frame FIRST: dyn windows (incl. the docked MASTER OUT
+        // slot) materialize only on the first frame — win_count before it
+        // undercounts and the 540-px master dock keeps the toolbar tail
+        // clipped (DIAG D5b 11-26).
+        frame(&mut app, &ctx, vec![]);
+        for w in 0..win_count(&app) {
+            set_visible(&mut app, w, false);
+        }
         frame(&mut app, &ctx, vec![]);
         let cur = SUBDIVISIONS[app.q_sub].1;
         let tgt = (app.q_sub + 3) % SUBDIVISIONS.len();
         let tgt_name = SUBDIVISIONS[tgt].1;
-        let cb = painted_text_rect(&ctx, &mut app, cur).expect("quantize combo shows its value");
-        click_pt(&mut app, &ctx, cb.center());
-        frame(&mut app, &ctx, vec![]); // the popup opens one frame later
+        // Both subdivision combos render the same value text; the
+        // QUANTIZE combo is the LEFTMOST galley (paint order = x order).
+        let cbs = galley_centers(&mut app, &ctx, cur, true);
+        assert!(cbs.len() >= 2, "both subdivision combos paint {cur:?}");
+        click_pt(&mut app, &ctx, cbs[0]);
+        frame(&mut app, &ctx, vec![]); // popup opens + settles
+        frame(&mut app, &ctx, vec![]);
         let picks = galley_centers(&mut app, &ctx, tgt_name, true);
         assert!(!picks.is_empty(), "popup lists {tgt_name:?}");
         click_pt(&mut app, &ctx, *picks.last().unwrap());
@@ -67760,7 +67786,9 @@ mod tests {
                 offenders.push(format!("line {}: {}", i + 1, l.trim()));
             }
         }
-        assert_eq!(checked, 5, "strip affordances = label + 3 sliders + reset");
+        // 4 statements drive the 5 affordances: ONE Slider stmt inside the
+        // (fade-in, fade-out) loop covers both fade sliders.
+        assert_eq!(checked, 4, "strip affordances = label + gain + fade-loop + reset");
         assert!(
             offenders.is_empty(),
             "clip_props_strip affordances WITHOUT hover:\n{offenders:#?}"
@@ -67774,6 +67802,17 @@ mod tests {
         let mut app = headless_app("v175strip");
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
+        // Dock-free: with the MIXER docked its master "gain" galley wins
+        // the probe and the squeezed central strip wraps its tail away
+        // (DIAG 11-26) — close every side window for a full-width strip.
+        // One boot frame FIRST: dyn windows (incl. the docked MASTER OUT
+        // slot) materialize only on the first frame — win_count before it
+        // undercounts and the 540-px master dock keeps the toolbar tail
+        // clipped (DIAG D5b 11-26).
+        frame(&mut app, &ctx, vec![]);
+        for w in 0..win_count(&app) {
+            set_visible(&mut app, w, false);
+        }
         frame(&mut app, &ctx, vec![]);
         let kick = app.rack[0].files[0].path.clone();
         let a = app.ensure_asset(std::path::Path::new(&kick)).unwrap() as u32;
@@ -67781,7 +67820,11 @@ mod tests {
         app.select_one((0, 0, 0));
         frame(&mut app, &ctx, vec![]);
         let g = painted_text_rect(&ctx, &mut app, "gain").expect("gain slider painted");
-        let texts = hover_until_tip(&mut app, &ctx, g.center(), &["own gain in dB"]);
+        // `Slider::text()` paints the label at the RIGHT end of the rail:
+        // the interactive rect sits LEFT of the label galley (DIAG D5f —
+        // the tip only appears left of `g.min`).
+        let gp = egui::pos2(g.min.x - 30.0, g.center().y);
+        let texts = hover_until_tip(&mut app, &ctx, gp, &["own gain in dB"]);
         let tip = texts
             .iter()
             .map(|t| t.replace('\n', " "))
@@ -67848,10 +67891,12 @@ mod tests {
         let ctx = egui::Context::default();
         clear_canvas(&mut app);
         frame(&mut app, &ctx, vec![]);
-        // Empty canvas: any lane point opens the ELSE-branch menu.
+        // Empty canvas: a BARE right-click on a lane point opens the
+        // ELSE-branch menu. (A preceding left-click at the same point eats
+        // the menu on the test clock — DIAG4 11-26; use the bare gesture,
+        // which is also what the v0.15 doctrine describes.)
         let top0 = app.grid_anchor - app.vscroll;
         let p = egui::pos2(900.0, top0 + app.track_h(0) * 0.5);
-        click_pt(&mut app, &ctx, p);
         rmb(&mut app, &ctx, p);
         let g = painted_text_rect(&ctx, &mut app, "Select all clips")
             .expect("menu lists Select all clips");
