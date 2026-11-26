@@ -64,6 +64,7 @@ pub(crate) mod mcp_windows;
 /// line ahead of the tests seam truncates the seam tests' `code_lines()`
 /// view of this file's production region (v173 CI lesson).
 mod coverage_audit;
+mod design_audit;
 
 /// Keys a user may plausibly bind to a shortcut.
 /// v108: Home/End joined this list — SHORTCUT_DEFAULTS has bound them since
@@ -5178,6 +5179,8 @@ impl App {
 
     /// Compile/load every script in the folder again and refresh all rows.
     fn rescan_fx(&mut self) {
+        let was_ok = self.fx_registry.stems().len();
+        let was_bad = self.fx_registry.items().iter().filter(|e| e.error.is_some()).count();
         self.fx_registry.rescan();
         self.prune_dead_script_rows();
         let ok = self.fx_registry.stems().len();
@@ -5188,6 +5191,16 @@ impl App {
             .filter(|e| e.error.is_some())
             .count();
         self.fx_note = format!("{ok} valid effect(s), {bad} rejected");
+        // v176 (ts-027 echo gap): the verdict must also reach the status
+        // bar — fx_note only renders inside the chain window, so a rescan
+        // was silent everywhere else (v76 R1d doctrine, mirroring
+        // vst_rescan). The user question is WHAT CHANGED: (valid,
+        // rejected) before vs after.
+        self.status = if (ok, bad) == (was_ok, was_bad) {
+            format!("effects rescanned \u{2014} unchanged: {ok} valid, {bad} rejected")
+        } else {
+            format!("effects rescanned: {ok} valid, {bad} rejected (was {was_ok} valid, {was_bad} rejected)")
+        };
     }
 
     // ---- grid maths ------------------------------------------------------
@@ -24819,7 +24832,7 @@ fn rack_file_row(
             }
         }
         if ui
-            .button(RichText::new("delete file").color(Color32::from_rgb(255, 120, 120)))
+            .button(RichText::new("delete file").color(crate::kit::DESTROY))
             .on_hover_text("Removes every clip using this asset AND deletes the file on disk")
             .clicked()
         {
@@ -24843,6 +24856,23 @@ fn rack_file_row(
     ));
 }
 
+/// v176 (TS-028): the ONE rack kind-color home. The badge painter
+/// (rack_kind_badge) and the rack_body section headers each hand-wrote
+/// this palette as forked literals. MIDI borrows the accent; AUTO/AUDIO/
+/// PROJ carry data meaning (the automation red matches automation clips
+/// on the grid per v0.11 R5; project violet / audio tan) — data palette,
+/// single home with the owner, per the kit.rs module rule. The AUTO red
+/// is numerically the same as kit::DESTROY but means something else:
+/// kind identity vs "this button deletes" — do not merge.
+fn rack_kind_color(kind: u8) -> Color32 {
+    match kind {
+        1 => crate::kit::ACCENT,
+        2 => Color32::from_rgb(255, 120, 120),
+        3 => Color32::from_rgb(190, 150, 255),
+        _ => Color32::from_rgb(210, 175, 120),
+    }
+}
+
 /// Tiny right-aligned kind badge drawn inside an asset row: amber
 /// "AUDIO" / blue "MIDI" (the same blue the MREC button uses, so MIDI
 /// assets read as MIDI everywhere). Painted into the row rect after the
@@ -24850,13 +24880,14 @@ fn rack_file_row(
 fn rack_kind_badge(ui: &mut egui::Ui, row: egui::Rect, kind: u8) {
     // v0.11 R5: automation is the third kind and wears red, matching its
     // red clips on the grid.
-    let (txt, col) = match kind {
-        1 => ("MIDI", crate::kit::ACCENT),
-        2 => ("AUTO", Color32::from_rgb(255, 120, 120)),
+    let txt = match kind {
+        1 => "MIDI",
+        2 => "AUTO",
         // v50 R6: saved project rows in the rack.
-        3 => ("PROJ", Color32::from_rgb(190, 150, 255)),
-        _ => ("AUDIO", Color32::from_rgb(210, 175, 120)),
+        3 => "PROJ",
+        _ => "AUDIO",
     };
+    let col = rack_kind_color(kind);
     ui.painter().text(
         egui::pos2(row.max.x - 5.0, row.center().y),
         egui::Align2::RIGHT_CENTER,
@@ -25369,7 +25400,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                         && !key_tail.starts_with('#')
                                         && ui
                                             .button(RichText::new("delete folder").color(
-                                                Color32::from_rgb(255, 120, 120),
+                                                crate::kit::DESTROY,
                                             ))
                                             .on_hover_text(
                                                 "Delete this sub-folder \u{2014} only when it \
@@ -25494,11 +25525,15 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 if entries.is_empty() {
                                     continue;
                                 }
-                                let (label, col) = match kind {
-                                    1 => ("MIDI", crate::kit::ACCENT),
-                                    2 => ("AUTOMATION", Color32::from_rgb(255, 120, 120)),
-                                    _ => ("audio", Color32::from_rgb(210, 175, 120)),
+                                // v176: color comes from the single
+                                // rack_kind_color home; only the label
+                                // wording is section-local.
+                                let label = match kind {
+                                    1 => "MIDI",
+                                    2 => "AUTOMATION",
+                                    _ => "audio",
                                 };
+                                let col = rack_kind_color(kind);
                                 ui.label(RichText::new(label).weak().small().color(col));
                                 let roots: Vec<&RackFile> =
                                     entries.iter().cloned().filter(|r| r.dir.is_empty()).collect();
@@ -25802,7 +25837,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     }
                                     if ui
                                         .button(RichText::new("delete file").color(
-                                            Color32::from_rgb(255, 120, 120),
+                                            crate::kit::DESTROY,
                                         ))
                                         .on_hover_text(
                                             "permanently remove this file \u{b7} clips using it go silent",
@@ -25840,7 +25875,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                             RichText::new("projects")
                                 .weak()
                                 .small()
-                                .color(Color32::from_rgb(190, 150, 255)),
+                                .color(rack_kind_color(3)),
                         );
                         for (name, pth) in projs.iter().take(32) {
                             let cur = *name == app.proj_name;
@@ -26276,7 +26311,7 @@ fn paint_trace_points(
             if yc < y - 1.5 {
                 mesh.add_colored_rect(
                     egui::Rect::from_min_max(egui::pos2(x, yc - 1.2), egui::pos2(x1, yc)),
-                    Color32::from_rgb(220, 220, 220),
+                    crate::kit::SPEC_TRACE,
                 );
             }
         }
@@ -26297,7 +26332,7 @@ fn paint_trace_line(
     y_of: &dyn Fn(f32) -> f32,
 ) {
     bezier_curve(p, rect, coldb, 1.6, |a, b| spec_color((a + b) * 0.5), y_of);
-    bezier_curve(p, rect, colpk, 1.0, |_a, _b| Color32::from_rgb(220, 220, 220), y_of);
+    bezier_curve(p, rect, colpk, 1.0, |_a, _b| crate::kit::SPEC_TRACE, y_of);
 }
 
 /// v163: stroke one Catmull-Rom-smooth curve through `vals` (uniformly
@@ -53824,6 +53859,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// v176 (ts-028): rescan_fx must echo its verdict into the STATUS BAR
+    /// — the chain window's fx_note alone is not an echo (v76 R1d /
+    /// vst_rescan doctrine). Both polarities: unchanged count, and a
+    /// changed count carrying the previous number.
+    #[test]
+    fn v176_rescan_fx_status_echo() {
+        let mut app = headless_app("v176-rescan-echo");
+        app.rescan_fx();
+        let n = app.fx_registry.stems().len();
+        assert!(
+            app.status.contains(&format!(
+                "effects rescanned \u{2014} unchanged: {n} valid"
+            )),
+            "unchanged rescan must echo the count in the status bar: {:?}",
+            app.status
+        );
+        // Second polarity WITHOUT any compile cost: a garbage script lands
+        // as a REJECTION (seed_api re-seeds renamed bundled files, so
+        // removal cannot change the counts — a rejected script can).
+        // The changed verdict must carry BOTH previous counts.
+        let dir = std::path::PathBuf::from(&app.fx_dir_edit);
+        let junk = dir.join("zz-v176-broken.rs");
+        std::fs::write(&junk, "// not a slooper effect\nfn broken(\n").unwrap();
+        app.rescan_fx();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(
+                app.status.contains(&format!(
+                    "effects rescanned: {n} valid, 1 rejected (was {n} valid, 0 rejected)"
+                )),
+                "count-change echo must carry the previous counts: {:?}",
+                app.status
+            );
+        }));
+        std::fs::remove_file(&junk).unwrap();
+        res.unwrap_or_else(|e| std::panic::resume_unwind(e));
+    }
+
+    /// v176 (ts-028): the rack kind palette has ONE home
+    /// (rack_kind_color) and the rack's destructive labels paint with
+    /// kit::DESTROY — a re-forked badge/header/delete color fails here.
+    /// Scan window = [rack_file_row (first rack renderer) .. end of
+    /// rack_body]; needles
+    /// are concat!-split and this pin lives in `mod tests` (below the
+    /// window cut), so it can never match its own literals.
+    #[test]
+    fn v176_rack_kind_home_single() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\n    mod tests").unwrap_or(srcs.len())];
+        let home_at = prod
+            .find("fn rack_kind_color")
+            .expect("v176 kind-color home missing");
+        let body_at = home_at + prod[home_at..].find('{').unwrap();
+        let body_end = body_at + prod[body_at..].find("\n}").unwrap();
+        let rack_start = prod
+            .find("fn rack_file_row")
+            .expect("rack_file_row missing")
+            .min(home_at);
+        let rack_body_at = prod.find("fn rack_body").expect("rack_body missing");
+        let rack_end = rack_body_at + prod[rack_body_at..].find("\nfn ").unwrap_or(0);
+        let home = &prod[body_at..body_end];
+        // Count CODE only: doc/prose mentions of the token must not
+        // inflate the usage count.
+        let rack: String = prod[rack_start..rack_end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let red = concat!("from_rgb(255, ", "120, 120)");
+        let violet = concat!("from_rgb(19", "0, 150, 255)");
+        let tan = concat!("from_rgb(2", "10, 175, 120)");
+        for n in [&red, &violet, &tan] {
+            assert_eq!(home.matches(n).count(), 1, "home must carry {n} once");
+            assert_eq!(rack.matches(n).count(), 1, "{n} forked inside the rack again");
+        }
+        assert_eq!(
+            rack.matches("rack_kind_color(").count(),
+            4,
+            "def + badge + section header + projects label must share the home"
+        );
+        assert_eq!(
+            rack.matches("kit::DESTROY").count(),
+            3,
+            "both delete-file buttons + delete-folder must use kit::DESTROY"
+        );
     }
 
     /// Goal 1 as a machine-checked invariant: every button whose label

@@ -1157,32 +1157,6 @@ impl FxEditor {
         }
     }
 
-    /// Apply a preset to the live instance. Params match by label first,
-    /// then by declaration order (hand-written files stay usable). Values
-    /// clamp to the declared ranges; every ride also lands in `pending` so
-    /// the main window persists the chain row.
-    /// Apply (label, value) pairs by LABEL (unknown labels skipped) and
-    /// ride them into the running chain — the loader used by built-in
-    /// default presets. Clamping matches `load_user_preset`.
-    pub fn apply_labeled(&mut self, pairs: &[(&str, f32)]) -> usize {
-        let mut applied = 0usize;
-        for (label, v) in pairs {
-            if let Some((k, p)) = self
-                .desc
-                .params
-                .iter()
-                .enumerate()
-                .find(|(_, p)| p.label == *label)
-            {
-                let v = v.clamp(p.min.min(p.max), p.max.max(p.min));
-                self.inst.set_param(k, v);
-                self.pending.push((k, v));
-                applied += 1;
-            }
-        }
-        applied
-    }
-
     pub fn load_user_preset(&mut self, name: &str) {
         let path = fx::user_preset_path(&self.fx_dir, &self.stem, name);
         let pairs = match std::fs::read_to_string(&path)

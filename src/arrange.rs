@@ -351,20 +351,10 @@ impl Arrangement {
         Some(tr.lanes[to].clips.len() - 1)
     }
 
-    /// v29: move clip `(t, lane, c)` to another track, keeping its
-    /// lane slot (target lanes grow to reach it). Returns `(lane, idx)`.
-    pub fn move_clip_track(
-        &mut self,
-        t: usize,
-        lane: usize,
-        c: usize,
-        to_t: usize,
-    ) -> Option<(usize, usize)> {
-        self.move_clip_to(t, lane, c, to_t, None)
-    }
-
-    /// v34 R17: like [`Arrangement::move_clip_track`] with an EXPLICIT
-    /// destination lane (`None` = keep the lane slot). The pointer decides
+    /// v34 R17: move clip `(t, lane, c)` to another track with an EXPLICIT
+    /// destination lane (`None` = keep the lane slot; the v29
+    /// keep-lane-slot `move_clip_track` wrapper was dead code by v145's
+    /// group-drag rework and retired in v176). The pointer decides
     /// the lane while dragging, and the right-click menu lists every
     /// parent/child lane — the user picks where the clip lands, not the
     /// collision logic.

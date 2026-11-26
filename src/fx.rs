@@ -1172,13 +1172,6 @@ impl Instance {
         self.fns.process_st.is_some()
     }
 
-    /// Tier-6: true when this script wants block-rate transport pushes
-    /// (ABI v4 with a `set_sync` export).
-    #[inline]
-    pub fn wants_sync(&self) -> bool {
-        self.fns.set_sync.is_some()
-    }
-
     /// Tier-6: push the block-start transport snapshot. Call ONCE per
     /// audio block per instance, BEFORE any process call of that block,
     /// from the thread that owns the instance (RT for live chains, the
@@ -1446,11 +1439,6 @@ impl Registry {
 
     pub fn desc(&self, stem: &str) -> Option<&EffectDesc> {
         self.find(stem).and_then(|e| e.desc.as_ref())
-    }
-
-    /// True when the folder holds a script with this stem (any state).
-    pub fn has_file(&self, stem: &str) -> bool {
-        self.items.iter().any(|e| e.stem == stem)
     }
 
     pub fn has_template(&self) -> bool {
