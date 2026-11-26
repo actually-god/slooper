@@ -24831,7 +24831,7 @@ fn rack_file_row(
             }
         }
         if ui
-            .button(RichText::new("delete file").color(Color32::from_rgb(255, 120, 120)))
+            .button(RichText::new("delete file").color(crate::kit::DESTROY))
             .on_hover_text("Removes every clip using this asset AND deletes the file on disk")
             .clicked()
         {
@@ -24855,6 +24855,23 @@ fn rack_file_row(
     ));
 }
 
+/// v176 (TS-028): the ONE rack kind-color home. The badge painter
+/// (rack_kind_badge) and the rack_body section headers each hand-wrote
+/// this palette as forked literals. MIDI borrows the accent; AUTO/AUDIO/
+/// PROJ carry data meaning (the automation red matches automation clips
+/// on the grid per v0.11 R5; project violet / audio tan) — data palette,
+/// single home with the owner, per the kit.rs module rule. The AUTO red
+/// is numerically the same as kit::DESTROY but means something else:
+/// kind identity vs "this button deletes" — do not merge.
+fn rack_kind_color(kind: u8) -> Color32 {
+    match kind {
+        1 => crate::kit::ACCENT,
+        2 => Color32::from_rgb(255, 120, 120),
+        3 => Color32::from_rgb(190, 150, 255),
+        _ => Color32::from_rgb(210, 175, 120),
+    }
+}
+
 /// Tiny right-aligned kind badge drawn inside an asset row: amber
 /// "AUDIO" / blue "MIDI" (the same blue the MREC button uses, so MIDI
 /// assets read as MIDI everywhere). Painted into the row rect after the
@@ -24862,13 +24879,14 @@ fn rack_file_row(
 fn rack_kind_badge(ui: &mut egui::Ui, row: egui::Rect, kind: u8) {
     // v0.11 R5: automation is the third kind and wears red, matching its
     // red clips on the grid.
-    let (txt, col) = match kind {
-        1 => ("MIDI", crate::kit::ACCENT),
-        2 => ("AUTO", Color32::from_rgb(255, 120, 120)),
+    let txt = match kind {
+        1 => "MIDI",
+        2 => "AUTO",
         // v50 R6: saved project rows in the rack.
-        3 => ("PROJ", Color32::from_rgb(190, 150, 255)),
-        _ => ("AUDIO", Color32::from_rgb(210, 175, 120)),
+        3 => "PROJ",
+        _ => "AUDIO",
     };
+    let col = rack_kind_color(kind);
     ui.painter().text(
         egui::pos2(row.max.x - 5.0, row.center().y),
         egui::Align2::RIGHT_CENTER,
@@ -25381,7 +25399,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                         && !key_tail.starts_with('#')
                                         && ui
                                             .button(RichText::new("delete folder").color(
-                                                Color32::from_rgb(255, 120, 120),
+                                                crate::kit::DESTROY,
                                             ))
                                             .on_hover_text(
                                                 "Delete this sub-folder \u{2014} only when it \
@@ -25506,11 +25524,15 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 if entries.is_empty() {
                                     continue;
                                 }
-                                let (label, col) = match kind {
-                                    1 => ("MIDI", crate::kit::ACCENT),
-                                    2 => ("AUTOMATION", Color32::from_rgb(255, 120, 120)),
-                                    _ => ("audio", Color32::from_rgb(210, 175, 120)),
+                                // v176: color comes from the single
+                                // rack_kind_color home; only the label
+                                // wording is section-local.
+                                let label = match kind {
+                                    1 => "MIDI",
+                                    2 => "AUTOMATION",
+                                    _ => "audio",
                                 };
+                                let col = rack_kind_color(kind);
                                 ui.label(RichText::new(label).weak().small().color(col));
                                 let roots: Vec<&RackFile> =
                                     entries.iter().cloned().filter(|r| r.dir.is_empty()).collect();
@@ -25814,7 +25836,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                     }
                                     if ui
                                         .button(RichText::new("delete file").color(
-                                            Color32::from_rgb(255, 120, 120),
+                                            crate::kit::DESTROY,
                                         ))
                                         .on_hover_text(
                                             "permanently remove this file \u{b7} clips using it go silent",
@@ -25852,7 +25874,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                             RichText::new("projects")
                                 .weak()
                                 .small()
-                                .color(Color32::from_rgb(190, 150, 255)),
+                                .color(rack_kind_color(3)),
                         );
                         for (name, pth) in projs.iter().take(32) {
                             let cur = *name == app.proj_name;
@@ -26288,7 +26310,7 @@ fn paint_trace_points(
             if yc < y - 1.5 {
                 mesh.add_colored_rect(
                     egui::Rect::from_min_max(egui::pos2(x, yc - 1.2), egui::pos2(x1, yc)),
-                    Color32::from_rgb(220, 220, 220),
+                    crate::kit::SPEC_TRACE,
                 );
             }
         }
@@ -26309,7 +26331,7 @@ fn paint_trace_line(
     y_of: &dyn Fn(f32) -> f32,
 ) {
     bezier_curve(p, rect, coldb, 1.6, |a, b| spec_color((a + b) * 0.5), y_of);
-    bezier_curve(p, rect, colpk, 1.0, |_a, _b| Color32::from_rgb(220, 220, 220), y_of);
+    bezier_curve(p, rect, colpk, 1.0, |_a, _b| crate::kit::SPEC_TRACE, y_of);
 }
 
 /// v163: stroke one Catmull-Rom-smooth curve through `vals` (uniformly
@@ -53873,6 +53895,44 @@ mod tests {
         }));
         std::fs::remove_file(&junk).unwrap();
         let _ = res.unwrap_or_else(|e| std::panic::resume_unwind(e));
+    }
+
+    /// v176 (ts-028): the rack kind palette has ONE home
+    /// (rack_kind_color) and the rack's destructive labels paint with
+    /// kit::DESTROY — a re-forked badge/header/delete color fails here.
+    /// Scan window = [rack_kind_color home .. end of rack_body]; needles
+    /// are concat!-split and this pin lives in `mod tests` (below the
+    /// window cut), so it can never match its own literals.
+    #[test]
+    fn v176_rack_kind_home_single() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\n    mod tests").unwrap_or(srcs.len())];
+        let home_at = prod
+            .find("fn rack_kind_color")
+            .expect("v176 kind-color home missing");
+        let body_at = home_at + prod[home_at..].find('{').unwrap();
+        let body_end = body_at + prod[body_at..].find("\n}").unwrap();
+        let rack_body_at = prod.find("fn rack_body").expect("rack_body missing");
+        let rack_end = rack_body_at + prod[rack_body_at..].find("\nfn ").unwrap_or(0);
+        let home = &prod[body_at..body_end];
+        let rack = &prod[home_at..rack_end];
+        let red = concat!("from_rgb(255, ", "120, 120)");
+        let violet = concat!("from_rgb(19", "0, 150, 255)");
+        let tan = concat!("from_rgb(2", "10, 175, 120)");
+        for n in [&red, &violet, &tan] {
+            assert_eq!(home.matches(n).count(), 1, "home must carry {n} once");
+            assert_eq!(rack.matches(n).count(), 1, "{n} forked inside the rack again");
+        }
+        assert_eq!(
+            rack.matches("rack_kind_color(").count(),
+            4,
+            "def + badge + section header + projects label must share the home"
+        );
+        assert_eq!(
+            rack.matches("kit::DESTROY").count(),
+            3,
+            "both delete-file buttons + delete-folder must use kit::DESTROY"
+        );
     }
 
     /// Goal 1 as a machine-checked invariant: every button whose label

@@ -41,6 +41,15 @@ pub(crate) const MUTED: Color32 = Color32::from_gray(110);
 /// Frozen at the historical chain-window error red; a local `from_rgb`
 /// for error text is a drift bug, import this instead.
 pub(crate) const DANGER: Color32 = Color32::from_rgb(220, 120, 120);
+/// v176 (TS-028): the ONE destructive-action label red — button labels
+/// that name an irreversible deletion ("delete file", "Delete"). Distinct
+/// from `DANGER` (which reads "this thing is broken/bypassed"): DESTROY
+/// marks "this button WILL remove something". Frozen at the rack's
+/// historical (255,120,120) — zero visual drift when a surface adopts it.
+/// Note the rack's AUTO kind-badge red coincides numerically but carries
+/// the automation-CLIP identity (data palette, rack_kind_color home) —
+/// do not "unify" them.
+pub(crate) const DESTROY: Color32 = Color32::from_rgb(255, 120, 120);
 
 /// v174 (TS-020): the indicator lamps of the mixer/master/monitor family,
 /// frozen at the historical literals byte-for-byte — REC armed/idle button
@@ -69,6 +78,10 @@ pub(crate) const METER_HOLD: Color32 = Color32::from_rgb(130, 130, 138);
 pub(crate) const SPEC_BG: Color32 = Color32::from_rgb(24, 24, 29);
 pub(crate) const SPEC_GRID: Color32 = Color32::from_rgb(58, 58, 66);
 pub(crate) const SPEC_TXT: Color32 = Color32::from_rgb(120, 120, 128);
+/// v176 (TS-028): the measured-trace overlay line in the MASTER OUT
+/// spectrum panel (paint_trace_points / paint_trace_line). v174 swept
+/// this painter's chrome but missed the trace color itself.
+pub(crate) const SPEC_TRACE: Color32 = Color32::from_rgb(220, 220, 220);
 
 /// Theme-resolved kit chrome for the bridge widgets. Dark mode returns
 /// the historical constants byte-for-byte (pins freeze them); light mode
@@ -318,6 +331,15 @@ mod tests {
         // hand-wrote before v80 (zero visual drift); local error-reds
         // are pinned-out by v80_chain_chrome_kit_only.
         assert_eq!(DANGER, Color32::from_rgb(220, 120, 120));
+    }
+
+    #[test]
+    fn v176_kit_destroy_trace_tokens_frozen() {
+        // v176 (TS-028): DESTROY frozen at the rack's pre-v176 delete-
+        // label red, SPEC_TRACE at the pre-v174 trace line — adopting a
+        // surface must not change a single pixel.
+        assert_eq!(DESTROY, Color32::from_rgb(255, 120, 120));
+        assert_eq!(SPEC_TRACE, Color32::from_rgb(220, 220, 220));
     }
 
     #[test]
