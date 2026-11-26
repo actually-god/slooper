@@ -27,6 +27,12 @@ eframe = { version = "0.36.2", default-features = false, features = [
     "x11",
 ] }
 egui = "0.36"
+# v172 (edo-3): validate user EDO font packs with the EXACT parser egui
+# itself parses FontData with (epaint 0.36 → skrifa::FontRef::from_index,
+# which PANICS on failure — fonts.rs:990). Same version already in the
+# lock via epaint, so this adds no build cost; a pack the scanner accepts
+# structurally cannot panic the font atlas.
+skrifa = "0.44"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Only used to decode the bundled application icon (assets/icon.png).
