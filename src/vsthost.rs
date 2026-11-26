@@ -7827,4 +7827,78 @@ mod tests {
         let obs = v165_midi_state(&save).expect("observer block parses");
         assert_eq!(obs, [0i32; 13], "fresh instance has observed nothing");
     }
+
+    // ---- v167 (card t_879a77ef): hosted drawn-curve carrier ----
+
+    /// "As far as they want" on the hosted path: a +-24 st drawn curve on
+    /// a track with the UI bend range at 2 must AUTO-WIDEN the announced
+    /// RPN0 range to 24, reach the top AND bottom of the widened wheel,
+    /// land MID-WHEEL mid-sweep (no clamp — the roll law walls at +-12 st
+    /// and must never touch the curve), and re-burst only on change.
+    #[test]
+    fn v167_curve_hosted_full_range() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let dir = w6_temp_dir("v167full");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let load = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("{file} opens: {e}"));
+        let e = &load.entry;
+        e.set_bend_range(2);
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        assert_eq!(rt.v2_probe(9000), 0, "fresh instance has seen no CC6 yet");
+        let inp = vec![0.0f32; 1024]; // two VST_BLOCKs
+        let mut outp = vec![0.0f32; 1024];
+        // +24 st curve event (direct currency, ch2).
+        e.process_with_midi(&inp, &mut outp, &[(16, crate::audio::curve_wire(2, 24.0))]);
+        assert_eq!(rt.v2_probe(9000), 2, "eager ch0 burst + auto-widened ch2 burst");
+        assert_eq!(rt.v2_probe(9001), 24, "RPN0 AUTO-WIDENED to the full curve range");
+        assert_eq!(rt.v2_probe(9003), 16384, "+24 st hits the widened wheel top (+1-coded)");
+        // Mid-sweep on the SAME channel: no re-burst, exact mid-wheel —
+        // a ±12 st roll-law clamp would pin this at the top (16384).
+        e.process_with_midi(&inp, &mut outp, &[(8, crate::audio::curve_wire(2, 12.0))]);
+        assert_eq!(rt.v2_probe(9000), 2, "no RPN0 re-burst inside the same range");
+        assert_eq!(
+            rt.v2_probe(9003),
+            8192 + 4096 + 1,
+            "+12 st lands EXACTLY half-deflected on the +-24 wheel, no clamp"
+        );
+        // Bottom: -24 st reaches the floor.
+        e.process_with_midi(&inp, &mut outp, &[(8, crate::audio::curve_wire(2, -24.0))]);
+        assert_eq!(rt.v2_probe(9003), 2, "-24 st reaches the wheel bottom (+1-coded)");
+        assert_eq!(e.midi_drops(), 0, "bursts never overflow the queue");
+    }
+
+    /// The other polarity: NO curve = the v103 law untouched — roll-space
+    /// bends keep the UI range (no spurious widen) and the rescale law.
+    #[test]
+    fn v167_curve_hosted_no_spurious_widen() {
+        let file = if cfg!(windows) { "w6-vst2.dll" } else { "w6-vst2.so" };
+        let dir = w6_temp_dir("v167roll");
+        let fixture = dir.join(file);
+        std::fs::copy(w6_fixture(file), &fixture).unwrap();
+        let load = open(&fixture, VstKind::V2, 48_000, None)
+            .unwrap_or_else(|e| panic!("{file} opens: {e}"));
+        let e = &load.entry;
+        e.set_bend_range(5);
+        let rt = e.as_any().downcast_ref::<RtStageEntry>().expect("RtStageEntry");
+        let inp = vec![0.0f32; 1024];
+        let mut outp = vec![0.0f32; 1024];
+        // +3 st roll-space bend, exactly as a staged kind-5 lane event.
+        let raw = 10240u16;
+        let msg = crate::audio::midi3_raw(5, 2, (raw & 0x7F) as u8, ((raw >> 7) & 0x7F) as u8);
+        assert_eq!(msg[2] & 0x80, 0, "lane wire bytes never carry the marker");
+        e.process_with_midi(&inp, &mut outp, &[(16, msg)]);
+        assert_eq!(rt.v2_probe(9000), 2, "eager ch0 + reactive ch2 bursts");
+        assert_eq!(rt.v2_probe(9001), 5, "range stays the UI value — nothing widened");
+        assert_eq!(
+            rt.v2_probe(9003),
+            bend_rescale(raw, 5) as isize + 1,
+            "v103 roll rescale law intact"
+        );
+        // Same channel again: no re-burst (v103 behavior preserved).
+        e.process_with_midi(&inp, &mut outp, &[(8, msg)]);
+        assert_eq!(rt.v2_probe(9000), 2, "no RPN0 re-burst per bend");
+        assert_eq!(e.midi_drops(), 0);
+    }
 }

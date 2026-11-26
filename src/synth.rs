@@ -3202,4 +3202,242 @@ pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
         assert_eq!(host_tune_key(84), 3.0); // one EDO octave = +12 st
         crate::tune::set(back.0, back.1);
     }
+
+    // ---- v167 (card t_879a77ef): "as far and as fast as they want" ----
+
+    /// v101 harness shape, ±2-octave dome: (-12 st) -> (+24 st) -> (-12 st)
+    /// across the note. The MID window sits on the +24 st peak — a carrier
+    /// that clamps at ±12 st (the retired roll law) tops out at 2x here,
+    /// the unclamped curve must approach 4x.
+    fn v167_2oct_render(
+        reg: &crate::synth::Registry,
+        synth: &str,
+        note: u8,
+        curved: bool,
+    ) -> Vec<f32> {
+        let mut pat = crate::midipat::Pattern::new(120);
+        if curved {
+            pat.note_bends.push(crate::midipat::NoteBend::new(vec![
+                (0.0, -1200.0),
+                (0.5, 2400.0),
+                (1.0, -1200.0),
+            ]));
+        }
+        pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note,
+            vel: 110,
+            press: 0,
+            start: 0,
+            len: 960,
+            bend: if curved { Some(0) } else { None },
+        });
+        pat.bake_bends();
+        assert!(pat.bends.is_empty(), "owned curves never re-enter the audible lane");
+        let inst = reg
+            .create_instance(
+                synth,
+                48_000.0,
+                if synth == "sampler" { &[0.0, 48.0, 1.0] } else { &[] },
+            )
+            .expect("scripted instance");
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, note, 110u8)];
+        if curved {
+            ev.extend(crate::audio::pattern_curve_events(&pat, 48_000));
+        }
+        ev.push((47_000, 0, 0, note, 0));
+        let mut out = vec![0f32; 48_000];
+        crate::audio::render_midi_events(&inst, &mut ev, 0, out.len(), &mut out);
+        out
+    }
+
+    #[test]
+    fn v167_curve_2oct_sampler() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let sine: Arc<[f32]> = (0..96_000)
+            .map(|i| (i as f64 * std::f64::consts::TAU * 200.0 / 48_000.0).sin() as f32 * 0.5)
+            .collect();
+        set_host_assets(Arc::new(vec![sine]), 48_000);
+        let flat = v167_2oct_render(&reg, "sampler", 48, false);
+        let curve = v167_2oct_render(&reg, "sampler", 48, true);
+        assert_ne!(flat, curve);
+        let win = |x: &[f32], a: usize, b: usize| v100_cycles(&x[a..b]) as f64;
+        // MID (t .40-.60): +24 st peak -> ~4x flat (roll-law clamp fails at 2x).
+        let (mf, mc) = (win(&flat, 19_200, 28_800), win(&curve, 19_200, 28_800));
+        // END (t .80-1.0): back at -12 st -> below flat.
+        let (ef, ec) = (win(&flat, 38_400, 48_000), win(&curve, 38_400, 48_000));
+        eprintln!(
+            "v167 2oct sampler: mid {mf} -> {mc} ({:.3}x), end {ef} -> {ec} ({:.3}x)",
+            mc / mf,
+            ec / ef
+        );
+        assert!(mf >= 30.0, "flat control must carry cycles: {mf}");
+        assert!(mc / mf > 3.4, "MID must climb toward 4x (±24 st): got {:.3}", mc / mf);
+        assert!(mc / mf < 4.8, "MID cannot overshoot 4x: got {:.3}", mc / mf);
+        assert!(ec / ef < 0.85, "END must fall below flat: got {:.3}", ec / ef);
+    }
+
+    #[test]
+    fn v167_curve_2oct_piano() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let flat = v167_2oct_render(&reg, "piano", 57, false);
+        let curve = v167_2oct_render(&reg, "piano", 57, true);
+        assert_ne!(flat, curve, "±2 st curve never reached the bundled piano");
+        let win = |x: &[f32], a: usize, b: usize| v100_cycles(&x[a..b]) as f64;
+        let (mf, mc) = (win(&flat, 19_200, 28_800), win(&curve, 19_200, 28_800));
+        eprintln!("v167 2oct piano: mid {mf} -> {mc} ({:.3}x)", mc / mf);
+        assert!(mf >= 20.0, "piano must sound in the measure window: {mf}");
+        assert!(mc / mf > 3.2, "curve must bend the piano fully 2 octaves: got {:.3}", mc / mf);
+    }
+
+    /// "AS FAST as they want": a full 0 -> +2400¢ sweep inside the first
+    /// 100 ms of the note, then hold. Consecutive 50 ms windows INSIDE the
+    /// ramp must climb in the ideal-sweep ladder (avg 2^u: A≈1.44x, B≈2.89x)
+    /// and the hold window must sit near 4x — a ±12 st clamp flattens the
+    /// B/A ratio (~1.05x) and the hold (2x), failing both assertions.
+    #[test]
+    fn v167_curve_fast_ramp_tracks() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        let sine: Arc<[f32]> = (0..96_000)
+            .map(|i| (i as f64 * std::f64::consts::TAU * 200.0 / 48_000.0).sin() as f32 * 0.5)
+            .collect();
+        set_host_assets(Arc::new(vec![sine]), 48_000);
+        let mut pat = crate::midipat::Pattern::new(120);
+        pat.note_bends.push(crate::midipat::NoteBend::new(vec![
+            (0.0, 0.0),
+            (0.1, 2400.0),
+            (1.0, 2400.0),
+        ]));
+        pat.notes.push(crate::midipat::Note {
+            ch: 0,
+            note: 48,
+            vel: 110,
+            press: 0,
+            start: 0,
+            len: 960,
+            bend: Some(0),
+        });
+        let inst = reg
+            .create_instance("sampler", 48_000.0, &[0.0, 48.0, 1.0])
+            .expect("sampler");
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0u64, 3u8, 0u8, 48, 110u8)];
+        ev.extend(crate::audio::pattern_curve_events(&pat, 48_000));
+        let mut out = vec![0f32; 48_000];
+        crate::audio::render_midi_events(&inst, &mut ev, 0, 48_000, &mut out);
+        let flat = v167_2oct_render(&reg, "sampler", 48, false);
+        let win = |x: &[f32], a: usize, b: usize| v100_cycles(&x[a..b]) as f64;
+        let (a, b, c) = (win(&out, 0, 2400), win(&out, 2400, 4800), win(&out, 19_200, 21_600));
+        let f = |x: &[f32], r: std::ops::Range<usize>| win(x, r.start, r.end);
+        let flat_w = f(&flat, 19_200..21_600);
+        eprintln!(
+            "v167 fast ramp: A {a} B {b} C {c} (ideals ~1.44x 2.89x 4x); flat {flat_w} C/flat {:.3} B/A {:.3}",
+            c / flat_w.max(1.0),
+            b / a.max(1.0)
+        );
+        assert!(a >= 6.0 && b > a && c > b, "windows must climb inside the ramp: A{a} B{b} C{c}");
+        let ba = b / a.max(1.0);
+        assert!(ba > 1.6 && ba < 2.6, "B/A must track the ideal ~2.0 ladder ratio: {ba:.3}");
+        let cf = c / flat_w.max(1.0);
+        assert!(cf > 3.0, "hold sits near 4x — a ±12 st clamp gives 2x: {cf:.3}");
+    }
+
+    /// PROBE-SCRIPT pin: the recorder synth logs every bend() call it
+    /// receives (order, value) to a file — proving the full dispatch
+    /// (staging events → render_midi_events → apply_script_event → ABI
+    /// bend) delivers one call per moving sample with per-sample value
+    /// fidelity, unclamped to ±24 st. The retired 8-tick bake law would
+    /// log ~12 calls across the same window.
+    const V167_PROBE_REC: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+static CALLS: AtomicU64 = AtomicU64::new(0);
+extern "C" fn bd(_s: *mut c_void, _c: u8, st: f32) {
+    let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Ok(path) = std::env::var("V167_PROBE_OUT") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{} {:.6}", n, st);
+        }
+    }
+}
+extern "C" fn po(s: *mut c_void, out: *mut f32, n: usize, _p: *const f32) {
+    let _ = s;
+    let out = unsafe { core::slice::from_raw_parts_mut(out, n) };
+    for o in out.iter_mut() {
+        *o = 0.0;
+    }
+}
+pub static DESC: SynthInfoV1 = SynthInfoV1 {
+    abi: SLOOPER_SYNTH_ABI,
+    name: b"v167-probe-rec\0".as_ptr() as *const core::ffi::c_char,
+    author: core::ptr::null(),
+    description: core::ptr::null(),
+    n_params: 0, params: core::ptr::null(),
+    create: cr, destroy: de, note_on: no, note_off: nf, all_off: ao,
+    cc: cc, press: pr, process: po,
+};
+#[no_mangle]
+pub extern "C" fn slooper_synth_info() -> *const SynthInfoV1 { &DESC }
+static DESC_V2: SynthInfoV2 = SynthInfoV2 { abi: SLOOPER_SYNTH_ABI_V2, bend: bd };
+#[no_mangle]
+pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC_V2 }
+"#;
+
+    #[test]
+    #[ignore = "slow-tier: compiles a probe recorder synth with rustc (~10 s)"]
+    fn v167_curve_sample_accurate() {
+        if !crate::fx::rustc_available() {
+            return;
+        }
+        let reg = v51_registry();
+        std::fs::write(
+            reg.dir().join("v167_probe_rec.rs"),
+            format!("{V106_PROBE_HEAD}{V167_PROBE_REC}"),
+        )
+        .unwrap();
+        let logfile = std::env::temp_dir().join("v167-probe-calls.txt");
+        let _ = std::fs::remove_file(&logfile);
+        std::env::set_var("V167_PROBE_OUT", &logfile);
+        let reg = Registry::open(reg.dir().to_path_buf());
+        let inst = reg
+            .create_instance("v167_probe_rec", 48_000.0, &[])
+            .expect("probe instance");
+        // Full-span ramp 0 -> +2400 cents across 4800 samples (100 ms).
+        let nb = crate::midipat::NoteBend::new(vec![(0.0, 0.0), (1.0, 2400.0)]);
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![(0, 3, 0, 60, 110)];
+        crate::audio::note_curve_events(&nb, 0, 0, 4800, 0, u64::MAX, |s, ch, lo, hi| {
+            ev.push((s, crate::audio::KIND_CURVE, ch, lo, hi));
+        });
+        let mut audio = vec![0f32; 4800];
+        crate::audio::render_midi_events(&inst, &mut ev, 0, 4800, &mut audio);
+        std::env::remove_var("V167_PROBE_OUT");
+        let txt = std::fs::read_to_string(&logfile).expect("probe file");
+        let rows: Vec<(u64, f32)> = txt
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split(' ');
+                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+            })
+            .collect();
+        // One call per moving sample — a ramp moves EVERY sample: the
+        // "no zipper quantization" acceptance, at the callback itself.
+        assert_eq!(rows.len(), 4800, "bend() must fire on every moving sample");
+        assert_eq!(rows.first().unwrap().0, 1);
+        assert_eq!(rows.last().unwrap().0, 4800, "calls strictly ordered, no gaps");
+        // Per-sample value fidelity to the hand-derived linear law;
+        // tuple carrier quantum 0.001 st -> floor 5e-4.
+        for (i, (_n, st)) in rows.iter().enumerate() {
+            let ideal = 24.0 * (i as f32 / 4800.0);
+            assert!((st - ideal).abs() <= 1.1e-3, "call {i}: {st} vs {ideal}");
+        }
+        assert!(rows.last().unwrap().1 > 23.9, "bend reaches +23.99 st — UNCLAMPED");
+    }
 }

@@ -10756,4 +10756,100 @@ let desc = reg.desc("v80quarter").unwrap().clone();
         );
         crate::tune::set(back.0, back.1);
     }
+
+    // ---- v167 (card t_879a77ef): drawn-curve carrier laws ----
+
+    /// The hosted wire law, hand-derived (NOT copied from `curve_wire`):
+    /// standard MIDI 14-bit pair, offset-binary around 8192, 0.004 st
+    /// quantum, byte-2 bit-7 as the DIRECT-CURRENCY marker — plus the
+    /// collision polarity that keeps live wheel / hand-imported 0xE
+    /// bends on the untouched v103 roll law.
+    #[test]
+    fn v167_curve_wire_law() {
+        // Offset-binary center: 0 st = raw 8192 = (64 << 7) | 0.
+        assert_eq!(curve_wire(0, 0.0), [0xE0, 0x00, 0x40 | 0x80]);
+        // +24 st: q = 6000, raw = 14192 = (110 << 7) | 112.
+        assert_eq!(
+            curve_wire(0, 24.0),
+            [0xE0, 112, 110 | 0x80],
+            "up full scale, hand-derived"
+        );
+        // -24 st: q = -6000, raw = 2192 = (17 << 7) | 16.
+        assert_eq!(
+            curve_wire(0, -24.0),
+            [0xE0, 16, 17 | 0x80],
+            "down full scale, hand-derived (sign SURVIVES the wire)"
+        );
+        // Round-trip ladder; wire quantum 0.004 -> error <= 0.002; clamp
+        // at +-8191 units = +-32.764 st (covers the +-24 st curve bound).
+        for st in [
+            0.0f32, 0.004, -0.004, 0.1234, -0.1234, 12.34, -12.34, 23.996, 24.0, -24.0, 32.764,
+            -32.764, 100.0, -100.0,
+        ] {
+            let m = curve_wire(3, st);
+            assert_eq!(m[0], 0xE3, "status carries the channel");
+            assert_ne!(m[2] & 0x80, 0, "marker set on every curve wire byte");
+            let want = st.clamp(-32.764, 32.764);
+            let got = curve_wire_st(m);
+            assert!(
+                (got - want).abs() <= 0.0021,
+                "wire round-trip {st} -> {got}"
+            );
+        }
+        // Tuple -> wire -> decode (the staging dispatch): tuple quantum
+        // 0.001 st + wire quantum 0.004 st.
+        let ev = curve_ev(0, 5, 17.25);
+        let m = midi3_raw(7, 5, ev.3, ev.4);
+        assert_eq!(m[0], 0xE5);
+        assert!(
+            (curve_wire_st(m) - 17.25).abs() <= 0.004,
+            "tuple+wire compound quantization: {}",
+            curve_wire_st(m)
+        );
+        // Collision polarity: EVERY legacy writer masks byte 2 to 7 bits,
+        // so the marker can never arrive from wheel/lane/CC/AT traffic.
+        for d2 in 0u8..=255 {
+            assert_eq!(midi3_raw(5, 2, 0x7F, d2)[2] & 0x80, 0, "roll bend hi byte masks");
+            assert_eq!(midi3_raw(1, 2, 0x7F, d2)[2] & 0x80, 0, "CC hi byte masks");
+            assert_eq!(midi3_raw(4, 2, 0x7F, d2)[2] & 0x80, 0, "poly-AT hi byte masks");
+        }
+        assert_eq!(midi3_raw(5, 2, 0x7F, 0xFF)[2], 0x7F);
+    }
+
+    /// "As fast as they want" is a MATERIALIZE law: one event per sample
+    /// the curve value moves on, constant segments exactly one — and the
+    /// per-block materialize (windowed calls) must stitch into the exact
+    /// single-window stream (no drops or duplicates at block edges).
+    #[test]
+    fn v167_curve_generator_emits_per_moving_sample() {
+        let nb = crate::midipat::NoteBend::new(vec![(0.0, 0.0), (1.0, 2400.0)]);
+        let mut got: Vec<(u64, f32)> = Vec::new();
+        note_curve_events(&nb, 0, 1000, 4800, 0, u64::MAX, |s, _c, lo, hi| {
+            got.push((s, curve_st(lo, hi)));
+        });
+        assert_eq!(got.len(), 4800, "a ramp must emit at EVERY sample");
+        assert_eq!(got.first().unwrap().0, 1000, "stream starts at note-on");
+        assert_eq!(got.last().unwrap().0, 5799, "last event sits before note-end");
+        // Hand-derived linear law (2-point PCHIP IS linear), compared at
+        // the event's own sample: +-24 st is reached UNCLAMPED; decicent
+        // carrier quantum puts the floor at 5e-4 st.
+        for (i, (s, st)) in got.iter().enumerate() {
+            assert_eq!(*s, 1000 + i as u64, "consecutive sample offsets");
+            let ideal = 24.0 * (i as f32 / 4800.0);
+            assert!((st - ideal).abs() <= 1.1e-3, "sample {i}: {st} vs {ideal}");
+        }
+        // Constant curve: ONE event (the instrument holds it), not 4800.
+        let flat = crate::midipat::NoteBend::new(vec![(0.0, 500.0), (1.0, 500.0)]);
+        let mut n = 0usize;
+        note_curve_events(&flat, 0, 0, 4800, 0, u64::MAX, |_, _, _, _| n += 1);
+        assert_eq!(n, 1, "a constant curve is one event");
+        // Split windows (the materialize_curves block loop) == one window.
+        let mut two: Vec<(u64, f32)> = Vec::new();
+        for (w0, w1) in [(0u64, 3000u64), (3000, u64::MAX)] {
+            note_curve_events(&nb, 0, 1000, 4800, w0, w1, |s, _c, lo, hi| {
+                two.push((s, curve_st(lo, hi)));
+            });
+        }
+        assert_eq!(two, got, "block-split materialization must stitch exactly");
+    }
 }
