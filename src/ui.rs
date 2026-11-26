@@ -24552,37 +24552,40 @@ fn value_binds_body(ui: &mut egui::Ui, app: &mut App) {
             .find(|(id, _)| *id == vb.target)
             .map(|(_, l)| l.clone())
             .unwrap_or_else(|| crate::automation::describe_target(&vb.target));
-        ui.horizontal(|ui| {
-            let tail = if vb.kind == 0 {
-                format!("knob {}..{}", vb.lo, vb.hi)
+        // v177 (ts-022 AC2 + v44 fold doctrine): chain on its own line,
+        // actions on a line of their OWN — one wide row pushed relearn/×
+        // OUT of the window once the label was long, leaving bindings the
+        // user could neither re-aim nor remove (galley clipped away).
+        let tail = if vb.kind == 0 {
+            String::new()
+        } else {
+            " (switch)".to_string()
+        };
+        // v177: the row states WHAT IT BINDS AND FEEDS (ts-022 AC2):
+        // source control → target, which track, and how the control's
+        // travel maps — the old generic hover said only "in project".
+        ui.label(format!(
+            "{} \u{2192} T{} {}{tail}",
+            vb.bind.label(),
+            vb.track + 1,
+            lbl
+        ))
+        .on_hover_text(format!(
+            "{} \u{2192} {} on track {} \u{b7} {} \u{b7} bound in this \
+             project; travels with the project file",
+            vb.bind.label(),
+            lbl,
+            vb.track + 1,
+            if vb.kind == 0 {
+                format!(
+                    "the control's travel {}..{} maps 0..1 of this value",
+                    vb.lo, vb.hi
+                )
             } else {
-                "switch".to_string()
-            };
-            // v177: the row states WHAT IT BINDS AND FEEDS (ts-022 AC2):
-            // source control → target, which track, and how the control's
-            // travel maps — the old generic hover said only "in project".
-            ui.label(format!(
-                "{} \u{2192} T{} {} ({})",
-                vb.bind.label(),
-                vb.track + 1,
-                lbl,
-                tail
-            ))
-            .on_hover_text(format!(
-                "{} \u{2192} {} on track {} \u{b7} {} \u{b7} bound in this \
-                 project; travels with the project file",
-                vb.bind.label(),
-                lbl,
-                vb.track + 1,
-                if vb.kind == 0 {
-                    format!(
-                        "the control's travel {}..{} maps 0..1 of this value",
-                        vb.lo, vb.hi
-                    )
-                } else {
-                    "every press toggles this value".to_string()
-                }
-            ));
+                "every press toggles this value".to_string()
+            }
+        ));
+        ui.horizontal(|ui| {
             if ui
                 .small_button("relearn")
                 .on_hover_text(if vb.kind == 0 {
@@ -68589,8 +68592,22 @@ mod tests {
             .filter(|p| wr.contains(*p))
             .collect();
         cands.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let cands: Vec<_> = cands.into_iter().filter(|p| p.y < wr.min.y + 90.0).collect();
         assert!(!cands.is_empty(), "the roll toolbar paints a zoom-IN button");
-        click_pt(&mut app, &ctx, cands[0]);
+        // The maximized roll covers other panels, so its rect also
+        // CONTAINS galleys of windows drawn on top; only one of these
+        // toolbar-zone pluses belongs to the roll — the pin demands that
+        // a toolbar click zooms, whichever the draw order surfaces.
+        let mut zoomed = false;
+        for c in cands {
+            click_pt(&mut app, &ctx, c);
+            frame(&mut app, &ctx, vec![]);
+            if app.piano_roll.as_ref().unwrap().px_per_beat > before {
+                zoomed = true;
+                break;
+            }
+        }
+        assert!(zoomed, "a + in the roll toolbar zooms IN");
         frame(&mut app, &ctx, vec![]);
         let now = app.piano_roll.as_ref().unwrap().px_per_beat;
         assert!(now > before, "zoom IN grew px/beat");
@@ -68677,7 +68694,7 @@ mod tests {
         });
         app.show_binds = true;
         frame(&mut app, &ctx, vec![]);
-        let row = galley_at(&mut app, &ctx, "knob 9..110").expect("the bound row paints");
+        let row = galley_at(&mut app, &ctx, "→ T1 track volume").expect("the bound row paints");
         let tip = hover_until_tip(&mut app, &ctx, row.center(), &["maps 0..1"]);
         assert!(
             tip.iter().any(|t| t.contains("track 1") && t.contains("ch02")),
@@ -68700,6 +68717,9 @@ mod tests {
         let mut app = headless_app("v177mon");
         let ctx = egui::Context::default();
         app.show_midi = true;
+        // The BINDINGS window floats over the monitor's log rows and
+        // steals the hover hit-test — only the window under test is open.
+        app.show_binds = false;
         app.last_midi = None;
         app.midi_sources.clear();
         frame(&mut app, &ctx, vec![]);
@@ -68765,7 +68785,7 @@ mod tests {
         assert!(
             app.knob_learn
                 .as_ref()
-                .is_some_and(|k| k.vslot.as_ref().is_some_and(|v| v.2.contains("volume"))),
+                .is_some_and(|k| k.vslot.as_ref().is_some_and(|v| v.2 == crate::automation::TARGET_TRACK_VOL)),
             "the refusal must not clobber the first capture"
         );
         // Step 1: a CC on channel 2 defines the axis (echo names it).

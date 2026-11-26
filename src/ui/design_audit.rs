@@ -410,7 +410,6 @@ const COLOR_BASE: &[(&str, &str, usize)] = &[
     ("ui.rs", "p.rect_filled(tr, 3.0, Color32::from_rgb(24, 26, 30));", 1), // drift filed to ts-026 follow-up (t_2076e182 audit)
     ("ui.rs", "p.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(55)), egui::StrokeKind::Inside);", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
     ("ui.rs", "p.rect_stroke(strip, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(48)), egui::StrokeKind::Inside);", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
-    ("ui.rs", "painter.circle_filled(mc, 3.0, Color32::from_rgb(240, 150, 80));", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "painter.rect_filled(bend_lane, 0.0, Color32::from_gray(16));", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "painter.rect_filled(hbar, 0.0, Color32::from_black_alpha(90));", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 22, 26));", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
