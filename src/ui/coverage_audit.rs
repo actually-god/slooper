@@ -970,7 +970,7 @@ const EXEMPTIONS: &[Ex] = &[
     Ex { kind: "fn", site: "ui.rs\tdock_tab_into\tdock_tab_into", n: 1, why: "skip:window-chrome — tabbing visibly merges windows (v76 R3)" },
     Ex { kind: "fn", site: "ui.rs\topen_auto_editor\topen_auto_editor", n: 1, why: "skip:window-open — the opened editor IS the feedback (v72 open_*)" },
     Ex { kind: "fn", site: "ui.rs\topen_fx_editor\topen_fx_editor", n: 1, why: "skip:window-open — the opened editor IS the feedback (v72 open_*)" },
-    Ex { kind: "fn", site: "ui.rs\trescan_fx\trescan_fx", n: 1, why: "gap:ts-022 — script rescan should echo its verdict like plugin scan does; fix surface and delete row (ts-027 audit)" },
+    Ex { kind: "fn", site: "ui.rs\trescan_fx\trescan_fx", n: 1, why: "gap:ts-028 — Rescan lives in chain_win_body (v80 surface, ts-028 lane per ts-019 map): echo the verdict like plugin scan does; fix surface and delete row (ts-027 audit)" },
     Ex { kind: "fn", site: "ui.rs\tselect_toggle\tselect_toggle", n: 1, why: "skip:view-state — selection toggle paints itself (v86 R3 same-view)" },
     Ex { kind: "fn", site: "ui.rs\tset_group_active\tset_group_active", n: 1, why: "skip:view-state — group tab highlight shows the change (v86 R3)" },
     Ex { kind: "fn", site: "ui.rs\tset_master_midi\tset_master_midi", n: 1, why: "skip:midi-binding — bound indicator shows state (v72 MIDI-bind skip)" },
