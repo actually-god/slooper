@@ -948,22 +948,37 @@ fn track_head_menu(ui: &mut egui::Ui, app: &mut App, t: usize) {
     }
     // v94 (sc-1): the selection replaces one-by-one checkbox joins — every
     // selected track joins the RECORD GROUP here (ascending order, v52
-    // loop-inherit contract via the shared `rec_group_join` seam). The "G"
-    // checkbox stays for single-track join/leave: membership outlives the
-    // volatile selection.
+    // loop-inherit contract via the shared `rec_group_join` seam).
+    // v171: the strip "G" checkbox is RETIRED (user: multi-track selection
+    // is the way) — the head menu is now the ONLY membership surface:
+    // join AND leave both act on the selection through shared seams.
     let n_sel = app.track_sel.len();
     if ui
         .button("REC group (selection)")
         .on_hover_text(format!(
             "join the {} selected track(s) to the record group so they arm \
              and stop TOGETHER from the top-bar 'REC GROUP' button (loop \
-             'l' is shared); leave with the strip's G checkbox",
+             'l' is shared); leave with 'Leave group' below",
             n_sel
         ))
         .clicked()
     {
         let sel = app.track_sel.clone();
         app.rec_group_join(&sel);
+        ui.close();
+    }
+    if ui
+        .button("Leave group")
+        .on_hover_text(format!(
+            "remove the {} selected track(s) from the record group \
+             (members only — tracks outside the group are untouched); \
+             membership does NOT depend on the selection otherwise",
+            n_sel
+        ))
+        .clicked()
+    {
+        let sel = app.track_sel.clone();
+        app.rec_group_leave(&sel);
         ui.close();
     }
     if ui
@@ -5814,11 +5829,12 @@ impl App {
         }
     }
 
-    /// v94 (sc-1): join `ts` to the RECORD GROUP from ONE seam — the strip
-    /// "G" checkbox and the head-menu join-from-selection share it, so the
-    /// v52 R4 contract (join order = ascending front-oldest; a joiner
-    /// inherits the LINKED loop selector from the front member) cannot
-    /// drift between entry points. Already-member tracks are skipped.
+    /// v94 (sc-1): join `ts` to the RECORD GROUP from ONE seam — the
+    /// head-menu join-from-selection is the ONLY caller (v171 retired the
+    /// strip "G" checkbox), so the v52 R4 contract (join order = ascending
+    /// front-oldest; a joiner inherits the LINKED loop selector from the
+    /// front member) cannot drift between entry points. Already-member
+    /// tracks are skipped.
     fn rec_group_join(&mut self, ts: &[usize]) {
         let mut ts: Vec<usize> = ts.to_vec();
         ts.sort_unstable();
@@ -5851,6 +5867,47 @@ impl App {
                 joined
                     .iter()
                     .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                self.rec_group.len()
+            );
+        }
+    }
+
+    /// v171: leave mirror of the join seam — removes the GROUP MEMBERS of
+    /// `ts` (tracks outside the group are untouched), keeping join-order
+    /// intact for the survivors. The head menu's "Leave group" (selection)
+    /// is the ONLY caller since the strip "G" checkbox was retired; a
+    /// leave that removes nothing echoes a refusal (goal 1: no silent
+    /// clicks).
+    fn rec_group_leave(&mut self, ts: &[usize]) {
+        let mut ts: Vec<usize> = ts.to_vec();
+        ts.sort_unstable();
+        ts.dedup();
+        let left: Vec<usize> = ts
+            .iter()
+            .copied()
+            .filter(|t| *t < self.n_tracks && self.rec_group.contains(t))
+            .collect();
+        if left.is_empty() {
+            self.status = format!(
+                "record group: no selected track is in the group \u{b7} {} track(s) selected",
+                self.rec_group.len()
+            );
+            return;
+        }
+        self.rec_group.retain(|j| !left.contains(j));
+        if left.len() == 1 {
+            self.status = format!(
+                "record group: track {} leaves \u{2014} {} track(s) selected",
+                left[0] + 1,
+                self.rec_group.len()
+            );
+        } else {
+            self.status = format!(
+                "record group: tracks {} leave \u{2014} {} track(s) selected",
+                left.iter()
+                    .map(|n| (n + 1).to_string())
                     .collect::<Vec<_>>()
                     .join(", "),
                 self.rec_group.len()
@@ -20632,10 +20689,11 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                     )
                     .min_size(egui::vec2(84.0, 0.0));
                     let g_resp = ui.add(g_btn).on_hover_text(format!(
-                        "Record group: {} track(s) joined (select them with \
-                         'grp' on their strips). Click arms every member at \
-                         once, each with its own ticked sources; while any \
-                         member records, this STOPs them all together.",
+                        "Record group: {} track(s) joined (use the track \
+                         head menu: 'REC group (selection)' / 'Leave \
+                         group'). Click arms every member at once, each \
+                         with its own ticked sources; while any member \
+                         records, this STOPs them all together.",
                         mem.len()
                     ));
                     if g_resp.clicked() && !mem.is_empty() {
@@ -22222,6 +22280,9 @@ fn def_w(idx: usize) -> f32 {
         // default explicitly; windows can still shrink freely by hand.
         // v52 R4 added the strip's group ('G') toggle — 360 then clipped
         // the child-lane '+' off the row (pinned by v32_mixer_state_swaps).
+        // v171 retired the 'G' toggle again; 390 stays the COMFORTABLE
+        // default (the pins own this width budget — do not squeeze it back
+        // just because the row lost one widget).
         3 => 390.0,
         _ => 440.0,
     }
@@ -26672,35 +26733,11 @@ fn mixer_strip(ui: &mut egui::Ui, app: &mut App, t: usize) {
         {
             app.toggle_record_all(t);
         }
-        // v52 R4: RECORD GROUP membership. Joined tracks are armed/stopped
-        // together by the top-bar master; the loop ("l") selector is LINKED
-        // across members — joining inherits the oldest member's value, a
-        // toggle on any member mirrors to all. The other selectors stay
-        // independent.
-        let mut grp = app.rec_group.contains(&t);
-        let grp_resp = ui
-            .checkbox(&mut grp, "G")
-            .on_hover_text(
-                "Record group: joined tracks arm and stop TOGETHER from the \
-                 top-bar 'REC GROUP' button. The loop ('l') selector is shared \
-                 across members: joining inherits it from the first member, \
-                 toggling it mirrors to all. The other source selectors stay \
-                 per-track.",
-            );
-        if grp_resp.changed() {
-            if grp {
-                // v94 (sc-1): join goes through the shared seam (the head
-                // menu's join-from-selection uses the same code path).
-                app.rec_group_join(&[t]);
-            } else {
-                app.rec_group.retain(|&j| j != t);
-                app.status = format!(
-                    "record group: track {} leaves — {} track(s) selected",
-                    t + 1,
-                    app.rec_group.len()
-                );
-            }
-        }
+        // v52 R4: RECORD GROUP membership (joined tracks arm/stop together
+        // via the top-bar master; the loop "l" selector below is LINKED
+        // across members). v171: the strip "G" checkbox is RETIRED — the
+        // head menu carries join/leave for the whole selection, and the
+        // v94 selection-join seam is the single entry point.
         let mut src = app.rec_src[t];
         let ac = ui
             .checkbox(&mut src.audio, "a")
