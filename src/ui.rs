@@ -857,6 +857,44 @@ const COL_BEAT_LINE: Color32 = Color32::from_gray(78);
 /// subdivision" report).
 const COL_SNAP_LINE: Color32 = Color32::from_gray(44);
 
+// v175 (ts-028 design-language audit): arrangement data tints — ONE home.
+// The piano roll paints the same yellow-cap/gold values; adoption on the
+// roll side is a ts-022 rebase to-do — do NOT add forked literals of these
+// values on either side (tripwired by v175_arrangement_tints_single_home).
+/// Ruler-strip background (the lane bg below it is kit::SPEC_BG).
+const COL_RULER_BG: Color32 = Color32::from_rgb(34, 34, 40);
+/// "original length" ghost line + "original" label (trimmed past the loop
+/// region): the muted gold of "what the asset used to be".
+const COL_ORIG_LEN: Color32 = Color32::from_rgb(250, 200, 90);
+/// Clip resize end caps + loop-region handles — the shared "yellow handle"
+/// language.
+const COL_RESIZE_CAP: Color32 = Color32::from_rgb(250, 200, 50);
+/// A yellow handle grabbed RIGHT NOW (ruler loop handles).
+const COL_RESIZE_CAP_HELD: Color32 = Color32::from_rgb(255, 235, 120);
+/// The selected-clip "x" hint top-right: Delete removes these.
+const COL_DEL_HINT: Color32 = Color32::from_rgb(235, 120, 120);
+/// Pattern-asset note dots inside a clip (selected = the brighter twin).
+const COL_CLIP_NOTES: Color32 = Color32::from_rgb(120, 205, 255);
+const COL_CLIP_NOTES_SEL: Color32 = Color32::from_rgb(180, 235, 255);
+/// The automation curve drawn over automation-asset clips.
+const COL_AUTO_CURVE: Color32 = Color32::from_rgb(255, 130, 130);
+const COL_AUTO_CURVE_SEL: Color32 = Color32::from_rgb(255, 190, 190);
+/// Track separation bar: resting / hot-under-the-grab.
+const COL_SEP_BAR: Color32 = Color32::from_rgb(56, 56, 64);
+const COL_SEP_BAR_HOT: Color32 = Color32::from_rgb(96, 96, 116);
+/// Skip-to-start/-end button glyphs: resting / hover. Kept in the palette
+/// (not kit): transport chrome with a single use site — an exemption with
+/// its reason, per the ts-028 "token or exempt-with-reason" rule.
+const COL_SKIP_FG: Color32 = Color32::from_rgb(205, 210, 226);
+const COL_SKIP_FG_HOVER: Color32 = Color32::from_rgb(240, 244, 255);
+/// Row-edge grab tolerance — shared HOME for the two historical values.
+/// The arrangement lane grabs 1 px WIDER than a piano-roll note: lanes are
+/// big targets with dense content beside them, notes need tighter
+/// precision in a dense roll. Deliberate divergence — changing either one
+/// is a design decision, so both live here, not in the call sites.
+const GRAB_EDGE_LANE: f32 = 7.0;
+const GRAB_EDGE_NOTE: f32 = 6.0;
+
 /// v112: the arrangement's asset-length lookup (asset id → timeline
 /// samples) as a borrow-cheap closure for `place_auto`/`Lane::occupied`.
 /// Takes the table + sample rate as plain args so callers can pass
@@ -13111,7 +13149,7 @@ impl App {
         }
         // notes (+ yellow end caps on the selected ones — the
         // resize handles, same language as the loop-area handles)
-        const EDGE_PX: f32 = 6.0;
+        const EDGE_PX: f32 = GRAB_EDGE_NOTE;
         // v105 (pb-3, spec docs/SAMPLER-PITCH.md § 4 VISUAL): per-note
         // pitch-curve trail geometry. The trail rides the note's ROW:
         // ±trail_half px around the row center = ±1200 ¢.
@@ -28239,9 +28277,9 @@ fn paint_grid(
         rect,
         0.0,
         if ruler {
-            Color32::from_rgb(34, 34, 40)
+            COL_RULER_BG
         } else {
-            Color32::from_rgb(24, 24, 29)
+            crate::kit::SPEC_BG
         },
     );
     let beat_px = quantize::beat_samples(sr as u32, app.bpm()) * (px / sr);
@@ -28333,9 +28371,9 @@ fn skip_button(ui: &mut egui::Ui, to_start: bool) -> egui::Response {
         );
     }
     let fg = if resp.hovered() {
-        egui::Color32::from_rgb(240, 244, 255)
+        COL_SKIP_FG_HOVER
     } else {
-        egui::Color32::from_rgb(205, 210, 226)
+        COL_SKIP_FG
     };
     let c = r.center().y;
     let (tb, tip) = if to_start {
@@ -28402,9 +28440,9 @@ fn ruler_row(ui: &mut egui::Ui, app: &mut App, avail: f32, px: f64, sr: f64) {
                         ),
                         1.0,
                         if held {
-                            Color32::from_rgb(255, 235, 120)
+                            COL_RESIZE_CAP_HELD
                         } else {
-                            Color32::from_rgb(250, 200, 50)
+                            COL_RESIZE_CAP
                         },
                     );
                 }
@@ -28503,9 +28541,9 @@ fn track_block(ui: &mut egui::Ui, app: &mut App, t: usize, w: f32, px: f64, sr: 
         ),
         0.0,
         if hot {
-            Color32::from_rgb(96, 96, 116)
+            COL_SEP_BAR_HOT
         } else {
-            Color32::from_rgb(56, 56, 64)
+            COL_SEP_BAR
         },
     );
     if sep.drag_started_by(egui::PointerButton::Primary) {
@@ -28611,7 +28649,7 @@ fn lane_row(
     // Edge zones become trim/extend handles on ANY clip (grabbing an edge
     // selects the clip on the way — the old "only selected clips resize"
     // rule made the feature undiscoverable and read as broken).
-    const EDGE_PX: f32 = 7.0;
+    const EDGE_PX: f32 = GRAB_EDGE_LANE;
     let edge_at = |app: &App, pt: egui::Pos2| -> Option<(usize, u8)> {
         let mut best: Option<(f32, usize, u8)> = None;
         for (ci, (c, _)) in clips.iter().enumerate() {
@@ -28657,7 +28695,7 @@ fn lane_row(
         egui::Align2::LEFT_TOP,
         format!("T{} {}", t + 1, if k == 0 { "track" } else { "child" }),
         egui::FontId::proportional(9.0),
-        Color32::from_gray(110),
+        crate::kit::MUTED,
     );
     for (ci, (c, name)) in clips.iter().enumerate() {
         let alen = app.asset_len(c.asset);
@@ -28854,7 +28892,7 @@ fn lane_row(
                 let _ = right_of_clip;
                 ui.painter().line_segment(
                     [egui::pos2(x, cres.min.y), egui::pos2(x, cres.max.y)],
-                    egui::Stroke::new(1.0, Color32::from_rgb(250, 200, 90)),
+                    egui::Stroke::new(1.0, COL_ORIG_LEN),
                 );
             }
             ui.painter().text(
@@ -28862,7 +28900,7 @@ fn lane_row(
                 egui::Align2::RIGHT_BOTTOM,
                 "original",
                 egui::FontId::proportional(8.0),
-                Color32::from_rgb(250, 200, 90),
+                COL_ORIG_LEN,
             );
         }
         if sel {
@@ -28875,7 +28913,7 @@ fn lane_row(
                         egui::pos2(ex + 2.0, cres.max.y),
                     ),
                     1.0,
-                    Color32::from_rgb(250, 200, 50),
+                    COL_RESIZE_CAP,
                 );
             }
             // Selection hint: these clips are what Delete removes.
@@ -28884,7 +28922,7 @@ fn lane_row(
                 egui::Align2::RIGHT_TOP,
                 "\u{d7}",
                 egui::FontId::proportional(13.0),
-                Color32::from_rgb(235, 120, 120),
+                COL_DEL_HINT,
             );
         }
     }
@@ -28933,7 +28971,7 @@ fn lane_row(
                 ui.painter().rect_stroke(
                     gres,
                     2.0,
-                    egui::Stroke::new(1.5, Color32::from_rgb(255, 90, 90)),
+                    egui::Stroke::new(1.5, crate::kit::REC_ON),
                     egui::StrokeKind::Inside,
                 );
                 // Peak columns: a bounded scan (>=1 sample per column,
@@ -30385,9 +30423,9 @@ fn draw_asset_clip(
             let (lo_n, hi_n) = (24i32, 108i32);
             let h = rect.height().max(6.0);
             let col = if sel {
-                Color32::from_rgb(180, 235, 255)
+                COL_CLIP_NOTES_SEL
             } else {
-                Color32::from_rgb(120, 205, 255)
+                COL_CLIP_NOTES
             };
             for note in pat.notes.iter() {
                 let n = note.note as i32;
@@ -30445,9 +30483,9 @@ fn draw_asset_clip(
                 hi += 0.5;
             }
             let col = if sel {
-                Color32::from_rgb(255, 190, 190)
+                COL_AUTO_CURVE_SEL
             } else {
-                Color32::from_rgb(255, 130, 130)
+                COL_AUTO_CURVE
             };
             let steps = (body.width() / 2.0).max(2.0) as i64;
             let h = rect.height().max(6.0);
@@ -67983,6 +68021,86 @@ mod tests {
             .find(|x| x.contains("right-click for dock"))
             .unwrap_or_else(|| panic!("title tooltip painted: {texts:?}"));
         assert!(tip.contains("ASSET RACK"), "tooltip names the window: {tip:?}");
+    }
+
+    /// v175 R9 (source, ts-028 design-language audit): the arrangement
+    /// corridor's data tints are bound to the ONE COL_* palette (kit tokens
+    /// where kit owns the value), the palette holds the historical values
+    /// verbatim, and the two grab-edge tolerances live in one home.
+    #[test]
+    fn v175_arrangement_tints_single_home() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").expect("mod tests anchor at col 0")];
+        // (a) The palette home pins the historical values verbatim.
+        let home: [(&str, &str); 13] = [
+            ("COL_RULER_BG", "Color32::from_rgb(34, 34, 40)"),
+            ("COL_ORIG_LEN", "Color32::from_rgb(250, 200, 90)"),
+            ("COL_RESIZE_CAP", "Color32::from_rgb(250, 200, 50)"),
+            ("COL_RESIZE_CAP_HELD", "Color32::from_rgb(255, 235, 120)"),
+            ("COL_DEL_HINT", "Color32::from_rgb(235, 120, 120)"),
+            ("COL_CLIP_NOTES", "Color32::from_rgb(120, 205, 255)"),
+            ("COL_CLIP_NOTES_SEL", "Color32::from_rgb(180, 235, 255)"),
+            ("COL_AUTO_CURVE", "Color32::from_rgb(255, 130, 130)"),
+            ("COL_AUTO_CURVE_SEL", "Color32::from_rgb(255, 190, 190)"),
+            ("COL_SEP_BAR", "Color32::from_rgb(56, 56, 64)"),
+            ("COL_SEP_BAR_HOT", "Color32::from_rgb(96, 96, 116)"),
+            ("COL_SKIP_FG", "Color32::from_rgb(205, 210, 226)"),
+            ("COL_SKIP_FG_HOVER", "Color32::from_rgb(240, 244, 255)"),
+        ];
+        for (name, val) in home {
+            assert!(
+                prod.contains(&format!("const {name}: Color32 = {val};")),
+                "palette home {name} must stay exactly {val}"
+            );
+        }
+        // (b) The corridor fns carry NONE of those literals inline anymore.
+        let banned: [&str; 13] = [
+            "from_rgb(34, 34, 40)",
+            "from_rgb(250, 200, 90)",
+            "from_rgb(250, 200, 50)",
+            "from_rgb(255, 235, 120)",
+            "from_rgb(235, 120, 120)",
+            "from_rgb(120, 205, 255)",
+            "from_rgb(180, 235, 255)",
+            "from_rgb(255, 130, 130)",
+            "from_rgb(255, 190, 190)",
+            "from_rgb(56, 56, 64)",
+            "from_rgb(96, 96, 116)",
+            "from_rgb(205, 210, 226)",
+            "from_rgb(240, 244, 255)",
+        ];
+        for anchor in [
+            "fn paint_grid(",
+            "fn ruler_row(",
+            "fn lane_row(",
+            "fn track_block(",
+            "fn skip_button(",
+            "fn draw_asset_clip(",
+        ] {
+            let region = v86_fn_region(prod, anchor);
+            for b in banned.iter() {
+                assert!(!region.contains(*b), "{anchor} still forks literal {b}");
+            }
+        }
+        // (c) Where KIT owns the value, the corridor calls kit.
+        assert!(
+            v86_fn_region(prod, "fn paint_grid(").contains("crate::kit::SPEC_BG"),
+            "grid lane bg must read kit::SPEC_BG"
+        );
+        let lane = v86_fn_region(prod, "fn lane_row(");
+        assert!(lane.contains("crate::kit::MUTED"), "lane tag text -> kit::MUTED");
+        assert!(lane.contains("crate::kit::REC_ON"), "lane rec stroke -> kit::REC_ON");
+        // (d) Grab-edge tolerances: ONE home, divergence deliberate, and no
+        // call site may re-declare its own value again.
+        assert!(prod.contains("const GRAB_EDGE_LANE: f32 = 7.0;"));
+        assert!(prod.contains("const GRAB_EDGE_NOTE: f32 = 6.0;"));
+        assert_eq!(
+            prod.matches("const EDGE_PX: f32 =").count(),
+            2,
+            "EDGE_PX may exist ONLY as the two palette-bound aliases"
+        );
+        assert!(prod.contains("const EDGE_PX: f32 = GRAB_EDGE_NOTE;"));
+        assert!(prod.contains("const EDGE_PX: f32 = GRAB_EDGE_LANE;"));
     }
 
     /// v175 R8 (runtime paint): the marquee rubber band (1.2 px ACCENT
