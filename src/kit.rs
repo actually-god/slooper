@@ -28,6 +28,11 @@ pub(crate) const ACCENT: Color32 = Color32::from_rgb(150, 200, 255);
 /// module docs). The frame edge around it is `EDGE`.
 pub(crate) const KIT_BG: Color32 = Color32::from_rgb(21, 23, 28);
 pub(crate) const EDGE: Color32 = Color32::from_gray(58);
+/// v174 (TS-020): the ONE hairline-separator tone (mixer band rule and
+/// any surface that divides rows with a 1px line).
+pub(crate) const SEP: Color32 = Color32::from_gray(64);
+/// v174 (TS-020): the dimmer inner rule (strip-row dividers under the band).
+pub(crate) const SEP_SOFT: Color32 = Color32::from_gray(48);
 /// Bridge caption text (dark theme). Light mode resolves through `Kit`.
 pub(crate) const TEXT: Color32 = Color32::from_gray(170);
 pub(crate) const MUTED: Color32 = Color32::from_gray(110);
@@ -36,6 +41,34 @@ pub(crate) const MUTED: Color32 = Color32::from_gray(110);
 /// Frozen at the historical chain-window error red; a local `from_rgb`
 /// for error text is a drift bug, import this instead.
 pub(crate) const DANGER: Color32 = Color32::from_rgb(220, 120, 120);
+
+/// v174 (TS-020): the indicator lamps of the mixer/master/monitor family,
+/// frozen at the historical literals byte-for-byte — REC armed/idle button
+/// text, the recording-region tint, the clip LED, and the amber warning
+/// text (REC idle shares it). A local `from_rgb` for an indicator is a
+/// drift bug, import these instead.
+pub(crate) const REC_ON: Color32 = Color32::from_rgb(255, 90, 90);
+pub(crate) const WARN: Color32 = Color32::from_rgb(220, 180, 120);
+pub(crate) const CLIP_LED: Color32 = Color32::from_rgb(235, 60, 50);
+/// v174: dim caption / bright readout header chrome of the MASTER OUT panel.
+pub(crate) const CAPTION: Color32 = Color32::from_rgb(150, 150, 158);
+pub(crate) const READOUT: Color32 = Color32::from_rgb(178, 178, 186);
+/// v174: automation-active label tint (mixer strips + mix columns) and
+/// the mono/poly synth-mode state text on the strip device row.
+pub(crate) const AUTO: Color32 = Color32::from_rgb(120, 210, 140);
+pub(crate) const MODE_ON: Color32 = Color32::from_rgb(150, 220, 150);
+pub(crate) const MODE_OFF: Color32 = Color32::from_rgb(150, 150, 150);
+/// v174: the master meter + spectrum console chrome (paint_stereo_meters
+/// and paint_spectrum — the MASTER OUT panel's painters).
+pub(crate) const METER_BG: Color32 = Color32::from_rgb(30, 30, 34);
+pub(crate) const METER_GREEN: Color32 = Color32::from_rgb(60, 200, 90);
+pub(crate) const METER_YELLOW: Color32 = Color32::from_rgb(224, 204, 70);
+pub(crate) const METER_HOT: Color32 = Color32::from_rgb(232, 84, 60);
+pub(crate) const METER_TRACK: Color32 = Color32::from_rgb(20, 20, 24);
+pub(crate) const METER_HOLD: Color32 = Color32::from_rgb(130, 130, 138);
+pub(crate) const SPEC_BG: Color32 = Color32::from_rgb(24, 24, 29);
+pub(crate) const SPEC_GRID: Color32 = Color32::from_rgb(58, 58, 66);
+pub(crate) const SPEC_TXT: Color32 = Color32::from_rgb(120, 120, 128);
 
 /// Theme-resolved kit chrome for the bridge widgets. Dark mode returns
 /// the historical constants byte-for-byte (pins freeze them); light mode
@@ -285,6 +318,30 @@ mod tests {
         // hand-wrote before v80 (zero visual drift); local error-reds
         // are pinned-out by v80_chain_chrome_kit_only.
         assert_eq!(DANGER, Color32::from_rgb(220, 120, 120));
+    }
+
+    #[test]
+    fn v174_kit_signal_tokens_frozen() {
+        // v174 (TS-020): the trio's indicator + console chrome tokens are
+        // frozen at the pre-v174 literals (zero visual drift); v174's
+        // ui.rs scans pin the old local literals out of the surfaces.
+        assert_eq!(REC_ON, Color32::from_rgb(255, 90, 90));
+        assert_eq!(WARN, Color32::from_rgb(220, 180, 120));
+        assert_eq!(CLIP_LED, Color32::from_rgb(235, 60, 50));
+        assert_eq!(CAPTION, Color32::from_rgb(150, 150, 158));
+        assert_eq!(READOUT, Color32::from_rgb(178, 178, 186));
+        assert_eq!(AUTO, Color32::from_rgb(120, 210, 140));
+        assert_eq!(MODE_ON, Color32::from_rgb(150, 220, 150));
+        assert_eq!(MODE_OFF, Color32::from_rgb(150, 150, 150));
+        assert_eq!(METER_BG, Color32::from_rgb(30, 30, 34));
+        assert_eq!(METER_GREEN, Color32::from_rgb(60, 200, 90));
+        assert_eq!(METER_YELLOW, Color32::from_rgb(224, 204, 70));
+        assert_eq!(METER_HOT, Color32::from_rgb(232, 84, 60));
+        assert_eq!(METER_TRACK, Color32::from_rgb(20, 20, 24));
+        assert_eq!(METER_HOLD, Color32::from_rgb(130, 130, 138));
+        assert_eq!(SPEC_BG, Color32::from_rgb(24, 24, 29));
+        assert_eq!(SPEC_GRID, Color32::from_rgb(58, 58, 66));
+        assert_eq!(SPEC_TXT, Color32::from_rgb(120, 120, 128));
     }
 
     #[test]
