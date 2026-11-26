@@ -5178,6 +5178,8 @@ impl App {
 
     /// Compile/load every script in the folder again and refresh all rows.
     fn rescan_fx(&mut self) {
+        let was_ok = self.fx_registry.stems().len();
+        let was_bad = self.fx_registry.items().iter().filter(|e| e.error.is_some()).count();
         self.fx_registry.rescan();
         self.prune_dead_script_rows();
         let ok = self.fx_registry.stems().len();
@@ -5188,6 +5190,16 @@ impl App {
             .filter(|e| e.error.is_some())
             .count();
         self.fx_note = format!("{ok} valid effect(s), {bad} rejected");
+        // v176 (ts-027 echo gap): the verdict must also reach the status
+        // bar — fx_note only renders inside the chain window, so a rescan
+        // was silent everywhere else (v76 R1d doctrine, mirroring
+        // vst_rescan). The user question is WHAT CHANGED: (valid,
+        // rejected) before vs after.
+        self.status = if (ok, bad) == (was_ok, was_bad) {
+            format!("effects rescanned \u{2014} unchanged: {ok} valid, {bad} rejected")
+        } else {
+            format!("effects rescanned: {ok} valid, {bad} rejected (was {was_ok} valid, {was_bad} rejected)")
+        };
     }
 
     // ---- grid maths ------------------------------------------------------
@@ -53824,6 +53836,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// v176 (ts-028): rescan_fx must echo its verdict into the STATUS BAR
+    /// — the chain window's fx_note alone is not an echo (v76 R1d /
+    /// vst_rescan doctrine). Both polarities: unchanged count, and a
+    /// changed count carrying the previous number.
+    #[test]
+    fn v176_rescan_fx_status_echo() {
+        let mut app = headless_app("v176-rescan-echo");
+        app.rescan_fx();
+        let n = app.fx_registry.stems().len();
+        assert!(
+            app.status.contains(&format!(
+                "effects rescanned \u{2014} unchanged: {n} valid"
+            )),
+            "unchanged rescan must echo the count in the status bar: {:?}",
+            app.status
+        );
+        // Second polarity WITHOUT any compile cost: a garbage script lands
+        // as a REJECTION (seed_api re-seeds renamed bundled files, so
+        // removal cannot change the counts — a rejected script can).
+        // The changed verdict must carry BOTH previous counts.
+        let dir = std::path::PathBuf::from(&app.fx_dir_edit);
+        let junk = dir.join("zz-v176-broken.rs");
+        std::fs::write(&junk, "// not a slooper effect\nfn broken(\n").unwrap();
+        app.rescan_fx();
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(
+                app.status.contains(&format!(
+                    "effects rescanned: {n} valid, 1 rejected (was {n} valid, 0 rejected)"
+                )),
+                "count-change echo must carry the previous counts: {:?}",
+                app.status
+            );
+        }));
+        std::fs::remove_file(&junk).unwrap();
+        let _ = res.unwrap_or_else(|e| std::panic::resume_unwind(e));
     }
 
     /// Goal 1 as a machine-checked invariant: every button whose label
