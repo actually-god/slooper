@@ -8,6 +8,16 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Added
 
+- **Removing a child track now asks first.** Pressing `−` on a track
+  whose last child track still holds clips opens a confirmation that
+  names what is lost (the clips on that lane) and what is kept (the
+  assets, safe in the asset rack). Cancel — or the Escape key — keeps
+  everything; *Never warn again*, checked at confirmation, is remembered
+  across restarts. Empty child tracks still remove instantly. This
+  dialog is the app's new STANDARD confirmation pattern: future
+  "are you sure?" popups share its look, its safe-default Cancel and
+  its persisted never-ask checkbox.
+
 - **Drawn pitch curves gained a readable axis.** A bent note's curve
   trail now paints and drags at a constant cents-per-pixel: ±1200 cents
   fills the trail box and a wilder swing EXTENDS it — a ±2-octave curve

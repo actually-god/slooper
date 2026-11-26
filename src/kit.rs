@@ -158,6 +158,110 @@ pub(crate) fn armed_outside_click(ui: &Ui, armed: bool, rect: Rect, pad: f32, es
         })
 }
 
+// ---------------------------------------------------------------------------
+// v170 (card t_3d0dfae8): the STANDARD confirm dialog — the ONE pattern
+// for "are you sure?" popups.
+//
+// Before v170 every destructive confirmation hand-rolled its own
+// egui::Window, copy and button row (`proj_confirm`, `rack_confirm_del`),
+// so behavior drifted between surfaces and "don't ask me again" had
+// nowhere to live. Rule going forward: every UX confirmation builds a
+// `ConfirmAsk` (title, body, confirm label, optional *Never warn again*
+// checkbox) and renders it through `confirm()`. The checkbox state is
+// bound to a NAMED persisted Config key by the CALLER (kit has no App
+// access — the helper stays stateless, like `armed_outside_click`
+// above); the caller owns the pending request between frames and the
+// persistence on confirm. First adopter: the child-track removal gate
+// (App::request_lane_removal in ui.rs).
+//
+// Contract:
+//   - CENTER-anchored, non-collapsible, non-resizable — the user can
+//     never lose the dialog to a drag (ad-hoc windows could wander off).
+//   - Cancel is the safe default: the Cancel button OR an Escape key
+//     press anywhere returns `No`; nothing else is touched.
+//   - `never_warn_label = Some(..)` paints the checkbox UNCHECKED by
+//     default; only the CONFIRM path may persist it (Checked + Cancel
+//     persists nothing).
+//   - The Yes/No verdict fires EXACTLY ONCE: the caller drops (or
+//     persists) the pending request as soon as `confirm()` resolves.
+// ---------------------------------------------------------------------------
+
+/// One pending standard confirmation. `kind` is the stable window-id
+/// source — one stable value per popup KIND, not per open.
+pub(crate) struct ConfirmAsk {
+    /// Stable machine id for this popup kind (window id source).
+    pub kind: &'static str,
+    /// Window title.
+    pub title: &'static str,
+    /// Primary copy: WHAT IS LOST (plain label).
+    pub body: String,
+    /// Secondary copy: WHAT SURVIVES (weak type). Optional.
+    pub note: Option<String>,
+    /// Destructive action button label, e.g. "Remove", "Delete".
+    pub confirm_label: &'static str,
+    /// Some(text) draws a Never-warn checkbox with this label;
+    /// None = a plain confirm/cancel pair.
+    pub never_warn_label: Option<&'static str>,
+    /// Cross-frame checkbox state. The caller seeds it false per open and
+    /// persists it (into its named Config key) only on `Confirm::Yes`.
+    pub never_warn: bool,
+}
+
+/// One-frame verdict from `confirm()`.
+pub(crate) enum Confirm {
+    /// Still open — the caller keeps the pending request.
+    Open,
+    /// Destructive action accepted (read `ask.never_warn` NOW).
+    Yes,
+    /// Cancelled — button, window close, or Escape. Safe default.
+    No,
+}
+
+/// Render one frame of the standard confirmation (see the section doc
+/// for the law). Returns the verdict; `Open` keeps the dialog up.
+pub(crate) fn confirm(ui: &Ui, ask: &mut ConfirmAsk) -> Confirm {
+    let mut verdict = Confirm::Open;
+    egui::Window::new(ask.title)
+        .id(egui::Id::new(("v170-confirm", ask.kind)))
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .collapsible(false)
+        .resizable(false)
+        .show(ui.ctx(), |ui| {
+            if ui.ctx().input(|i| i.key_pressed(Key::Escape)) {
+                verdict = Confirm::No;
+                return;
+            }
+            ui.label(&ask.body);
+            if let Some(note) = &ask.note {
+                ui.label(egui::RichText::new(note.clone()).weak().small());
+            }
+            if let Some(label) = ask.never_warn_label {
+                ui.checkbox(&mut ask.never_warn, label);
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(egui::RichText::new(ask.confirm_label).strong())
+                            .min_size(egui::vec2(90.0, 0.0)),
+                    )
+                    .on_hover_text("do it now \u{2014} this cannot be undone")
+                    .clicked()
+                {
+                    verdict = Confirm::Yes;
+                }
+                if ui
+                    .button("Cancel")
+                    .on_hover_text("go back \u{2014} nothing changes")
+                    .clicked()
+                {
+                    verdict = Confirm::No;
+                }
+            });
+        });
+    verdict
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +418,114 @@ mod tests {
         let near = egui::pos2(225.0, 130.0); // rect max.x = 220
         assert!(v152_verdict(v152_click(near, egui::PointerButton::Primary), true, 4.0, true));
         assert!(!v152_verdict(v152_click(near, egui::PointerButton::Primary), true, 6.0, true));
+    }
+
+    // ---- v170 (card t_3d0dfae8): the STANDARD confirm dialog ----
+    //
+    // Driven through a REAL egui Context like the v152 family: one frame
+    // per probe, FullOutput consumed, painted galleys read back. Button
+    // clicks (which need painted coordinates) are pinned end-to-end in
+    // ui::tests against the real mixer strip; here the coordinate-free
+    // contract — Escape, copy rendering, checkbox polarity — is frozen.
+
+    /// Host `confirm()` over three frames (warm-up + settle + read);
+    /// return (resolved?, painted galley strings of the LAST frame).
+    /// The multi-frame run is load-bearing twice: fonts install only on
+    /// the first `run` (0.36), and a Window spawned this frame paints its
+    /// CONTENT only from the NEXT frame (frame 0 shows zero window
+    /// galleys — the v82 settle family). Events feed the first real
+    /// frame; a verdict there (Escape) is still captured.
+    fn v170_probe(ask: &mut ConfirmAsk, events: Vec<egui::Event>) -> (bool, Vec<String>) {
+        let ctx = egui::Context::default();
+        // A RawInput WITHOUT screen_rect makes the viewport 0x0 and the
+        // whole Ui invisible — always feed a real screen_rect.
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1440.0, 853.0));
+        let mut resolved = false;
+        let mut texts: Vec<String> = Vec::new();
+        for i in 0..3 {
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                events: if i == 0 { events.clone() } else { vec![] },
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ctx| {
+                egui::Area::new(egui::Id::new("v170_host"))
+                    .fixed_pos(egui::pos2(4.0, 4.0))
+                    .show(ctx, |ui| match confirm(ui, ask) {
+                        Confirm::Yes | Confirm::No => resolved = true,
+                        Confirm::Open => {}
+                    });
+            });
+            texts = out
+                .shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::epaint::Shape::Text(t) => Some(t.galley.text().to_string()),
+                    _ => None,
+                })
+                .collect();
+            out.textures_delta.clear();
+        }
+        (resolved, texts)
+    }
+
+    fn v170_ask(never_warn_label: Option<&'static str>) -> ConfirmAsk {
+        ConfirmAsk {
+            kind: "probe",
+            title: "Remove child track?",
+            body: "It holds 2 clips \u{2014} they are lost.".into(),
+            note: Some("The assets stay saved in the asset rack.".into()),
+            confirm_label: "Remove",
+            never_warn_label,
+            never_warn: false,
+        }
+    }
+
+    #[test]
+    fn v170_kit_confirm_esc_is_cancel() {
+        // AC R2: Escape anywhere resolves the modal as Cancel (safe
+        // default) — the verdict arrives in the SAME frame the key does.
+        let mut ask = v170_ask(Some("Never warn again"));
+        let (resolved, _) = v170_probe(
+            &mut ask,
+            vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert!(resolved, "Escape cancels the standard confirm");
+        assert!(!ask.never_warn, "cancelling never latches the checkbox");
+    }
+
+    #[test]
+    fn v170_kit_confirm_painted_contract() {
+        // AC R1/R5: every slot of the ask is painted — title (window
+        // chrome), body (what is lost), note (what survives), both button
+        // labels, and the checkbox ONLY when never_warn_label is Some.
+        let mut ask = v170_ask(Some("Never warn again"));
+        let (_, texts) = v170_probe(&mut ask, vec![]);
+        for needle in [
+            "Remove child track?",
+            "It holds 2 clips",
+            "asset rack",
+            "Remove",
+            "Cancel",
+            "Never warn again",
+        ] {
+            assert!(
+                texts.iter().any(|t| t.contains(needle)),
+                "standard confirm must paint {needle:?}, got {texts:?}"
+            );
+        }
+        // Negative polarity: no label => no checkbox galley.
+        let mut plain = v170_ask(None);
+        let (_, t2) = v170_probe(&mut plain, vec![]);
+        assert!(
+            !t2.iter().any(|t| t.contains("Never warn again")),
+            "checkbox must not paint without a label"
+        );
     }
 }
