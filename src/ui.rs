@@ -13334,7 +13334,13 @@ impl App {
         // hovers a note (the wheel-trim control has no slider, so
         // it needs to be told the value directly).
         if let Some(hp) = hover {
-            if let Some((i, _, _)) = note_hit(&roll.pat.notes, hp) {
+            // v168 (pbc-2): the hover probe answers for the note body AND
+            // for curve dots — a dot's readout works even when the dot
+            // rides above/below the body (big curves, small rows).
+            let hit = note_hit(&roll.pat.notes, hp);
+            let dot_hit = nb_dot_hit(&roll.pat.notes, &roll.sel_notes, &roll.pat.note_bends, hp);
+            let note_i = hit.map(|(i, _, _)| i).or_else(|| dot_hit.map(|(ni, _)| ni));
+            if let Some(i) = note_i {
                 if let Some(n) = roll.pat.notes.get(i) {
                     // v105: the readout says whether THIS note has a curve
                     // and what the next gesture would be (discoverability).
@@ -13343,30 +13349,21 @@ impl App {
                     // point's live pitch — the EDO-aware label on the
                     // canvas, same status-echo channel (v71/v72 law).
                     let mut dot_txt = String::new();
-                    if curve {
-                        if let (Some(ci), Some((_, pi))) = (
-                            n.bend,
-                            nb_dot_hit(
-                                &roll.pat.notes,
-                                &roll.sel_notes,
-                                &roll.pat.note_bends,
-                                hp,
-                            )
-                            .filter(|(ni, _)| *ni == i),
-                        ) {
-                            let pt = roll
-                                .pat
-                                .note_bends
-                                .get(ci as usize)
-                                .and_then(|nb| nb.pts.get(pi))
-                                .copied();
-                            if let Some((_, c)) = pt {
-                                dot_txt = format!(
-                                    " \u{b7} dot {} ({:+.0} cents)",
-                                    crate::tune::label_pitch_text_live(n.note as i32, c),
-                                    c
-                                );
-                            }
+                    if let (Some(ci), Some((_, pi))) =
+                        (n.bend, dot_hit.filter(|(ni, _)| *ni == i))
+                    {
+                        let pt = roll
+                            .pat
+                            .note_bends
+                            .get(ci as usize)
+                            .and_then(|nb| nb.pts.get(pi))
+                            .copied();
+                        if let Some((_, c)) = pt {
+                            dot_txt = format!(
+                                " \u{b7} dot {} ({:+.0} cents)",
+                                crate::tune::label_pitch_text_live(n.note as i32, c),
+                                c
+                            );
                         }
                     }
                     painter.text(
@@ -64628,6 +64625,312 @@ mod tests {
             strip.matches("from_gray(60)").count(),
             1,
             "strip anchors keep today's ink"
+        );
+    }
+
+    // ============ v168 (card t_73fea549, pbc-2-gui): linear curve axis ============
+    //
+    // The ±2-octave Septabee swing must be VISIBLE and EDITABLE at a
+    // constant aiming precision (no compressing auto-scale), with the
+    // EDO-aware pitch label echoed wherever the user aims. Pins drive
+    // real gestures through frame().
+
+    /// Probe `app` once more (1440×853), optionally with fresh input
+    /// events, and return the RAW shapes (before tessellation) — the
+    /// v105 paint-probe idiom.
+    fn v168_probe(
+        app: &mut App,
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let raw = egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let shapes = out.shapes.clone();
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        shapes
+    }
+
+    #[test]
+    fn v168_axis_2oct_trail_paints_full_height() {
+        // A ±2-octave curve is FULLY VISIBLE: px-per-cent is constant
+        // (trail_half = 24 px = ±1200¢ at default zoom), so the trail
+        // EXTENDS to ±2·trail_half = ±48 px. The retired auto-scale
+        // compressed everything into the fixed ±24 px box — a capped
+        // trail could never paint 44+ px from the row center.
+        let mut app = headless_app("v168wide");
+        let ctx = egui::Context::default();
+        crate::tune::set(12, 60);
+        let c = v52_roll_rig(&mut app, &ctx);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 60,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+                bend: None,
+            });
+            r.pat
+                .note_bends
+                .push(crate::midipat::NoteBend::new(vec![
+                    (0.0, 0.0),
+                    (0.5, -2400.0),
+                    (1.0, 2400.0),
+                ]));
+            r.pat.notes[0].bend = Some(0);
+            r.pat.bake_bends();
+        }
+        frame(&mut app, &ctx, vec![]);
+        let row_c = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
+        let shapes = v168_probe(&mut app, &ctx, vec![]);
+        let mut top = f32::MAX;
+        let mut bot = f32::MIN;
+        for cs in &shapes {
+            if let egui::epaint::Shape::LineSegment { points, stroke } = &cs.shape {
+                let (r0, g0, b0, a0) = stroke.color.to_tuple();
+                if a0 == 255 && r0 == 90 && g0 == 220 && b0 == 170 {
+                    top = top.min(points[0].y.min(points[1].y));
+                    bot = bot.max(points[0].y.max(points[1].y));
+                }
+            }
+        }
+        assert!(
+            row_c - top >= 45.0,
+            "trail paints the +2-oct extreme ({} px above center; the retired auto-scale capped at 24)",
+            row_c - top
+        );
+        assert!(
+            bot - row_c >= 44.0,
+            "trail paints the -2-oct extreme ({} px below center)",
+            bot - row_c
+        );
+        crate::tune::set(crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT);
+    }
+
+    #[test]
+    fn v168_axis_linear_sensitivity() {
+        // LINEAR LAW + EDITABILITY: the +1200¢ endpoint dot sits EXACTLY
+        // trail_half (24 px) above the row center — the old auto-scale
+        // drew it at 12 px, so this press only grabs a dot under the
+        // linear map. One pixel = 50¢ everywhere: +24 px lands the
+        // NB_MAX_CENTS cap. Then the ROW-ZOOM knob (row_h 22) doubles the
+        // px-per-cent: the same 11 px moves HALF the cents.
+        let mut app = headless_app("v168lin");
+        let ctx = egui::Context::default();
+        crate::tune::set(12, 60);
+        let c = v105_curve_rig(&mut app, &ctx);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.note_bends[0].pts = vec![(0.0, 0.0), (1.0, 1200.0)];
+            r.pat.bake_bends();
+        }
+        frame(&mut app, &ctx, vec![]);
+        let grid_x0 = c.min.x + 58.0;
+        let row_c = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
+        let dot = egui::pos2(grid_x0 + 160.0 - 2.0, row_c - 24.0);
+        let up = egui::pos2(dot.x, dot.y - 24.0);
+        frame(&mut app, &ctx, vec![moved(dot), btn(dot, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(up)]);
+        // Mid-drag the status reads the dragged point's LIVE pitch.
+        assert!(
+            app.status.contains("curve point")
+                && app.status.contains("C6")
+                && app.status.contains("+2400"),
+            "drag echo = label + cents: {}",
+            app.status
+        );
+        frame(&mut app, &ctx, vec![moved(up), btn(up, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            let end = r.pat.note_bends[0].pts[1].1;
+            assert!((end - 2400.0).abs() < 60.0, "+48 px = the model cap: {end}");
+        }
+        assert!(
+            app.status.contains("curve point") && app.status.contains("(C6)"),
+            "release echo carries the label: {}",
+            app.status
+        );
+        // Zoom knob: row_h 22 → trail_half 44 px → 11 px = 300¢ (not 550¢).
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.row_h = 22.0;
+            r.pat.note_bends[0].pts = vec![(0.0, 0.0), (1.0, 1200.0)];
+            r.pat.bake_bends();
+        }
+        frame(&mut app, &ctx, vec![]);
+        let row_c = c.max.y - 10.0 + 500.0 - 22.0 * 60.5;
+        let dot = egui::pos2(grid_x0 + 160.0 - 2.0, row_c - 44.0);
+        let up = egui::pos2(dot.x, dot.y - 11.0);
+        frame(&mut app, &ctx, vec![moved(dot), btn(dot, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(up)]);
+        frame(&mut app, &ctx, vec![moved(up), btn(up, egui::PointerButton::Primary, false)]);
+        frame(&mut app, &ctx, vec![]);
+        {
+            let r = app.piano_roll.as_ref().unwrap();
+            let end = r.pat.note_bends[0].pts[1].1;
+            assert!(
+                (end - 1500.0).abs() < 30.0,
+                "zoomed: 55 px at 44px/1200¢ = 1500¢, got {end}"
+            );
+        }
+        crate::tune::set(crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT);
+    }
+
+    #[test]
+    fn v168_drag_echo_pitch_label() {
+        // MID-GESTURE the status line shows the live pitch as the EDO-
+        // aware label + cents (12-EDO: 400¢ above C4 = E4), every frame
+        // of the freehand stroke — and the release echo keeps the v105
+        // format with the label appended.
+        let mut app = headless_app("v168echo");
+        let ctx = egui::Context::default();
+        crate::tune::set(12, 60);
+        let c = v105_two_note_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let row_c = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
+        let z = |down: bool| egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: down,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let a = egui::pos2(grid_x0 + 80.0, row_c);
+        frame(&mut app, &ctx, vec![z(true), moved(a), btn(a, egui::PointerButton::Primary, true)]);
+        let b = egui::pos2(grid_x0 + 150.0, row_c - 8.0); // 8 px = 400 cents
+        frame(&mut app, &ctx, vec![moved(b)]);
+        assert!(
+            app.status.contains("E4") && app.status.contains("+400"),
+            "drag echo names the live pitch: {}",
+            app.status
+        );
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(b), btn(b, egui::PointerButton::Primary, false), z(false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("pitch curve") && app.status.contains("(E4)"),
+            "release echo carries the label: {}",
+            app.status
+        );
+        crate::tune::set(crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT);
+    }
+
+    /// Draw a 6px-up (300¢) Z-stroke on row 61 of a fresh rig at `tune`,
+    /// and return the committed app's status line.
+    fn v168_draw_300(tune: (u32, u8)) -> String {
+        let mut app = headless_app("v168edo");
+        let ctx = egui::Context::default();
+        crate::tune::set(tune.0, tune.1);
+        let c = v52_roll_rig(&mut app, &ctx);
+        {
+            let r = app.piano_roll.as_mut().unwrap();
+            r.pat.notes.push(crate::midipat::Note {
+                ch: 0,
+                note: 61,
+                vel: 100,
+                press: 0,
+                start: 0,
+                len: 480,
+                bend: None,
+            });
+        }
+        frame(&mut app, &ctx, vec![]);
+        let grid_x0 = c.min.x + 58.0;
+        let row_c = c.max.y - 10.0 + 500.0 - 11.0 * 61.5;
+        let z = |down: bool| egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: None,
+            pressed: down,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let a = egui::pos2(grid_x0 + 80.0, row_c);
+        let b = egui::pos2(grid_x0 + 150.0, row_c - 6.0);
+        frame(&mut app, &ctx, vec![z(true), moved(a), btn(a, egui::PointerButton::Primary, true)]);
+        frame(&mut app, &ctx, vec![moved(b)]);
+        frame(
+            &mut app,
+            &ctx,
+            vec![moved(b), btn(b, egui::PointerButton::Primary, false), z(false)],
+        );
+        frame(&mut app, &ctx, vec![]);
+        let status = app.status.clone();
+        crate::tune::set(crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT);
+        status
+    }
+
+    #[test]
+    fn v168_release_echo_edo_label() {
+        // The release echo follows the LIVE TUNING: +300¢ over row 61 is
+        // E4 at 12-EDO, but row 61 at 24-EDO sits a quarter-tone lower
+        // and the SAME gesture reads D#4+50c.
+        let s12 = v168_draw_300((12, 60));
+        assert!(s12.contains("(E4)"), "12-EDO echo: {s12}");
+        let s24 = v168_draw_300((24, 60));
+        assert!(s24.contains("(D#4+50c)"), "24-EDO echo: {s24}");
+    }
+
+    #[test]
+    fn v168_hover_dot_echo_pitch() {
+        // Hovering a curve dot reads out that point's pitch in the
+        // canvas readout (v71/v72 hover-text standard): "… · dot D#4
+        // (+300 cents)". The pointer event rides the probe frame.
+        let mut app = headless_app("v168hover");
+        let ctx = egui::Context::default();
+        crate::tune::set(12, 60);
+        let c = v105_curve_rig(&mut app, &ctx);
+        let grid_x0 = c.min.x + 58.0;
+        let row_c = c.max.y - 10.0 + 500.0 - 11.0 * 60.5;
+        let dot = egui::pos2(grid_x0 + 160.0 - 2.0, row_c - 6.0); // +300¢ / 50¢px
+        let shapes = v168_probe(&mut app, &ctx, vec![egui::Event::PointerMoved(dot)]);
+        let found = shapes.iter().any(|cs| {
+            matches!(&cs.shape, egui::epaint::Shape::Text(t)
+                if t.galley.text().contains("dot D#4 (+300 cents)"))
+        });
+        assert!(found, "hover on a curve dot echoes its pitch label");
+        crate::tune::set(crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT);
+    }
+
+    #[test]
+    fn v168_echo_and_axis_source() {
+        // Completeness audit (v54 source-scan law): the compressing
+        // auto-scale is GONE, every echo consumes the tune.rs single
+        // home, and the always-run trail paint loop allocates nothing.
+        // Needles use concat! so the pin cannot match its own text.
+        let ui_src = include_str!("ui.rs");
+        assert!(
+            !ui_src.contains(concat!("nb_", "disp")),
+            "the 600¢-step auto-scale is retired"
+        );
+        let home = concat!("tune::label_pitch_te", "xt_live");
+        assert_eq!(
+            ui_src.matches(home).count(),
+            7,
+            "3 drag + 1 hover + 3 release echoes consume the single home"
+        );
+        // The trail loop (always-run, per note) must be allocation-free.
+        let a = ui_src.find("let mut prev: Option<egui::Pos2> = None;").expect("trail loop");
+        let loop_body = &ui_src[a..a + 600];
+        assert!(loop_body.contains("cents_at"), "grabbed the trail loop");
+        assert!(
+            !loop_body.contains("format!") && !loop_body.contains("clone"),
+            "the trail paint loop must not allocate per frame"
         );
     }
 }

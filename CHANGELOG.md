@@ -8,6 +8,16 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Added
 
+- **Drawn pitch curves gained a readable axis.** A bent note's curve
+  trail now paints and drags at a constant cents-per-pixel: ±1200 cents
+  fills the trail box and a wilder swing EXTENDS it — a ±2-octave curve
+  paints fully, edits at the same precision, and the row-zoom wheel is
+  the curve-zoom knob. Every aim now reads back: while drawing or
+  dragging a curve point, the status line names the live pitch in the
+  project's tuning (`E4`, or `D#4+50c` in 24-EDO) plus the cents,
+  hovering a control dot reads its pitch on the canvas, and the release
+  echoes carry the label too.
+
 - **Microtonal keyboards now read.** With the octave-divisions setting
   off 12-EDO, every note label stays a standard note name on the rows
   that coincide with 12-EDO ("anchor" rows — a 24-EDO C-sharp still
