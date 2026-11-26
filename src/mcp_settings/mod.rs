@@ -99,6 +99,9 @@ pub const LIVE: &[&str] = &[
     "show_drums",
     "show_master",
     "spectrum_line",
+    // v170 (card t_3d0dfae8): child-track removal never-warn flag —
+    // pure UI gate, applying it live is correct.
+    "lane_rm_never_warn",
     "sc_send",
     "sc_recv_gain",
     "editor_probe",
