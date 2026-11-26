@@ -40,7 +40,8 @@ run live and in export.
    audio engine is up.
 3. Click the **hamburger ☰** (top-left) → settings panel:
    - **INPUTS** — tick the remote output ports you want to record (your mic /
-     instrument chain). Multiple inputs are summed.
+     instrument chain). With several ticked, each device records as its own
+     clip (see [Recording takes](#recording-takes)).
    - **OUTPUTS** — for each port tick **L**, **R** or both: `L` plays only
      the left side of the stereo mix, `R` only the right, and both play a
      mono downmix (the default behaviour).
@@ -266,6 +267,14 @@ Recording works with the transport stopped (you set the position by dragging
 the playhead first, then punch in), or while the project plays. The
 metronome can keep rolling while you record — its click is output-only and
 is **never** captured into a take.
+
+**Several devices, several clips.** With more than one input device ticked
+in the INPUTS list, each ticked device is captured **separately** and lands
+as its own clip on the armed track, named
+`project name-input device name-Track number` (e.g. `Live set-Motif M2-Track 3`).
+Recording the same device again appends `-2`, `-3`, …, so no take is ever
+overwritten. Nothing ticked, or only one thing ticked, records one clip as
+before.
 
 ### Preview bounce (`p`)
 
