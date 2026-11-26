@@ -8,6 +8,18 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Added
 
+- **Every input device now records as its own clip.** Ticking three
+  inputs in the INPUTS list and pressing record used to bounce ONE mixed
+  mono take per armed track — and a long-standing flag bug planted that
+  same take TWICE, which is why recordings always arrived as a pair.
+  Now each ticked input device is captured separately and lands as its
+  own clip on the armed track, named
+  `project name-input device name-Track number` (e.g.
+  `Live set-Motif M2-Track 3`); recording the same device again appends
+  `-2`, `-3`, … so no take is ever overwritten. Nothing ticked, or only
+  one thing ticked, behaves as before with one clip. Preview bounces,
+  loop takes and MIDI recording keep their established behaviour, and
+  the live take waveform keeps drawing while the recording rolls.
 - **Removing a child track now asks first.** Pressing `−` on a track
   whose last child track still holds clips opens a confirmation that
   names what is lost (the clips on that lane) and what is kept (the

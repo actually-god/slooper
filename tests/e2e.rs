@@ -1002,7 +1002,7 @@ fn v172_e2e_two_devices_two_takes() {
     let (cb, _s2) =
         Client::new("v172srcB", ClientOptions::NO_START_SERVER).expect("no JACK server");
     let ob = cb.register_port("out_a", AudioOut::default()).unwrap();
-    let vb = Arc::new(AtomicU32::new(-0.5f32.to_bits()));
+    let vb = Arc::new(AtomicU32::new((-0.5f32).to_bits()));
     let _b2 = cb.activate_async((), Cst { out: ob, val: vb }).unwrap();
     e2e_apply(
         &b,

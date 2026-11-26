@@ -7580,7 +7580,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Evt>(32);
         toggle_record(&e, 2, &NullSession, &tx); // arm
         assert_eq!(e.rec_state_of(2), TR_REC);
-        for k in 0..128u32 {
+        for _ in 0..128u32 {
             assert!(!e.rec_sample(2, 0.5));
         }
         toggle_record(&e, 2, &NullSession, &tx); // stop + ship
