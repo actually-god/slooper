@@ -927,7 +927,10 @@ const EXEMPTIONS: &[Ex] = &[
     Ex { kind: "blk", site: "ui.rs\tmix_column\tapp.fx_window = Some(t);", n: 1, why: "skip:window-open — opens/closes a window or picker; the surface change is the feedback (v72 open_*)" },
     Ex { kind: "blk", site: "ui.rs\tmix_column\tapp.synth_pick = Some(t);", n: 1, why: "skip:window-open — opens/closes a window or picker; the surface change is the feedback (v72 open_*)" },
     Ex { kind: "blk", site: "ui.rs\tmonitor_body\tapp.midi_log.clear();", n: 1, why: "skip:same-view — removal/clear repaints visibly; echo would repeat the widget (v86 R3)" },
-    Ex { kind: "blk", site: "ui.rs\track_body\tapp.proj_confirm = Some((name.clone(), pth.clone()));", n: 1, why: "skip:dialog-prompt — opens a confirm/rename editor that IS the feedback (v72 open_*)" },
+    // v181 (TS-025 R2): the old track_body arm into the retired
+    // proj_confirm twin is GONE (gate migrated onto the standard seam);
+    // the new seam fn echoes every verdict itself (v181 pins).
+    Ex { kind: "fn", site: "ui.rs\trequest_proj_load\trequest_proj_load", n: 1, why: "skip:dialog-prompt — opens the standard v170 seam whose verdicts all echo" },
     Ex { kind: "blk", site: "ui.rs\track_body\tapp.rack_collapsed.clear();", n: 1, why: "skip:view-state — selection/filter/collapse/toggle state paints itself (v86 R3)" },
     Ex { kind: "blk", site: "ui.rs\track_body\tapp.rack_collapsed.insert(format!(\"{}\\u{1}{d}\", f.path));", n: 1, why: "skip:view-state — selection/filter/collapse/toggle state paints itself (v86 R3)" },
     Ex { kind: "blk", site: "ui.rs\track_body\tapp.rack_collapsed.insert(key.clone());", n: 1, why: "skip:view-state — selection/filter/collapse/toggle state paints itself (v86 R3)" },
@@ -940,7 +943,6 @@ const EXEMPTIONS: &[Ex] = &[
     Ex { kind: "blk", site: "ui.rs\track_file_row\tapp.sample_edit_win = Some(fp_disp.clone());", n: 1, why: "skip:window-open — opens/closes a window or picker; the surface change is the feedback (v72 open_*)" },
     Ex { kind: "blk", site: "ui.rs\troll_rmb_menu\troll.pat.bend_segs.remove(i);", n: 1, why: "skip:same-view — removal/clear repaints visibly; echo would repeat the widget (v86 R3)" },
     Ex { kind: "blk", site: "ui.rs\troll_rmb_menu\troll.pat.notes.remove(ix);", n: 1, why: "skip:same-view — removal/clear repaints visibly; echo would repeat the widget (v86 R3)" },
-    Ex { kind: "blk", site: "ui.rs\tsave_prompt_window\tapp.show_save_prompt = false;", n: 1, why: "skip:dialog-prompt — opens a confirm/rename editor that IS the feedback (v72 open_*)" },
     Ex { kind: "blk", site: "ui.rs\tsettings_panel\tapp.mcp_token_shown = !shown;", n: 1, why: "skip:view-state — selection/filter/collapse/toggle state paints itself (v86 R3)" },
     Ex { kind: "blk", site: "ui.rs\tsettings_panel\tapp.project_dir = p.to_string_lossy().into_owned();", n: 1, why: "skip:file-dialog — the picked path shows in the field/panel it follows" },
     Ex { kind: "blk", site: "ui.rs\tsettings_panel\tapp.sel_midi.insert(n.clone());", n: 1, why: "skip:view-state — selection/filter/collapse/toggle state paints itself (v86 R3)" },

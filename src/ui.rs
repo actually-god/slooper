@@ -7282,6 +7282,10 @@ impl App {
             "mixer_follow_tracks" => self.mixer_follow_tracks = cfg.mixer_follow_tracks,
             "spectrum_line" => self.spectrum_line = cfg.spectrum_line,
             "lane_rm_never_warn" => self.lane_rm_never_warn = cfg.lane_rm_never_warn,
+            // v181 (TS-025 R3): read at the next save — live is correct.
+            "save_overwrite_never_warn" => {
+                self.save_overwrite_never_warn = cfg.save_overwrite_never_warn
+            }
             "show_midi" => self.show_midi = cfg.show_midi,
             "show_binds" => self.show_binds = cfg.show_binds,
             "theme" => self.light_theme = cfg.theme == "light",
@@ -58984,9 +58988,9 @@ mod tests {
         app.show_save_prompt = true;
         frame(&mut app, &ctx, vec![]);
         let r = painted_text_rect(&ctx, &mut app, "Save").expect("Save painted");
-        let texts = hover_until_tip(&mut app, &ctx, r.center(), &["write the project file"]);
+        let texts = hover_until_tip(&mut app, &ctx, r.center(), &["into the projects folder"]);
         assert!(
-            texts.iter().any(|t| t.contains("write the project file")),
+            texts.iter().any(|t| t.contains("into the projects folder")),
             "SAVE PROJECT Save must tooltip what it does; galleys: {texts:?}"
         );
         let mut app2 = headless_app("v71tip2");
