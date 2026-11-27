@@ -69544,6 +69544,10 @@ mod tests {
         frame(&mut app, &ctx, vec![]);
         let _ = app.ensure_asset(&wav);
         let key = wav.to_string_lossy().into_owned();
+        // Hermetic: a prior run of this very pin committed a reverse
+        // into the autosaved project — the window reads the map every
+        // frame, so clear it to pin the FRESH click semantics.
+        app.sample_edits.remove(&key);
         app.sample_edit_win = Some(key.clone());
         frame(&mut app, &ctx, vec![]);
         frame(&mut app, &ctx, vec![]);
@@ -69576,7 +69580,14 @@ mod tests {
             "reset must echo its own verb: {:?}",
             app.status
         );
-        assert!(!app.sample_edits[&key].reverse, "reset cleared the edit");
+        // Identity edits are pruned by se_apply (the source file is
+        // then the truth) — the reset's echo + a cleared map entry are
+        // the two halves of the honest outcome.
+        assert!(
+            !app.sample_edits.contains_key(&key),
+            "reset must clear the edit entry: {:?}",
+            app.sample_edits.keys().collect::<Vec<_>>()
+        );
     }
 
     /// v178 R2.4: the kit pad rows echo — mute names pad+sound, removal
