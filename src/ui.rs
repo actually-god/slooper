@@ -2419,6 +2419,22 @@ const SMAP_LANE_H: f32 = 24.0;
 const SMAP_KEY_H: f32 = 22.0;
 /// Sampler-map lane header cell width (layer combo + velocity + kill).
 const SMAP_HDR_W: f32 = 190.0;
+/// v180 (card t_bd658af5): default size of the floating script-synth
+/// window. The old non-sampler default 420 silently CLIPPED the kit pad
+/// rows' tail (v30 horizontal-clip trap): the row is left-anchored and
+/// its ✕ right edge measures 461.4 pt from the window left edge —
+/// name 56, ▶ 18, combo 110, wav 24, vel 52, ● 16, ✕ 16, spacing — so
+/// at 420 the mute/remove buttons did not exist until the user widened
+/// the window. 490 = 461.4 tail + 8 window margin + 14 scrollbar
+/// reserve, plus ~7 pt slack. Values frozen + seam scan:
+/// v180_synth_win_default_home.
+const SYNTH_WIN_DEF_W: f32 = 490.0;
+/// Synth window default height (v180 home; unchanged from the old pair).
+const SYNTH_WIN_DEF_H: f32 = 430.0;
+/// Sampler window default width (v52 R2: inline key map C2..C6 roll).
+const SAMPLER_WIN_DEF_W: f32 = 1150.0;
+/// Sampler window default height (v52 R2 pair; v180 home).
+const SAMPLER_WIN_DEF_H: f32 = 520.0;
 
 /// Left edge + width of the painted key / lane block for `note`
 /// (x0 = roll origin). Black notes straddle the boundary they paint.
@@ -16797,9 +16813,11 @@ impl App {
             .id(egui::Id::new(("synthwin", t)))
             .open(&mut open)
             .default_size(if is_sampler {
-                [1150.0, 520.0]
+                [SAMPLER_WIN_DEF_W, SAMPLER_WIN_DEF_H]
             } else {
-                [420.0, 430.0]
+                // v180 (card t_bd658af5): was 420 — clipped the kit rows'
+                // tail; the budget math lives at SYNTH_WIN_DEF_W.
+                [SYNTH_WIN_DEF_W, SYNTH_WIN_DEF_H]
             })
             .min_width(80.0)
             .min_height(70.0);
@@ -69879,23 +69897,14 @@ mod tests {
     /// v178 R2.4: the kit pad rows echo — mute names pad+sound, removal
     /// names the victim, add counts; the combo/drop/import echoes are
     /// pinned at source level (popup/dialog reachability, v50 trap (e)).
+    /// v180 (card t_bd658af5): this pin USED to drag-resize the window
+    /// first because the row tail was clipped out of existence at the
+    /// default width (v30 trap); the default now covers the row budget,
+    /// so the probe runs UNWIDENED — v180_kit_tail_default_width owns
+    /// the default-width paint contract.
     #[test]
     fn v178_kit_pad_echo() {
         let (mut app, ctx) = v65_synth_win("v178kitecho");
-        // WIDE first: the pad row trails (vel/mute/remove) are clipped
-        // out of existence at the default window width (v30 horizontal
-        // clip trap) — widen the window so the row's tail becomes real.
-        let si = app
-            .dyn_wins
-            .iter()
-            .position(|w| w.kind == DynKind::Synth(0))
-            .expect("synth window slot");
-        let sr = app.dyn_wins[si].rect;
-        let corner = egui::pos2(sr[0] + sr[2] - 1.5, sr[1] + sr[3] - 1.5);
-        drag_steps(&mut app, &ctx, corner, corner + egui::vec2(340.0, 0.0));
-        for _ in 0..4 {
-            frame(&mut app, &ctx, vec![]);
-        }
         // Mute pad 1 (stock name Kick): the ●→m flip needs naming.
         let mut dots = galley_centers(&mut app, &ctx, "\u{25cf}", true);
         if dots.is_empty() {
@@ -69960,6 +69969,110 @@ mod tests {
             kit.contains("kit::label_clipped("),
             "kit combo dropped the v87 clipped-identity check"
         );
+    }
+
+    /// v180 (card t_bd658af5): the kit pad rows' tail paints AND clicks
+    /// at the DEFAULT window width — no drag-resize step anywhere in this
+    /// pin (that step is exactly what v178's pin had to carry while the
+    /// default clipped the tail, the v30 horizontal-clip trap). Proves:
+    /// full tail on every row (AC1), geometry containment inside the
+    /// window rect (AC2), and a live mute click echoes at default (AC3).
+    #[test]
+    fn v180_kit_tail_default_width() {
+        let (mut app, ctx) = v65_synth_win("v180tail");
+        let si = app
+            .dyn_wins
+            .iter()
+            .position(|w| w.kind == DynKind::Synth(0))
+            .expect("synth window slot");
+        // v82 settle law: sample AFTER the frame(s) the scroll chrome
+        // needs, but never widen — the DEFAULT is the contract.
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let r = app.dyn_wins[si].rect;
+        assert_eq!(
+            r[2], SYNTH_WIN_DEF_W,
+            "the fresh synth window opens at the v180 home width"
+        );
+        // AC1: one ● and one ✕ per pad row — the tail is complete, not
+        // just "some tail somewhere".
+        let play = galley_centers(&mut app, &ctx, "\u{25b6}", true);
+        let dots = galley_centers(&mut app, &ctx, "\u{25cf}", true);
+        let xx = galley_centers(&mut app, &ctx, "\u{2715}", true);
+        assert!(!play.is_empty(), "kit pad rows painted");
+        assert_eq!(
+            dots.len(),
+            play.len(),
+            "mute tail missing on some rows: rows={} mute={}",
+            play.len(),
+            dots.len()
+        );
+        assert_eq!(
+            xx.len(),
+            play.len(),
+            "remove tail missing on some rows: rows={} remove={}",
+            play.len(),
+            xx.len()
+        );
+        // AC2: containment — rightmost ✕ (16 pt wide, galley centered)
+        // clears the window's right edge.
+        let right = r[0] + r[2];
+        let worst = xx.iter().map(|p| p.x).fold(f32::MIN, f32::max);
+        assert!(
+            worst + 8.0 <= right - 2.0,
+            "row tail crosses the clip edge: \u{2715} right {:.1} vs window right {right:.1}",
+            worst + 8.0
+        );
+        // AC3: the tail is REAL at default — click row-1 mute, echo.
+        let mut dots = dots;
+        dots.sort_by(|a, b| a.y.total_cmp(&b.y));
+        click_pt(&mut app, &ctx, *dots.first().expect("pad mute buttons"));
+        assert!(
+            app.status.starts_with("drum kit: pad 1 muted")
+                && app.status.contains("Kick"),
+            "mute must echo at the DEFAULT width: {:?}",
+            app.status
+        );
+    }
+
+    /// v180 (card t_bd658af5): the synth-window default size is a
+    /// geometry-home constant pair, the seam reads the consts (no
+    /// inline literals), and the values are frozen — with the measured
+    /// kit-row budget as a floor, so a future shrink that re-opens the
+    /// v30 clip fails HERE instead of silently clipping users.
+    #[test]
+    fn v180_synth_win_default_home() {
+        // Budget floor: 461.4 tail + 8 margin + 14 scrollbar reserve,
+        // measured by the card's probe run (card t_bd658af5). Bound
+        // through a let so clippy sees a non-constant comparison.
+        let budget_floor = SYNTH_WIN_DEF_W;
+        assert!(
+            budget_floor >= 483.0,
+            "synth default width {SYNTH_WIN_DEF_W} dropped under the measured kit-row budget"
+        );
+        assert_eq!(SYNTH_WIN_DEF_W, 490.0);
+        assert_eq!(SYNTH_WIN_DEF_H, 430.0);
+        assert_eq!(SAMPLER_WIN_DEF_W, 1150.0);
+        assert_eq!(SAMPLER_WIN_DEF_H, 520.0);
+        let prod = v178_prod();
+        let seam = prod
+            .find(".default_size(if is_sampler {")
+            .expect("synth window default_size seam");
+        let win = &prod[seam..seam + 420];
+        assert!(
+            win.contains("[SAMPLER_WIN_DEF_W, SAMPLER_WIN_DEF_H]")
+                && win.contains("[SYNTH_WIN_DEF_W, SYNTH_WIN_DEF_H]"),
+            "default_size no longer reads the geometry home"
+        );
+        // The old literals may haunt comments but must not return to
+        // the seam (active-literal polarity).
+        for bad in ["[420.0", "[1150.0", "430.0]", "520.0]"] {
+            assert!(
+                !win.contains(bad),
+                "raw default literal {bad:?} back inside the seam"
+            );
+        }
     }
 
     /// v178 R3.1: the stock surfaces share the ONE preset bar and the
