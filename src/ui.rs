@@ -59258,59 +59258,533 @@ mod tests {
         );
     }
 
+    // ---- v182 (TS-026): topbar / transport / echo-strip contract pins ----
+
+    /// Custom-viewport top-bar reader: paints one frame at (w × 480) and
+    /// returns every painted Text galley inside the top-bar band with its
+    /// absolute rect (the probe that froze the fold-tier budget).
+    fn v182_topbar_rows(
+        app: &mut App,
+        ctx: &egui::Context,
+        w: f32,
+        events: Vec<egui::Event>,
+        yband: f32,
+    ) -> Vec<(String, egui::Rect)> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(w, 480.0),
+            )),
+            time: Some(test_time()),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let mut rows = Vec::new();
+        for cs in &out.shapes {
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                let r = egui::Rect::from_min_size(
+                    t.pos + t.galley.rect.min.to_vec2(),
+                    t.galley.rect.size(),
+                );
+                if r.min.y < yband {
+                    rows.push((t.galley.text().to_string(), r));
+                }
+            }
+        }
+        let _ = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        out.textures_delta.clear();
+        rows
+    }
+
+    /// R2: the metronome echoes from BOTH entry points — the top-bar button
+    /// and the M shortcut share ONE seam (v68 one-voice law).
     #[test]
-    fn v182_tmp_probe_topbar_widths() {
-        let mut app = headless_app("v182probe");
+    fn v182_metro_echo_both_paths() {
+        let mut app = headless_app("v182metro");
         let ctx = egui::Context::default();
-        frame(&mut app, &ctx, vec![]); // installs fonts
-        let probe = |app: &mut App, w: f32| -> Vec<String> {
+        frame(&mut app, &ctx, vec![]);
+        let p = label_center(&mut app, &ctx, "METRO").expect("METRO painted");
+        click_pt(&mut app, &ctx, p);
+        assert!(app.metro_on, "click starts the click track");
+        assert!(
+            app.status.contains("metronome: on"),
+            "button path echoes through the strip: {:?}",
+            app.status
+        );
+        assert!(
+            !v25_hits(&mut app, &ctx, "metronome: on").is_empty(),
+            "button echo PAINTS on the strip"
+        );
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![key_ev(egui::Key::M, egui::Modifiers::NONE)],
+        );
+        assert!(!app.metro_on, "M stops the click track");
+        assert!(
+            app.status.contains("metronome: off"),
+            "shortcut path echoes too: {:?}",
+            app.status
+        );
+        assert!(
+            !v25_hits(&mut app, &ctx, "metronome: off").is_empty(),
+            "shortcut echo PAINTS on the strip (keyboard-only change is visible)"
+        );
+    }
+
+    /// R2: committing the grid boxes echoes the COMMITTED (clamped) value,
+    /// and an unchanged commit never re-echoes (no strip spam).
+    #[test]
+    fn v182_grid_tempo_echo() {
+        let mut app = headless_app("v182grid");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.metro_bpm = "132".into();
+        let br = app.bpm_rect.expect("bpm box painted").center();
+        click_pt(&mut app, &ctx, br);
+        // Leave focus via a neutral control (the Windows button, closed again).
+        let w = label_center(&mut app, &ctx, "Windows").expect("Windows button");
+        click_pt(&mut app, &ctx, w);
+        click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0));
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("grid tempo: 132 bpm \u{b7} 4 beats"),
+            "commit echoes the raw target: {:?}",
+            app.status
+        );
+        // Out-of-range input: the strip names the CLAMP, never the lie.
+        app.metro_bpm = "9".into();
+        let br = app.bpm_rect.expect("bpm box painted").center();
+        click_pt(&mut app, &ctx, br);
+        let w = label_center(&mut app, &ctx, "Windows").expect("Windows button");
+        click_pt(&mut app, &ctx, w);
+        click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0));
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("grid tempo: 20 bpm"),
+            "clamped commit echoes the COMMITTED value: {:?}",
+            app.status
+        );
+        // Unchanged commit: no new echo.
+        app.status = "sentinel-unchanged".into();
+        let br = app.bpm_rect.expect("bpm box painted").center();
+        click_pt(&mut app, &ctx, br);
+        let w = label_center(&mut app, &ctx, "Windows").expect("Windows button");
+        click_pt(&mut app, &ctx, w);
+        click_pt(&mut app, &ctx, egui::pos2(720.0, 700.0));
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.status, "sentinel-unchanged",
+            "re-committing the same grid must not spam the strip"
+        );
+    }
+
+    /// R1: an empty RECORD GROUP is a DISABLED verb with a hover reason —
+    /// clicking it changes nothing and echoes nothing (never silently inert:
+    /// the reason is stated). With members it is the v52 arm/stop echo.
+    #[test]
+    fn v182_rec_group_empty_disabled() {
+        let mut app = headless_app("v182recg");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.rec_group.is_empty(), "fresh app has no group");
+        let r = painted_text_rect(&ctx, &mut app, "REC GROUP").expect("REC GROUP painted");
+        // The hover states the REASON (disabled arm of the response chain).
+        let texts = hover_until_tip(&mut app, &ctx, r.center(), &["record group is empty"]);
+        assert!(
+            texts.iter().any(|t| t.contains("record group is empty")
+                && t.contains("REC group (selection)")),
+            "empty group must hover its reason; galleys: {texts:?}"
+        );
+        // A click arms NOTHING and echoes nothing.
+        app.status = "sentinel-inert".into();
+        click_pt(&mut app, &ctx, r.center());
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(
+            app.status, "sentinel-inert",
+            "empty group click must not echo (it did something it shows as disabled)"
+        );
+        // With a member: enabled, WARN idle text, real echo (v52 seam).
+        app.rec_group = vec![0];
+        frame(&mut app, &ctx, vec![]);
+        let r = painted_text_rect(&ctx, &mut app, "REC GROUP").expect("REC GROUP painted");
+        click_pt(&mut app, &ctx, r.center());
+        assert!(
+            app.status.contains("record group: 1 track(s) armed"),
+            "member arm echoes: {:?}",
+            app.status
+        );
+    }
+
+    /// R5: dock-all / float-all report their verdict on the strip, including
+    /// the honest "nothing moved" reading (capture/apply/reset already did).
+    #[test]
+    fn v182_layout_cmds_echo() {
+        let mut app = headless_app("v182lay");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let open_menu = |app: &mut App, ctx: &egui::Context| {
+            let w = label_center(app, ctx, "Windows").expect("Windows button");
+            click_pt(app, ctx, w);
+            frame(app, ctx, vec![]);
+        };
+        open_menu(&mut app, &ctx);
+        let f = label_center(&mut app, &ctx, "float all windows").expect("float-all item");
+        click_pt(&mut app, &ctx, f);
+        assert!(
+            app.status.contains("window(s) floated"),
+            "float-all echoes its verdict: {:?}",
+            app.status
+        );
+        open_menu(&mut app, &ctx);
+        let f = label_center(&mut app, &ctx, "float all windows").expect("float-all item");
+        click_pt(&mut app, &ctx, f);
+        assert!(
+            app.status.contains("already floating"),
+            "no-op float-all says so honestly: {:?}",
+            app.status
+        );
+        open_menu(&mut app, &ctx);
+        let d = label_center(&mut app, &ctx, "dock all windows").expect("dock-all item");
+        click_pt(&mut app, &ctx, d);
+        assert!(
+            app.status.contains("window(s) docked"),
+            "dock-all echoes its verdict: {:?}",
+            app.status
+        );
+        open_menu(&mut app, &ctx);
+        let d = label_center(&mut app, &ctx, "dock all windows").expect("dock-all item");
+        click_pt(&mut app, &ctx, d);
+        assert!(
+            app.status.contains("already docked"),
+            "no-op dock-all says so honestly: {:?}",
+            app.status
+        );
+    }
+
+    /// R2: the transport's echo has ONE voice — the engine's
+    /// Evt::Transport seam. Neither the top-bar button nor the shortcut
+    /// arm adds a second copy of the same sentence.
+    #[test]
+    fn v182_transport_echo_single_voice() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").unwrap_or(srcs.len())];
+        assert_eq!(
+            prod.matches("\"transport running\"").count(),
+            1,
+            "the transport-echo sentence must exist exactly once"
+        );
+        assert_eq!(prod.matches("\"transport stopped\"").count(), 1);
+        let tb = &prod[prod.find("fn top_bar(").unwrap()..prod.find("fn file_buttons(").unwrap()];
+        assert!(
+            !tb.contains("transport running") && !tb.contains("transport stopped"),
+            "the PLAY button must not add a second transport voice"
+        );
+        let fm =
+            &prod[prod.find("fn fire_midi_action").unwrap()..prod.find("fn handle_evt").unwrap()];
+        assert!(
+            !fm.contains("self.status"),
+            "fire_midi_action must not echo directly — its actions echo via their seams"
+        );
+    }
+
+    /// R3: the strip's lifetime is FROZEN (fade start / TTL / dim floor) and
+    /// its priority law is last-write-wins; an aged notice leaves the bar
+    /// for the idle summary and survives only in the tooltip.
+    #[test]
+    fn v182_echo_lifetime() {
+        let fade_s = STATUS_FADE_START_S;
+        let ttl = STATUS_TTL_S;
+        let floor = STATUS_FADE_FLOOR;
+        assert_eq!(fade_s, 6.0);
+        assert_eq!(ttl, 12.0);
+        assert!((floor - 0.15).abs() < 1e-9);
+        let mut app = headless_app("v182life");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let status_ink = |app: &mut App, ctx: &egui::Context, needle: &str| -> Option<u32> {
             let raw = egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(w, 480.0),
+                    egui::vec2(1440.0, 853.0),
                 )),
                 time: Some(test_time()),
                 ..Default::default()
             };
             let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
-            let needles = [
-                "slooper", "PLAY", "REC GROUP", "METRO", "bpm", "beat",
-                "Export", "Meter", "Drums", "Windows", "Load", "Save as",
-                "Save", "Hz", "More", "audio engine",
-            ];
-            let mut rows: Vec<String> = Vec::new();
-            for cs in &out.shapes {
+            let ink = out.shapes.iter().rev().find_map(|cs| {
                 if let egui::epaint::Shape::Text(t) = &cs.shape {
-                    let txt = t.galley.text().replace('\n', " / ");
-                    if txt.chars().count() > 60 {
-                        continue;
+                    if t.galley.text().contains(needle) {
+                        let c = t.galley.job.sections.first()?.format.color;
+                        return Some(c.r() as u32 + c.g() as u32 + c.b() as u32);
                     }
-                    if needles.iter().any(|n| txt.contains(n)) {
-                        let r = egui::Rect::from_min_size(
-                            t.pos + t.galley.rect.min.to_vec2(),
-                            t.galley.rect.size(),
-                        );
-                        rows.push(format!(
-                            "  x{:6.1}..{:6.1} y{:5.1} {txt:?}",
-                            r.min.x, r.max.x, r.min.y
+                }
+                None
+            });
+            let _ = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            out.textures_delta.clear();
+            ink
+        };
+        app.status = "notice alpha".into();
+        app.status_at = std::time::Instant::now();
+        let bright = status_ink(&mut app, &ctx, "notice alpha").expect("fresh notice painted");
+        app.status_at -= std::time::Duration::from_secs(9);
+        let dim = status_ink(&mut app, &ctx, "notice alpha").expect("fading notice painted");
+        assert!(dim < bright, "notice must dim (bright {bright} -> dim {dim})");
+        app.status_at -= std::time::Duration::from_secs(20);
+        assert!(
+            !v25_hits(&mut app, &ctx, "audio engine: offline").is_empty(),
+            "aged notice is replaced by the live idle summary"
+        );
+        assert!(
+            v25_hits(&mut app, &ctx, "notice alpha").is_empty(),
+            "aged raw text must leave the bar itself"
+        );
+        let field = painted_text_rect(&ctx, &mut app, "audio engine: offline")
+            .expect("idle summary painted");
+        let texts = hover_until_tip(&mut app, &ctx, field.center(), &["last message"]);
+        assert!(
+            texts.iter().any(|t| t.contains("last message") && t.contains("notice alpha")),
+            "the raw text survives in the tooltip; galleys: {texts:?}"
+        );
+        // Priority: within a frame the LAST write owns the strip.
+        app.status = "first message".into();
+        app.status = "second message".into();
+        frame(&mut app, &ctx, vec![]);
+        assert!(!v25_hits(&mut app, &ctx, "second message").is_empty());
+        assert!(v25_hits(&mut app, &ctx, "first message").is_empty());
+    }
+
+    /// R3: the strip is the app's ONE feedback home — the freshness seam
+    /// exists once, exactly one painter renders the field, and no other
+    /// status clone feeds any widget outside them.
+    #[test]
+    fn v182_echo_strip_single_home() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").unwrap_or(srcs.len())];
+        assert_eq!(
+            prod.matches("self.status_seen = self.status.clone();").count(),
+            1,
+            "the freshness seam (every write re-lights the strip) must exist exactly once"
+        );
+        assert_eq!(
+            prod.matches("RichText::new(status)").count(),
+            1,
+            "exactly ONE painted status field in the whole app"
+        );
+        // status text reaches a widget only inside top_bar (plus the seam).
+        let tb = &prod[prod.find("fn top_bar(").unwrap()..prod.find("fn file_buttons(").unwrap()];
+        assert_eq!(tb.matches("app.status.clone()").count(), 2, "strip + tooltip reads");
+        let outside = prod.replace(tb, "").replace("self.status_seen = self.status.clone();", "");
+        assert!(
+            !outside.contains("app.status.clone()") && !outside.contains("self.status.clone()"),
+            "no other surface may read the status text for display"
+        );
+    }
+
+    /// R1: every interactive control in the top-bar corridor (inline row,
+    /// Windows popup, More… popup, seam render fns) carries hover copy.
+    #[test]
+    fn v182_topbar_hover_completeness() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").unwrap_or(srcs.len())];
+        let span =
+            &prod[prod.find("fn top_bar(").unwrap()..prod.find("/// Playhead position as").unwrap()];
+        const CTLS: [&str; 5] = [
+            ".button(",
+            ".checkbox(",
+            "Button::selectable",
+            "TextEdit::singleline",
+            ".add(g_btn)",
+        ];
+        let mut offenders: Vec<String> = Vec::new();
+        for ctl in CTLS {
+            for (i, _) in span.match_indices(ctl) {
+                let win = &span[i..(i + 600).min(span.len())];
+                let hover = ["on_hover_text", "on_disabled_hover_text", "hint_text"]
+                    .iter()
+                    .map(|n| win.find(n).unwrap_or(usize::MAX))
+                    .min()
+                    .unwrap();
+                let next_ctl = CTLS
+                    .iter()
+                    .filter(|c| **c != ctl)
+                    .map(|c| win[1..].find(*c).map(|p| p + 1).unwrap_or(usize::MAX))
+                    .min()
+                    .unwrap();
+                if hover > next_ctl {
+                    let head: String = win.chars().take(60).collect();
+                    offenders.push(head.replace('\n', " "));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "top-bar controls without hover copy:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// R4: at every width from the 780 floor to the default, no top-bar
+    /// galley leaves the screen and none overlaps another (the v30/v44
+    /// horizontal-clip / push class, incl. a pathologically long project
+    /// name). At 780 the folded verbs are reachable through the More… popup.
+    #[test]
+    fn v182_topbar_narrow_floor() {
+        let mut app = headless_app("v182floor");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.proj_name = "very long project title that keeps growing and growing".into();
+        let mut offenders: Vec<String> = Vec::new();
+        for w in [780.0f32, 900.0, 950.0, 1020.0, 1200.0, 1440.0] {
+            let rows = v182_topbar_rows(&mut app, &ctx, w, vec![], TOPBAR_H);
+            assert!(!rows.is_empty(), "top bar paints at {w}");
+            for (t, r) in &rows {
+                if r.max.x > w + 1.0 {
+                    offenders.push(format!("{w}: {t:?} runs past the edge to {:.1}", r.max.x));
+                }
+            }
+            for i in 0..rows.len() {
+                for j in (i + 1)..rows.len() {
+                    if rows[i].1.intersects(rows[j].1) {
+                        offenders.push(format!(
+                            "{w}: {:?} overlaps {:?}",
+                            rows[i].0, rows[j].0
                         ));
                     }
                 }
             }
-            let _ = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
-            out.textures_delta.clear();
-            rows
-        };
-        for name in ["", "very long project title that keeps growing and growing"] {
-            app.proj_name = name.to_string();
-            println!("== proj_name={:?}", name);
-            for w in [1440.0f32, 1200.0, 1050.0, 950.0, 780.0] {
-                println!(" -- width {w}");
-                for row in probe(&mut app, w) {
-                    println!("{row}");
-                }
+        }
+        assert!(offenders.is_empty(), "top bar clip/overlap offenders:\n{}", offenders.join("\n"));
+        // The 780 floor is honest: More… opens and carries the folded verbs.
+        let mut app2 = headless_app("v182floor2");
+        frame(&mut app2, &ctx, vec![]);
+        let rows = v182_topbar_rows(&mut app2, &ctx, 780.0, vec![], TOPBAR_H);
+        assert!(rows.iter().any(|(t, _)| t == "PLAY" || t == "STOP"), "PLAY stays inline");
+        assert!(rows.iter().any(|(t, _)| t.contains("More")), "More… painted at 780");
+        assert!(
+            !v182_topbar_rows(&mut app2, &ctx, 780.0, vec![], 200.0)
+                .iter()
+                .any(|(t, _)| t == "bpm"),
+            "grid folded at 780 (nothing below the bar either)"
+        );
+        let m = rows
+            .iter()
+            .find(|(t, _)| t.contains("More"))
+            .expect("More… button")
+            .1
+            .center();
+        v182_topbar_rows(&mut app2, &ctx, 780.0, vec![moved(m)], 200.0);
+        v182_topbar_rows(&mut app2, &ctx, 780.0, vec![btn(m, egui::PointerButton::Primary, true)], 200.0);
+        v182_topbar_rows(
+            &mut app2,
+            &ctx,
+            780.0,
+            vec![btn(m, egui::PointerButton::Primary, false)],
+            200.0,
+        );
+        let rows = v182_topbar_rows(&mut app2, &ctx, 780.0, vec![], 200.0);
+        assert!(rows.iter().any(|(t, _)| t == "bpm"), "popup carries the bpm box");
+        assert!(
+            rows.iter().any(|(t, _)| t.contains("REC GROUP")),
+            "popup carries REC GROUP"
+        );
+        assert!(rows.iter().any(|(t, _)| t == "Load"), "compact popup carries Load");
+    }
+
+    /// R6: the documented shortcut table and the REAL binding table agree —
+    /// both directions (a new bound slot without a doc row, or a doc row
+    /// with no binding, goes RED here).
+    #[test]
+    fn v182_shortcut_docs_parity() {
+        let usage = include_str!("../docs/USAGE.md");
+        let sec = &usage[usage.find("## Keyboard shortcuts").unwrap()..];
+        let table = &sec[..sec.find("\nWhile the **piano roll").unwrap_or(sec.len())];
+        let app = headless_app("v182keys");
+        // Docs -> code: every documented rebindable key is really bound.
+        for (tok, key) in [
+            ("Space", Some(egui::Key::Space)),
+            ("R", Some(egui::Key::R)),
+            ("C", Some(egui::Key::C)),
+            ("E", Some(egui::Key::E)),
+            ("M", Some(egui::Key::M)),
+            ("Home", Some(egui::Key::Home)),
+            ("End", Some(egui::Key::End)),
+        ] {
+            assert!(
+                table.contains(&format!("`{tok}`")),
+                "USAGE.md lost the `{tok}` row"
+            );
+            let k = key.unwrap();
+            assert!(
+                app.short_keys.contains(&Some(k)),
+                "`{tok}` is documented but no longer bound"
+            );
+        }
+        // Fixed (non-slot) rows the docs promise.
+        for tok in [
+            "`1`–`4`",
+            "`Ctrl+S`",
+            "`Ctrl+Shift+S`",
+            "`Ctrl+K`",
+            "`Delete`",
+            "`S`",
+            "`F9`",
+        ] {
+            assert!(table.contains(tok), "USAGE.md lost the {tok:?} row");
+        }
+        // Code -> docs: every bound default slot has a doc row.
+        let mut missing: Vec<String> = Vec::new();
+        for (i, slot) in app.short_keys.iter().enumerate() {
+            let Some(k) = slot else { continue };
+            let tok = key_display(*k);
+            let documented = match tok.as_str() {
+                "space" => table.contains("`Space`"),
+                "1" | "2" | "3" | "4" => table.contains("`1`–`4`"),
+                other => table.contains(&format!("`{other}`")),
+            };
+            if !documented {
+                missing.push(format!("slot {i} = {tok} ({})", MidiAction::ALL[i].label()));
             }
         }
+        assert!(
+            missing.is_empty(),
+            "bound shortcut defaults missing from USAGE.md: {missing:?}"
+        );
+    }
+
+    /// R7: the dock-chrome tints live in ONE home each (adopted byte-equal,
+    /// kit::MUTED for the idle ring); MIN_SHARE is declared once.
+    #[test]
+    fn v182_dock_tints_single_home() {
+        let srcs = include_str!("ui.rs");
+        let prod = &srcs[..srcs.find("\nmod tests").unwrap_or(srcs.len())];
+        for lit in [
+            "Color32::from_rgb(48, 52, 60)",
+            "Color32::from_rgb(70, 96, 128)",
+            "Color32::from_rgb(24, 26, 30)",
+        ] {
+            assert_eq!(
+                prod.matches(lit).count(),
+                1,
+                "{lit} must live ONLY in its COL_DOCK_* home"
+            );
+        }
+        assert_eq!(
+            prod.matches("egui::Stroke::new(1.0, Color32::from_gray(110))")
+                .count(),
+            0,
+            "the dock-button idle ring must ride kit::MUTED"
+        );
+        assert_eq!(prod.matches("const MIN_SHARE: f32 = 56.0;").count(), 1);
+        // Frozen values (adoption was byte-equal — zero visual drift).
+        let btn: egui::Color32 = COL_DOCK_BTN;
+        let hot: egui::Color32 = COL_DOCK_BTN_HOT;
+        let tab: egui::Color32 = COL_DOCK_TAB_BG;
+        assert_eq!(btn, egui::Color32::from_rgb(48, 52, 60));
+        assert_eq!(hot, egui::Color32::from_rgb(70, 96, 128));
+        assert_eq!(tab, egui::Color32::from_rgb(24, 26, 30));
     }
 
     /// v72 R1: status-echo inventory (goal 1 sweep 2). Every action the
