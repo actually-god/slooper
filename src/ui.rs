@@ -1891,9 +1891,9 @@ pub struct App {
     /// primary-folder rule). Any rack root or sub-folder can be picked
     /// from the folder's right-click menu.
     record_target: String,
-    /// v50 R6: project row clicked in the rack, awaiting the
-    /// overwrite-safety confirmation: (name, file).
-    proj_confirm: Option<(String, PathBuf)>,
+    // v181 (TS-025 R2): the retired `proj_confirm` field's job now
+    // lives in `pending_confirm` (the standard seam) — see
+    // `App::request_proj_load`.
     /// v170 (card t_3d0dfae8): the pending STANDARD confirmation
     /// (kit::confirm) + the effect its Yes verdict runs. One slot at a
     /// time — modals never stack (the helper is the single render home).
@@ -1902,6 +1902,10 @@ pub struct App {
     /// track (Config.lane_rm_never_warn; set only via the standard
     /// confirm dialog's checked+confirmed path).
     lane_rm_never_warn: bool,
+    /// v181 (TS-025 R3): persisted "Never warn again" for saving over a
+    /// FOREIGN existing project file (Config.save_overwrite_never_warn;
+    /// set only via the standard confirm dialog's checked+Yes path).
+    save_overwrite_never_warn: bool,
     /// v29: group the rack by sub-folder instead of by asset type.
     rack_group_by_dir: bool,
     /// v29: rename dialog: (asset file path, draft stem, focus-once).
@@ -2806,9 +2810,9 @@ impl App {
             rack_collapsed: cfg.rack_collapsed.iter().cloned().collect(),
             rack_dir_order: cfg.rack_dir_order.clone(),
             record_target: cfg.record_target.clone(),
-            proj_confirm: None,
             pending_confirm: None,
             lane_rm_never_warn: cfg.lane_rm_never_warn,
+            save_overwrite_never_warn: cfg.save_overwrite_never_warn,
             rack_group_by_dir: cfg.rack_group_by_dir,
             rack_rename: None,
             sample_edits: Default::default(),
@@ -6841,6 +6845,7 @@ impl App {
             mixer_follow_tracks: self.mixer_follow_tracks,
             spectrum_line: self.spectrum_line,
             lane_rm_never_warn: self.lane_rm_never_warn,
+            save_overwrite_never_warn: self.save_overwrite_never_warn,
             show_midi: self.show_midi,
             show_binds: self.show_binds,
             side_wins: self.side_wins,
@@ -7277,6 +7282,10 @@ impl App {
             "mixer_follow_tracks" => self.mixer_follow_tracks = cfg.mixer_follow_tracks,
             "spectrum_line" => self.spectrum_line = cfg.spectrum_line,
             "lane_rm_never_warn" => self.lane_rm_never_warn = cfg.lane_rm_never_warn,
+            // v181 (TS-025 R3): read at the next save — live is correct.
+            "save_overwrite_never_warn" => {
+                self.save_overwrite_never_warn = cfg.save_overwrite_never_warn
+            }
             "show_midi" => self.show_midi = cfg.show_midi,
             "show_binds" => self.show_binds = cfg.show_binds,
             "theme" => self.light_theme = cfg.theme == "light",
@@ -18847,6 +18856,47 @@ impl App {
             self.status = "save: the project needs a name".into();
             return;
         }
+        // v181 (TS-025 R3): saving over a FOREIGN existing project is
+        // an irreversible overwrite — the standard gate asks first
+        // (never-warn persists to `save_overwrite_never_warn`). Saving
+        // over the LOADED project's own path is the ordinary Ctrl+S
+        // and never asks (nag-class by the v170 standard).
+        if name != self.proj_name
+            && !self.save_overwrite_never_warn
+            && project::project_path(&self.projects_dir(), &name).exists()
+        {
+            if self.pending_confirm.is_none() {
+                self.pending_confirm = Some(PendingConfirm {
+                    ask: crate::kit::ConfirmAsk {
+                        kind: "save_overwrite",
+                        title: "Overwrite project file?",
+                        body: format!(
+                            "A project named \u{201c}{name}\u{201d} already \
+                             exists \u{2014} saving replaces its file and \
+                             rewrites its audio sidecar folder."
+                        ),
+                        note: Some(
+                            "The work on screen is untouched \u{2014} \
+                             Cancel only aborts the save."
+                                .into(),
+                        ),
+                        confirm_label: "Overwrite",
+                        alt_label: None,
+                        alt_hover: None,
+                        never_warn_label: Some("Never warn again"),
+                        never_warn: false,
+                    },
+                    effect: ConfirmEffect::SaveOverwrite { name },
+                });
+            }
+            return;
+        }
+        self.do_save_now(&name);
+    }
+
+    /// v181: the write body of a save, past every name/overwrite gate.
+    /// Success echoes the file it wrote (AC2: result names the path).
+    fn do_save_now(&mut self, name: &str) {
         let dir = self.projects_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             self.status = format!("save: {e}");
@@ -18930,12 +18980,16 @@ impl App {
                 }
             }
         }
-        let pr = self.build_project(name.clone());
-        match project::save(&project::project_path(&dir, &name), &pr) {
+        let pr = self.build_project(name.to_string());
+        let pth = project::project_path(&dir, name);
+        match project::save(&pth, &pr) {
             Ok(()) => {
-                self.proj_name = name.clone();
+                self.proj_name = name.to_string();
                 self.show_save_prompt = false;
-                self.status = format!("saved project “{name}”");
+                self.status = format!(
+                    "saved project \u{201c}{name}\u{201d} \u{b7} {}",
+                    pth.display()
+                );
             }
             Err(e) => self.status = format!("save: {e}"),
         }
@@ -19716,6 +19770,8 @@ impl App {
         let worker = std::thread::Builder::new()
             .name("slooper-export".into())
             .spawn(move || {
+                // v181: render+encode wall time, echoed on success.
+                let t0 = std::time::Instant::now();
                 let res = (|| -> Result<usize, String> {
                     let (buf, n) = if let Some(items) = &items {
                         let (_from, s) =
@@ -19741,12 +19797,15 @@ impl App {
                 })();
                 let msg = match res {
                     Ok(n) => format!(
-                        "exported {} · {label}",
+                        // v181 (TS-025 R5): the result echo carries the
+                        // wall-clock render time (AC2 duration).
+                        "exported {} · {label} · {:.1} s",
                         if n > 0 {
                             format!("{n} clip(s)")
                         } else {
                             "mix".into()
-                        }
+                        },
+                        t0.elapsed().as_secs_f32()
                     ),
                     Err(e) => format!("export: {e}"),
                 };
@@ -20989,7 +21048,6 @@ impl App {
         save_prompt_window(ui, self);
         load_window(ui, self);
         track_template_window(ui, self);
-        proj_confirm_window(ui, self);
         standard_confirm_window(ui, self);
         self.load_opts_window(ui);
         self.sample_edit_window(ui);
@@ -26558,7 +26616,10 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                             );
                             rack_kind_badge(ui, prow.rect, 3);
                             if prow.clicked() {
-                                app.proj_confirm = Some((name.clone(), pth.clone()));
+                                // v181 (TS-025 R2): the standard seam owns
+                                // this confirmation now (Esc = Cancel, Alt =
+                                // save-current hatch, echo on every verdict).
+                                app.request_proj_load(name, pth.clone());
                             }
                         }
                     }
@@ -32012,6 +32073,9 @@ fn export_window(ui: &mut egui::Ui, app: &mut App) {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui.button("Cancel").on_hover_text("close without exporting").clicked() {
+                    // v181 (TS-025 R7): a closed dialog echoes too.
+                    app.status =
+                        "export window closed \u{2014} nothing rendered".into();
                     cancelled = true;
                 }
                 if ui.button("Export").on_hover_text("render the mix to the chosen file").clicked() {
@@ -33399,26 +33463,44 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
             ) {
                 any = true;
             ui.horizontal(|ui| {
+                // v181 (TS-025 R4): the reset destroys three things but
+                // used to advertise one — the hover now names its FULL
+                // blast radius, and one click arms the standard
+                // confirmation (plain pair: a never-warn on a reset
+                // would just restore the one-click destroyer).
                 if ui
                     .button("Reset to Defaults")
-                    .on_hover_text("restore every shortcut to its shipped default")
+                    .on_hover_text(
+                        "restore every shortcut to its shipped default AND \
+                         clear every app-global MIDI binding and knob \
+                         calibration \u{b7} cannot be undone \u{b7} the \
+                         project MIDI BINDINGS window is untouched",
+                    )
                     .clicked()
+                    && app.pending_confirm.is_none()
                 {
-                    for (k, d) in app.short_keys.iter_mut().zip(SHORTCUT_DEFAULTS.iter()) {
-                        *k = *d;
-                    }
-                    for m in app.midi_binds.iter_mut() {
-                        *m = None;
-                    }
-                    // v25: the reset also drops axis calibration (the
-                    // knob min/max sweeps) — it belongs to the bindings
-                    // being cleared, and silently keeping it made the
-                    // button a partial lie.
-                    for c in app.knob_cal.iter_mut() {
-                        *c = None;
-                    }
-                    app.save_config();
-                    app.status = "bindings reset to defaults".into();
+                    app.pending_confirm = Some(PendingConfirm {
+                        ask: crate::kit::ConfirmAsk {
+                            kind: "bindings_reset",
+                            title: "Reset bindings to defaults?",
+                            body: "Every keyboard shortcut returns to \
+                                   its shipped default, and every \
+                                   app-global MIDI binding and knob \
+                                   calibration is cleared."
+                                .into(),
+                            note: Some(
+                                "The MIDI BINDINGS window\u{2019}s \
+                                 per-project bindings are not touched."
+                                    .into(),
+                            ),
+                            confirm_label: "Reset",
+                            alt_label: None,
+                            alt_hover: None,
+                            never_warn_label: None,
+                            never_warn: false,
+                        },
+                        effect: ConfirmEffect::ResetBindings,
+                    });
                 }
             });
             // v68: the mix-page hotkey is intentionally NOT a slot row
@@ -34053,10 +34135,26 @@ fn save_prompt_window(ui: &mut egui::Ui, app: &mut App) {
             );
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("Save").on_hover_text("write the project file").clicked() {
+                if ui
+                    .button("Save")
+                    .on_hover_text(format!(
+                        "write \u{201c}<name>\u{201d}.{} into the projects \
+                         folder \u{b7} an existing file is replaced only \
+                         after you confirm",
+                        project::EXT
+                    ))
+                    .clicked()
+                {
                     do_save = true;
                 }
-                if ui.button("Cancel").on_hover_text("close the prompt without saving").clicked() {
+                if ui
+                    .button("Cancel")
+                    .on_hover_text("close the prompt without saving")
+                    .clicked()
+                {
+                    // v181 (TS-025 R7): even a refusal echoes.
+                    app.status =
+                        "save prompt closed \u{2014} nothing was written".into();
                     app.show_save_prompt = false;
                 }
             });
@@ -34192,15 +34290,8 @@ fn load_window(ui: &mut egui::Ui, app: &mut App) {
         });
     if let Some(p) = load {
         // v42: opening a project asks WHAT to import first.
-        match project::load(&p) {
-            Ok(pr) => {
-                app.pending_proj = Some(pr);
-                app.pending_proj_dir = p.parent().map(|d| d.to_path_buf());
-                app.load_sel = LoadSel::all();
-                app.show_load_opts = true;
-            }
-            Err(e) => app.status = format!("load: {e}"),
-        }
+        // v181: same seam tail as the rack-project gate.
+        app.start_project_load(&p);
     }
     app.show_load = open;
 }
@@ -34226,6 +34317,19 @@ pub(crate) enum ConfirmEffect {
     /// Never-warn checkbox verdict rides in `PendingConfirm::ask`
     /// (single source), never duplicated here.
     RemoveLane { t: usize },
+    /// v181 (TS-025 R2): a rack project row was clicked — loading
+    /// REPLACES the current project. `Yes` opens the existing slice
+    /// chooser; `Alt` (the escape hatch) saves the current project to
+    /// its own name FIRST, then the same chooser.
+    LoadProject { path: PathBuf },
+    /// v181 (TS-025 R3): a save-as names an EXISTING project that is
+    /// not the one loaded — `Yes` proceeds with the write; the
+    /// never-warn verdict persists `save_overwrite_never_warn`.
+    SaveOverwrite { name: String },
+    /// v181 (TS-025 R4): the settings Reset-to-Defaults gate — `Yes`
+    /// restores every shortcut, clears every app-global MIDI binding
+    /// and drops every knob calibration.
+    ResetBindings,
 }
 
 /// A modal request parked between frames: the dialog content + the
@@ -34267,11 +34371,92 @@ impl App {
                     "The clips\u{2019} assets stay saved in the asset rack.".into(),
                 ),
                 confirm_label: "Remove",
+                alt_label: None,
+                alt_hover: None,
                 never_warn_label: Some("Never warn again"),
                 never_warn: false,
             },
             effect: ConfirmEffect::RemoveLane { t },
         });
+    }
+
+    /// v181 (TS-025 R2): the project-load gate — the rack project row's
+    /// ONLY route into loading. Replaces the retired hand-rolled
+    /// `proj_confirm_window` (pre-v170 chrome, no Esc wiring) with the
+    /// standard seam: Load = Yes, "Save current & load" = the Alt
+    /// hatch, Cancel/Esc = safe no-op that echoes what survived.
+    pub(crate) fn request_proj_load(&mut self, name: &str, path: PathBuf) {
+        if self.pending_confirm.is_some() {
+            return; // one modal at a time
+        }
+        let now = if self.proj_name.is_empty() {
+            String::new()
+        } else {
+            format!("(now \u{201c}{}\u{201d}) ", self.proj_name)
+        };
+        let hatch = (!self.proj_name.is_empty()).then_some("Save current & load");
+        let hatch_hover = (!self.proj_name.is_empty()).then(|| {
+            format!(
+                "save the current project as \u{201c}{}\u{201d} first, then load",
+                self.proj_name
+            )
+        });
+        self.pending_confirm = Some(PendingConfirm {
+            ask: crate::kit::ConfirmAsk {
+                kind: "proj_load",
+                title: "Load project?",
+                body: format!(
+                    "Load project \u{201c}{name}\u{201d}? This replaces the \
+                     current project\u{2019}s tracks, clips and controls \
+                     {now}\u{2014} save it first if you want to keep it."
+                ),
+                note: Some(
+                    "Nothing is deleted here \u{2014} the current work stays \
+                     on disk if you saved it."
+                        .into(),
+                ),
+                confirm_label: "Load",
+                alt_label: hatch,
+                alt_hover: hatch_hover,
+                never_warn_label: None,
+                never_warn: false,
+            },
+            effect: ConfirmEffect::LoadProject { path },
+        });
+    }
+
+    /// v181: the shared tail of the load gate — parse, then the v42
+    /// slice chooser before anything changes. Failure names the reason.
+    fn start_project_load(&mut self, path: &Path) {
+        match project::load(path) {
+            Ok(pr) => {
+                self.pending_proj = Some(pr);
+                self.pending_proj_dir = path.parent().map(|d| d.to_path_buf());
+                self.load_sel = LoadSel::all();
+                self.show_load_opts = true;
+            }
+            Err(e) => self.status = format!("load: {e}"),
+        }
+    }
+
+    /// v181 (TS-025 R4): the settings reset body, behind the standard
+    /// confirmation. v25 rule kept: the axis (knob) calibration belongs
+    /// to the bindings being cleared — a partial reset was a lie.
+    fn reset_bindings_now(&mut self) {
+        for (k, d) in self.short_keys.iter_mut().zip(SHORTCUT_DEFAULTS.iter()) {
+            *k = *d;
+        }
+        for m in self.midi_binds.iter_mut() {
+            *m = None;
+        }
+        for c in self.knob_cal.iter_mut() {
+            *c = None;
+        }
+        self.save_config();
+        self.status =
+            "bindings reset \u{2014} shortcuts, MIDI bindings and knob \
+             calibration restored to defaults"
+                .into();
     }
 
     /// v170: the ONLY live caller of `arr.remove_lane` (pin-enforced).
@@ -34310,96 +34495,66 @@ fn standard_confirm_window(ui: &mut egui::Ui, app: &mut App) {
     let Some(mut p) = app.pending_confirm.take() else {
         return;
     };
-    match crate::kit::confirm(ui, &mut p.ask) {
+    let verdict = crate::kit::confirm(ui, &mut p.ask);
+    match verdict {
         crate::kit::Confirm::Open => app.pending_confirm = Some(p),
-        crate::kit::Confirm::Yes => match p.effect {
-            ConfirmEffect::RemoveLane { t } => {
-                let never = p.ask.never_warn;
-                app.do_remove_lane(t, never);
+        // v181: the Alt hatch shares the Yes dispatch — each effect
+        // decides what the hatch means (only LoadProject paints one).
+        crate::kit::Confirm::Yes | crate::kit::Confirm::Alt => {
+            let alt = matches!(verdict, crate::kit::Confirm::Alt);
+            match p.effect {
+                ConfirmEffect::RemoveLane { t } => {
+                    let never = p.ask.never_warn;
+                    app.do_remove_lane(t, never);
+                }
+                ConfirmEffect::LoadProject { path } => {
+                    if alt {
+                        // The hatch saves under the LOADED name — the
+                        // overwrite gate never fires on it (own path).
+                        let n = app.proj_name.clone();
+                        app.do_save(&n);
+                    }
+                    app.start_project_load(&path);
+                }
+                ConfirmEffect::SaveOverwrite { name } => {
+                    if p.ask.never_warn {
+                        app.save_overwrite_never_warn = true;
+                        app.save_config();
+                    }
+                    app.do_save_now(&name);
+                }
+                ConfirmEffect::ResetBindings => app.reset_bindings_now(),
             }
-        },
+        }
+        // Cancel/Esc: nothing happened; the echo names what SURVIVED.
         crate::kit::Confirm::No => {
-            app.status = "kept the child track \u{2014} nothing was removed".into();
+            app.status = match &p.effect {
+                ConfirmEffect::RemoveLane { .. } => {
+                    "kept the child track \u{2014} nothing was removed".into()
+                }
+                ConfirmEffect::LoadProject { .. } => format!(
+                    "kept \u{201c}{}\u{201d} \u{2014} nothing was loaded",
+                    if app.proj_name.is_empty() {
+                        "the current project"
+                    } else {
+                        &app.proj_name
+                    }
+                ),
+                ConfirmEffect::SaveOverwrite { name } => {
+                    format!("save aborted \u{2014} \u{201c}{name}\u{201d} keeps its existing file")
+                }
+                ConfirmEffect::ResetBindings => {
+                    "kept your bindings \u{2014} nothing was reset".into()
+                }
+            };
         }
     }
 }
 
-/// v50 R6: a rack project row was clicked. Loading REPLACES the current
-/// project, so nothing happens before an explicit confirmation here —
-/// with a one-click "save current first" escape hatch. Confirming feeds
-/// the existing v42 slice chooser, so the current work is only replaced
-/// after one more deliberate step.
-fn proj_confirm_window(ui: &mut egui::Ui, app: &mut App) {
-    let Some((name, path)) = app.proj_confirm.clone() else {
-        return;
-    };
-    let mut answer: Option<Option<PathBuf>> = None; // None = still open
-    egui::Window::new("Load project?")
-        .id(egui::Id::new("v50-proj-confirm"))
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .collapsible(false)
-        .resizable(false)
-        .show(ui.ctx(), |ui| {
-            ui.label(format!("Load project \u{201c}{name}\u{201d}?"));
-            ui.label(
-                egui::RichText::new(format!(
-                    "This replaces the current project\u{201d}s tracks, clips and \
-                     controls{} \u{2014} save it first if you want to keep it.",
-                    if app.proj_name.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" (now \u{201c}{}\u{201d})", app.proj_name)
-                    }
-                ))
-                .weak()
-                .small(),
-            );
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(egui::RichText::new("Load").strong())
-                            .min_size(egui::vec2(90.0, 0.0)),
-                    )
-                    .on_hover_text("replace the current project with this file")
-                    .clicked()
-                {
-                    answer = Some(Some(path.clone()));
-                }
-                if !app.proj_name.is_empty()
-                    && ui
-                        .button("Save current & load")
-                        .on_hover_text(format!("Save as \u{201c}{}\u{201d} first", app.proj_name))
-                        .clicked()
-                {
-                    let n = app.proj_name.clone();
-                    app.do_save(&n);
-                    answer = Some(Some(path.clone()));
-                }
-                if ui.button("Cancel").on_hover_text("keep the current project").clicked() {
-                    answer = Some(None);
-                }
-            });
-        });
-    if let Some(chosen) = answer {
-        app.proj_confirm = None;
-        if let Some(p) = chosen {
-            // Same pipeline the LOAD PROJECT browser uses: parse, then
-            // ask WHICH slices to import before anything changes.
-            match project::load(&p) {
-                Ok(pr) => {
-                    app.pending_proj = Some(pr);
-                    app.pending_proj_dir = p.parent().map(|d| d.to_path_buf());
-                    app.load_sel = LoadSel::all();
-                    app.show_load_opts = true;
-                }
-                Err(e) => app.status = format!("load: {e}"),
-            }
-        } else {
-            app.status = "load cancelled".into();
-        }
-    }
-}
+// v181 (TS-025 R2): the hand-rolled `proj_confirm_window` (v50 R6) is
+// RETIRED — the rack project row now arms the standard seam via
+// `App::request_proj_load`; see the v170 block above for the contract.
+
 // v110/MCP-04: `mixer.*`/`chain.*`/`assets.*` — a ui CHILD module (MCP-03
 // precedent): handlers ride the App's private setter seams directly, so the
 // tool surface cannot drift from the mouse path and ui.rs stays untouched
@@ -45365,6 +45520,17 @@ mod tests {
         app.show_settings = true;
         let p = label_center(&mut app, &ctx, "Reset to Defaults").expect("reset button");
         click_pt(&mut app, &ctx, p);
+        // v181 (TS-025 R4): the button now ARMS the standard confirmation
+        // (a silent destroyer was the bug class); accept it first.
+        assert!(
+            app.pending_confirm.as_ref().is_some_and(|c| matches!(
+                c.effect,
+                ConfirmEffect::ResetBindings
+            )),
+            "the reset must ask before clearing"
+        );
+        let yes = v170_click_target(&mut app, &ctx, "Reset");
+        click_pt(&mut app, &ctx, yes);
         assert!(
             app.knob_cal.iter().all(|c| c.is_none()),
             "axis calibration must not outlive the reset"
@@ -52691,18 +52857,31 @@ mod tests {
             app.projects_dir()
         );
         // NB: click by EXACT galley — the status bar reads
-        // `saved project "demo"` and galley_at's substring would land there.
+        // `saved project "demo" · …` and galley_at's substring would land there.
         click_exact(&mut app, &ctx, "demo");
-        assert_eq!(
-            app.proj_confirm.as_ref().map(|(n, _)| n.as_str()),
-            Some("demo"),
-            "the click must only arm the confirmation"
-        );
+        {
+            let p = app
+                .pending_confirm
+                .as_ref()
+                .expect("the click must only arm the STANDARD confirmation");
+            assert_eq!(
+                p.ask.kind, "proj_load",
+                "v181: the load gate rides the v170 seam"
+            );
+        }
         assert!(!app.show_load_opts, "nothing may load before confirming");
         assert_eq!(app.proj_name, "other", "a click alone never loads");
-        // Cancel backs out cleanly.
+        // Cancel backs out cleanly — and the echo names what survived.
         click_last(&mut app, &ctx, "Cancel");
-        assert!(app.proj_confirm.is_none() && !app.show_load_opts && app.proj_name == "other");
+        assert!(
+            app.pending_confirm.is_none() && !app.show_load_opts && app.proj_name == "other"
+        );
+        assert!(
+            app.status.contains("\u{201c}other\u{201d}")
+                && app.status.contains("nothing was loaded"),
+            "cancel echo names the kept project: {}",
+            app.status
+        );
         // Confirming opens the existing slice chooser, then imports.
         click_exact(&mut app, &ctx, "demo");
         click_last(&mut app, &ctx, "Load");
@@ -52710,7 +52889,7 @@ mod tests {
             app.show_load_opts && app.pending_proj.is_some(),
             "confirm -> slice chooser"
         );
-        assert!(app.proj_confirm.is_none());
+        assert!(app.pending_confirm.is_none());
         click_last(&mut app, &ctx, "Import");
         assert_eq!(
             app.proj_name, "demo",
@@ -54939,6 +55118,17 @@ mod tests {
         assert!(
             texts.iter().any(|t| t.contains("restore every shortcut")),
             "shortcut reset must explain its blast radius on hover; galleys: {texts:?}"
+        );
+        // v181 (TS-025 R4) EXTENSION: the hover must name EVERY victim,
+        // not just the headline one (it used to hide the MIDI bindings
+        // and knob calibration it also wipes).
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("MIDI binding")
+                    && t.contains("calibration")
+                    && t.contains("cannot be undone")),
+            "v181: the reset hover must name all three victims; galleys: {texts:?}"
         );
         app.sett_filter = "audio ports".into();
         let r = painted_text_rect(&ctx, &mut app, "Stop").expect("ports Stop painted");
@@ -58798,9 +58988,9 @@ mod tests {
         app.show_save_prompt = true;
         frame(&mut app, &ctx, vec![]);
         let r = painted_text_rect(&ctx, &mut app, "Save").expect("Save painted");
-        let texts = hover_until_tip(&mut app, &ctx, r.center(), &["write the project file"]);
+        let texts = hover_until_tip(&mut app, &ctx, r.center(), &["into the projects folder"]);
         assert!(
-            texts.iter().any(|t| t.contains("write the project file")),
+            texts.iter().any(|t| t.contains("into the projects folder")),
             "SAVE PROJECT Save must tooltip what it does; galleys: {texts:?}"
         );
         let mut app2 = headless_app("v71tip2");
@@ -70497,5 +70687,421 @@ mod tests {
                 "Automation window lost {label:?} at its default size"
             );
         }
+    }
+
+    // ============ v181 (TS-025, card t_9d6dfb4c): project + dialog windows ============
+    //
+    // The dialog family raised to the hover/echo/confirm standard: the
+    // project-load gate moved onto the ONE v170 seam (with the new Alt
+    // escape-hatch slot), save-as over a foreign existing file asks,
+    // the settings binding reset asks and names all three victims,
+    // export echoes its duration, and closing a dialog echoes too.
+
+    /// Temp projects dir (chained single-component joins — the Windows
+    /// mixed-separator trap) + point the app at it.
+    fn v181_temp_projects(app: &mut App, tag: &str) -> std::path::PathBuf {
+        let pdir = std::env::temp_dir()
+            .join(format!("sp-uity-{tag}"))
+            .join("projs");
+        let _ = std::fs::remove_dir_all(&pdir);
+        std::fs::create_dir_all(&pdir).unwrap();
+        app.project_dir = pdir.display().to_string();
+        pdir
+    }
+
+    /// Painted color of the EXACT-galley label's first text section
+    /// (853 viewport, settle frame first — identity probes per v82).
+    fn v181_galley_color(app: &mut App, ctx: &egui::Context, needle: &str) -> egui::Color32 {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        ctx.global_style_mut(|s| s.animation_time = 0.0);
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let col = out.shapes.iter().rev().find_map(|cs| {
+            if let egui::epaint::Shape::Text(t) = &cs.shape {
+                if t.galley.text() == needle {
+                    return t.galley.job.sections.first().map(|s| s.format.color);
+                }
+            }
+            None
+        });
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+        col.unwrap_or_else(|| panic!("v181: no painted galley exactly {needle:?}"))
+    }
+
+    #[test]
+    fn v181_proj_load_modal_paints_identity() {
+        // R2: the rack-project gate paints the STANDARD chrome — title,
+        // body, note, the Alt hatch — and never a never-warn checkbox
+        // (loading on request is not a nag class).
+        let mut app = headless_app("v181ldident");
+        v181_temp_projects(&mut app, "v181ldident");
+        app.do_save("demo");
+        app.proj_name = "other".into();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        click_exact(&mut app, &ctx, "demo");
+        frame(&mut app, &ctx, vec![]); // the modal's content frame
+        for needle in [
+            "Load project?",
+            "Save current & load",
+            "Load",
+            "Cancel",
+            "Nothing is deleted",
+        ] {
+            assert!(
+                v170_text_painted(&mut app, &ctx, needle),
+                "the load gate must paint {needle:?}"
+            );
+        }
+        assert!(
+            !v170_text_painted(&mut app, &ctx, "Never warn"),
+            "the load gate must not grow a never-warn"
+        );
+    }
+
+    #[test]
+    fn v181_proj_load_alt_saves_first() {
+        // R1+R2: the escape hatch — "Save current & load" persists the
+        // UNSAVED project to its own file first (no overwrite gate:
+        // own path), then arms the slice chooser.
+        let mut app = headless_app("v181althatch");
+        let pdir = v181_temp_projects(&mut app, "v181althatch");
+        app.do_save("demo");
+        assert!(
+            app.pending_confirm.is_none(),
+            "a first save is never an overwrite"
+        );
+        app.proj_name = "other".into();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        click_exact(&mut app, &ctx, "demo");
+        frame(&mut app, &ctx, vec![]);
+        let hatch = v170_click_target(&mut app, &ctx, "Save current & load");
+        click_pt(&mut app, &ctx, hatch);
+        assert!(
+            pdir.join(format!("other.{}", project::EXT)).exists(),
+            "the hatch saves the current project FIRST"
+        );
+        assert!(
+            app.pending_confirm.is_none()
+                && app.show_load_opts
+                && app.pending_proj.is_some(),
+            "Alt continues into the slice chooser"
+        );
+        assert!(
+            app.status.contains("saved project \u{201c}other\u{201d}"),
+            "the save echoes: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn v181_save_overwrite_confirm_flow() {
+        // R3: saving under a FOREIGN existing name asks; Cancel keeps
+        // the bytes, checked+Overwrite persists never-warn, and Ctrl+S
+        // over the loaded project's own path never asks.
+        let mut app = headless_app("v181ovr");
+        let pdir = v181_temp_projects(&mut app, "v181ovr");
+        app.do_save("two");
+        assert!(app.pending_confirm.is_none(), "first save asks nothing");
+        let two = pdir.join(format!("two.{}", project::EXT));
+        let bytes_before = std::fs::read(&two).expect("two was written");
+        app.proj_name = "one".into();
+        app.do_save("two"); // foreign existing name -> the gate
+        assert_eq!(
+            app.pending_confirm.as_ref().map(|c| c.ask.kind),
+            Some("save_overwrite"),
+            "a foreign existing name must ask"
+        );
+        // Cancel: bytes untouched, echo names the kept file.
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let cancel = v170_click_target(&mut app, &ctx, "Cancel");
+        click_pt(&mut app, &ctx, cancel);
+        assert_eq!(
+            std::fs::read(&two).unwrap(),
+            bytes_before,
+            "Cancel replaces nothing"
+        );
+        assert!(
+            app.status.contains("save aborted") && app.status.contains("\u{201c}two\u{201d}"),
+            "the refusal names the file kept: {}",
+            app.status
+        );
+        // Re-arm, tick Never warn, Overwrite: write lands + latch persists.
+        app.do_save("two");
+        frame(&mut app, &ctx, vec![]);
+        let nw = v170_click_target(&mut app, &ctx, "Never warn again");
+        click_pt(&mut app, &ctx, nw);
+        let yes = v170_click_target(&mut app, &ctx, "Overwrite");
+        click_pt(&mut app, &ctx, yes);
+        assert_eq!(app.proj_name, "two", "Overwrite performed the save");
+        assert!(
+            app.save_overwrite_never_warn,
+            "checked + Overwrite latches never-warn"
+        );
+        // Never-warn: the same overwrite saves straight through...
+        app.proj_name = "one".into();
+        app.do_save("two");
+        assert!(
+            app.pending_confirm.is_none() && app.proj_name == "two",
+            "never-warn skips the popup"
+        );
+        // ...and Ctrl+S over the loaded project's OWN path never asks.
+        app.save_overwrite_never_warn = false;
+        app.do_save("two");
+        assert!(
+            app.pending_confirm.is_none(),
+            "saving over the loaded project's own path must never nag"
+        );
+    }
+
+    #[test]
+    fn v181_save_echo_names_path() {
+        // R3/AC2: the success echo names the file it wrote.
+        let mut app = headless_app("v181savecho");
+        let pdir = v181_temp_projects(&mut app, "v181savecho");
+        app.do_save("solo");
+        assert!(
+            app.status.starts_with("saved project \u{201c}solo\u{201d}"),
+            "echo keeps its contract prefix: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains(&format!("solo.{}", project::EXT))
+                && app.status.contains(&pdir.display().to_string()),
+            "the echo names the written path: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn v181_reset_bindings_confirm() {
+        // R4: the destroyer asks; Cancel keeps every victim with an
+        // echo; the Yes verdict clears shortcuts, bindings AND
+        // calibration (v25 rule) and echoes all three.
+        let mut app = headless_app("v181reset");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.short_keys[MidiAction::idx(MidiAction::Metronome)] = None;
+        app.knob_cal[5] = Some(crate::config::MidiAxisCal {
+            slot: 5,
+            lo: 3,
+            hi: 99,
+        });
+        frame(&mut app, &ctx, vec![]);
+        app.show_settings = true;
+        let p = label_center(&mut app, &ctx, "Reset to Defaults").expect("reset button");
+        click_pt(&mut app, &ctx, p);
+        assert!(
+            app
+                .pending_confirm
+                .as_ref()
+                .is_some_and(|c| c.ask.kind == "bindings_reset"),
+            "the reset arms the standard confirmation"
+        );
+        frame(&mut app, &ctx, vec![]);
+        let cancel = v170_click_target(&mut app, &ctx, "Cancel");
+        click_pt(&mut app, &ctx, cancel);
+        assert!(app.knob_cal[5].is_some(), "Cancel keeps the calibration");
+        assert!(
+            app.status.contains("nothing was reset"),
+            "the refusal echoes: {}",
+            app.status
+        );
+        // Re-arm and confirm. Fresh rect, never the stale `p`: the
+        // status-bar change re-flowed the strip by a whole row (v82
+        // sample-the-target-IMMEDIATELY-before-click law, proven here:
+        // the stale rect sat 30 px below the button).
+        let p = v170_click_target(&mut app, &ctx, "Reset to Defaults");
+        click_pt(&mut app, &ctx, p);
+        frame(&mut app, &ctx, vec![]);
+        let yes = v170_click_target(&mut app, &ctx, "Reset");
+        click_pt(&mut app, &ctx, yes);
+        assert!(app.knob_cal.iter().all(|c| c.is_none()), "calibration cleared");
+        assert!(
+            app.midi_binds.iter().all(|m| m.is_none()),
+            "MIDI bindings cleared"
+        );
+        assert!(
+            app.short_keys
+                .iter()
+                .zip(SHORTCUT_DEFAULTS.iter())
+                .all(|(k, d)| k == d),
+            "shortcuts back to defaults"
+        );
+        assert!(
+            app.status.contains("bindings reset") && app.status.contains("calibration"),
+            "the echo names the victims: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn v181_export_echo_duration() {
+        // R5: the finished export echoes WHAT, WHERE and HOW LONG.
+        use std::sync::Arc;
+        let mut app = headless_app("v181expdur");
+        app.sample_rate = 48_000;
+        clear_canvas(&mut app);
+        app.assets.clear();
+        let mut d = vec![0.0f32; 2400];
+        d[0] = 1.0;
+        app.assets.push(Asset::audio(
+            0,
+            "tick".into(),
+            std::path::PathBuf::from("tick.wav"),
+            Arc::from(d),
+            false,
+        ));
+        app.arr.tracks[0].lanes[0].clips.push(Clip::new(0, 0));
+        let dir = std::env::temp_dir()
+            .join("sp-uity-v181expdur")
+            .join("out");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.export_path = dir.join("mix").to_string_lossy().into_owned();
+        app.export_whole = true;
+        app.do_export();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            app.drain_events();
+            if app.status.contains("exported") || std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            app.status.contains("exported mix \u{b7} "),
+            "success echo shape: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains("mix.wav") && app.status.ends_with(" s"),
+            "echo names the file AND carries the duration: {}",
+            app.status
+        );
+        assert!(dir.join("mix.wav").exists(), "the file is really there");
+    }
+
+    #[test]
+    fn v181_cancel_echoes() {
+        // R7: closing save-prompt / export-window echoes too.
+        let mut app = headless_app("v181cancl");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.show_save_prompt = true;
+        frame(&mut app, &ctx, vec![]);
+        click_last(&mut app, &ctx, "Cancel");
+        assert!(!app.show_save_prompt, "Cancel closes");
+        assert!(
+            app.status.contains("nothing was written"),
+            "save-prompt Cancel echoes: {}",
+            app.status
+        );
+        app.show_export = true;
+        frame(&mut app, &ctx, vec![]);
+        click_last(&mut app, &ctx, "Cancel");
+        assert!(!app.show_export, "Cancel closes the export window");
+        assert!(
+            app.status.contains("nothing rendered"),
+            "export Cancel echoes: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn v181_template_delete_destroy_label() {
+        // R6: the preset bar's destructive slot wears kit::DESTROY
+        // (the rack's "delete file" identity) — behaviorally untouched,
+        // visually identified; the harmless slots stay plain.
+        let mut app = headless_app("v181destr");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        let dir = crate::paths::data_dir().join("track-templates");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brass.json"), "{}").unwrap();
+        v61_open_template_window(&mut app, &ctx);
+        // The delete slot lives INSIDE the opened "templates" picker
+        // (v77 picker contract, as the v61 delete pin drives it).
+        click_exact(&mut app, &ctx, "templates");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at_last(&mut app, &ctx, "delete template").is_some(),
+            "delete slot paints in the picker"
+        );
+        assert_eq!(
+            v181_galley_color(&mut app, &ctx, "delete template"),
+            crate::kit::DESTROY,
+            "the delete slot must wear the DESTROY token"
+        );
+        assert_ne!(
+            v181_galley_color(&mut app, &ctx, "save"),
+            crate::kit::DESTROY,
+            "negative polarity: the save slot stays plain"
+        );
+    }
+
+    #[test]
+    fn v181_dialog_seam_completeness() {
+        // Completeness audit (persona law 4): the dialog family speaks
+        // with ONE confirm voice; the retired twins stayed retired.
+        // Markers concat-split so THIS pin never counts for its own
+        // needles (source-pin vacuity trap).
+        let src = include_str!("ui.rs");
+        let active = |marker: &str| -> usize {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !(t.starts_with("//") || t.starts_with("///") || t.starts_with("//!"))
+                })
+                .filter(|l| l.contains(marker))
+                .count()
+        };
+        assert_eq!(
+            active(concat!("fn proj_conf", "irm_window")),
+            0,
+            "the hand-rolled confirm window must stay retired"
+        );
+        assert_eq!(
+            active(concat!("app.proj_conf", "irm")),
+            0,
+            "the retired field must not come back"
+        );
+        assert_eq!(
+            active(concat!("crate::kit::con", "firm(")),
+            1,
+            "standard_confirm_window remains the single render home"
+        );
+        assert_eq!(
+            active(concat!("app.request_proj_loa", "d(")),
+            1,
+            "the rack project row is the gate's only trigger"
+        );
+        assert_eq!(
+            active(concat!("ConfirmEffect::LoadPro", "ject")),
+            3,
+            "arm + dispatch + refusal echo, exactly"
+        );
+        assert_eq!(
+            active(concat!("ConfirmEffect::SaveOve", "rwrite")),
+            3,
+            "arm + Yes + No sites exactly"
+        );
+        let kit = include_str!("kit.rs");
+        assert_eq!(
+            kit.matches(concat!("let resp = ui.but", "ton(alt)")).count(),
+            1,
+            "the Alt slot renders from ONE place"
+        );
     }
 }

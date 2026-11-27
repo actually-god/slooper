@@ -393,7 +393,14 @@ pub fn render(
                 if let Some(dt) = spec.delete_text {
                     if !presets.is_empty() {
                         ui.separator();
-                        if ui.button(dt).on_hover_text(spec.delete_hover).clicked() {
+                        // v181 (TS-025 R6): the destructive slot wears the
+                        // kit DESTROY identity (same token the rack's
+                        // "delete file" label uses) — twins must not drift.
+                        if ui
+                            .button(egui::RichText::new(dt).color(crate::kit::DESTROY))
+                            .on_hover_text(spec.delete_hover)
+                            .clicked()
+                        {
                             act = Some(PresetBarAction::Delete);
                         }
                     }
