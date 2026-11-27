@@ -16987,7 +16987,29 @@ impl App {
                         // v129: separator-safe stem label (was a slash-only
                         // rsplit — full path on Windows scans, card t_b47cb577).
                         let label = sample_stem_label(&cur_path);
-                        let cresp = egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
+                        // v178 (TS-023): the 110-px combo silently elides a
+                        // long stem — a clipped pick hovers the FULL sound
+                        // name (v87 law; label_clipped measures the same
+                        // elision the combo applies, ~84 px after the
+                        // button-arrow reserve). The hover rides the
+                        // statement chain so the v173 combo-owner rule
+                        // sees it.
+                        let lbl_clipped = crate::kit::label_clipped(
+                            ui,
+                            &label,
+                            84.0,
+                            egui::TextStyle::Button,
+                            None,
+                        );
+                        let kit_hover = if lbl_clipped {
+                            format!(
+                                "sound \u{201c}{label}\u{201d} \u{b7} click to change it"
+                            )
+                        } else {
+                            "change this pad's sound (click for the sample list)"
+                                .to_string()
+                        };
+                        egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
                             .selected_text(label.clone())
                             .width(110.0)
                             .show_ui(ui, |ui| {
@@ -17025,25 +17047,9 @@ impl App {
                                         );
                                     }
                                 }
-                            });
-                        // v178 (TS-023): the 110-px combo silently elides a
-                        // long stem — a clipped pick hovers the FULL sound
-                        // name (v87 law, kit::label_clipped measures the
-                        // same elision the combo applies; ~84 px is the
-                        // label field after the button arrow reserve).
-                        if crate::kit::label_clipped(
-                            ui,
-                            &label,
-                            84.0,
-                            egui::TextStyle::Button,
-                            None,
-                        ) {
-                            cresp.response.on_hover_text(format!(
-                                "sound \u{201c}{label}\u{201d} \u{b7} click to change it"
-                            ));
-                        } else {
-                            cresp.response.on_hover_text("change this pad's sound (click for the sample list)");
-                        }
+                            })
+                            .response
+                            .on_hover_text(kit_hover);
                         // v69 (S1): import a sound straight from disk —
                         // no file-manager round-trip for a drop. The
                         // dialog is native (unreachable headless), so
@@ -61066,14 +61072,14 @@ mod tests {
         };
         assert_eq!(
             prod.matches("kit::row_clipped(").count(),
-            3,
-            "chain row + both add-combo popups detect right-overflow via kit"
+            4,
+            "chain row + both add-combo popups + the drum grid pad-name label detect right-overflow via kit"
         );
         assert_eq!(
             prod.matches("kit::label_clipped(").count(),
-            2,
-            "the fixed-height ♪ rows + the v174 strip device row are the \
-             pre-paint probes"
+            3,
+            "the fixed-height ♪ rows + the v174 strip device row + the v178 \
+             kit pad asset combo are the pre-paint probes"
         );
         assert_eq!(
             prod.matches("row_dir: Some(").count(),
@@ -66709,9 +66715,13 @@ mod tests {
             "strip intermediate tint is the kit token"
         );
         assert_eq!(
-            strip.matches("from_gray(60)").count(),
+            strip.matches("COL_SMAP_KEY_LBL").count(),
             1,
-            "strip anchors keep today's ink"
+            "strip anchors paint the named home"
+        );
+        assert!(
+            ui_src.contains("const COL_SMAP_KEY_LBL: egui::Color32 = egui::Color32::from_gray(60);"),
+            "the home holds today's ink (v166 freeze; v178 renamed the site, not the color)"
         );
     }
 
