@@ -64,7 +64,7 @@ run live and in export.
 
 | Region | Contents |
 | --- | --- |
-| **Top bar** | ☰ settings · engine status · **PLAY/STOP** (transport) · bar.beat position · **METRO/STOP** button + bpm + beats/measure + subdivision · **Windows** menu · **Load / Save as / Save / Export** |
+| **Top bar** | ☰ settings · status/echo strip · **PLAY/STOP** (transport) · bar.beat position · **METRO/STOP** button + bpm + beats/measure · **Windows** menu · **Load / Save as / Save / Export** — in a narrow window the grid and view controls fold into a **More…** popup (nothing is ever clipped) |
 | **Left panel** | the [asset rack](#the-asset-rack); ☰ docks the **settings panel to its left**, ☰ again closes it |
 | **Grid toolbar** | **loop** toggle + mode dropdown (see [Transport & playhead](#transport--playhead)), auto-quantize checkbox, **quantize** subdivision, **snap** on/off checkbox + subdivision, **MIX** full-page mixer toggle ([mix page](#the-mix-page-f9)), **♫ Piano roll** (opens the [note editor](#piano-roll)), zoom slider |
 | **Timeline** | **ruler pinned above the tracks** (bar numbers; click/drag scrubs) + one **seamless block per track** — one tall lane strip per lane, hairline separators between tracks (no gaps), one continuous red playhead line drawn across every track, and the **loop region** tinted between its draggable handles; MIDI clips draw their **notes** right on the grid |
@@ -647,6 +647,8 @@ in **any** text box, and auto-repeat never re-fires):
 | `E` | export prompt |
 | `M` | metronome on / off |
 | `1`–`4` | select track 1–4 (5–16 via the action list) |
+| `Home` | playhead to the start of the selection (loop / project start when nothing is selected) |
+| `End` | playhead to the end of the selection (loop / project end when nothing is selected) |
 | `Ctrl+S` | save project (name prompt on first save) |
 | `Ctrl+Shift+S` | save under a new name |
 | `Delete` | remove all selected clips |
@@ -655,6 +657,7 @@ in **any** text box, and auto-repeat never re-fires):
 | `Ctrl+V` | paste at the playhead, on the track nearest your last click |
 | `Ctrl+D` | duplicate the selection at the playhead |
 | `Ctrl+M` | merge the selected clips (one kind) into one new asset |
+| `Ctrl+K` | command palette — one box for every window, layout, settings category and command |
 | `S` | split the selected clip(s) at the playhead |
 | `F9` | flip the main view between the grid and the full-page [mix page](#the-mix-page-f9) — fixed like the zoom keys, not a rebindable slot |
 
