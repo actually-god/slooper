@@ -7929,10 +7929,25 @@ impl App {
         }
         if ed != cur {
             self.sample_edits.insert(key.clone(), ed);
+            let heavy = (ed.pitch_cents - cur.pitch_cents).abs() > 1e-6
+                || (ed.bend_start_cents - cur.bend_start_cents).abs() > 1e-6
+                || (ed.bend_end_cents - cur.bend_end_cents).abs() > 1e-6
+                || (ed.stretch - cur.stretch).abs() > 1e-6;
+            if heavy && self.se_drag.is_some() {
+                // Pitch/bend/stretch re-renders (WSOLA search, cubic sweep)
+                // are far too heavy to run per DRAGGED frame; the canvas
+                // affordances already track the pointer live, so the
+                // waveform commit lands on pointer release.
+                self.se_defer = Some(key.clone());
+            } else {
+                self.se_apply(&key);
+                self.se_defer = None;
+            }
             // v178 (TS-023): every committed edit echoes one line naming
             // what moved — a 1-px fade-handle nudge otherwise looked like
             // nothing happened (the strip/canvas are far from the label
-            // rows the user is watching).
+            // rows the user is watching). LAST, so se_apply's length
+            // readout never overwrites the verb line.
             let verbs: Vec<String> = if reset {
                 vec!["reset to the source sound \u{b7} edits cleared".into()]
             } else {
@@ -7981,20 +7996,6 @@ impl App {
             };
             if !verbs.is_empty() {
                 self.status = format!("sample edit: {aname} \u{b7} {}", verbs.join(" \u{b7} "));
-            }
-            let heavy = (ed.pitch_cents - cur.pitch_cents).abs() > 1e-6
-                || (ed.bend_start_cents - cur.bend_start_cents).abs() > 1e-6
-                || (ed.bend_end_cents - cur.bend_end_cents).abs() > 1e-6
-                || (ed.stretch - cur.stretch).abs() > 1e-6;
-            if heavy && self.se_drag.is_some() {
-                // Pitch/bend/stretch re-renders (WSOLA search, cubic sweep)
-                // are far too heavy to run per DRAGGED frame; the canvas
-                // affordances already track the pointer live, so the
-                // waveform commit lands on pointer release.
-                self.se_defer = Some(key.clone());
-            } else {
-                self.se_apply(&key);
-                self.se_defer = None;
             }
         } else if self.se_drag.is_none() {
             if let Some(k) = self.se_defer.take() {
@@ -69179,28 +69180,48 @@ mod tests {
             .expect("grid cell (0,0) painted");
         click_pt(&mut app, &ctx, cell.center());
         assert!(app.drum.grid[0][0] > 0, "cell click paints a hit");
-        // Per-row clear (topmost "x" = pad 1's row): names the pad.
-        let mut xs = galley_centers(&mut app, &ctx, "x", true);
-        xs.sort_by(|a, b| a.y.total_cmp(&b.y));
-        click_pt(&mut app, &ctx, *xs.first().expect("per-row clear button"));
+        // Everything must be targeted INSIDE the drum window rect (the
+        // panels underneath paint competing "x"/"play" galleys).
+        let wr = app
+            .dyn_wins
+            .iter()
+            .find(|w| w.kind == DynKind::Drums)
+            .expect("drum slot")
+            .rect;
+        let wrect = egui::Rect::from_min_max(
+            egui::pos2(wr[0], wr[1]),
+            egui::pos2(wr[0] + wr[2], wr[1] + wr[3]),
+        );
+        let in_win = |p: &egui::Pos2| wrect.expand(2.0).contains(*p);
+        // Per-row clear: the "x" sitting LEFT of the first step cell, on
+        // the first row's line.
+        let mut xs: Vec<egui::Pos2> = galley_centers(&mut app, &ctx, "x", true)
+            .into_iter()
+            .filter(|p| in_win(p) && (p.y - cell.center().y).abs() < 10.0 && p.x < cell.min.x)
+            .collect();
+        xs.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let clear_x = *xs.last().expect("pad-1 row clear button");
+        click_pt(&mut app, &ctx, clear_x);
         assert!(
             app.status.starts_with("drums: cleared pad"),
             "row clear must name the emptied pad: {:?}",
             app.status
         );
-        // Transport verbs.
-        let play = galley_at(&mut app, &ctx, "play")
-            .expect("play button")
-            .center();
+        // Transport verbs (window-scoped).
+        let play = galley_centers(&mut app, &ctx, "play", true)
+            .into_iter()
+            .find(in_win)
+            .expect("play button in the drum window");
         click_pt(&mut app, &ctx, play);
         assert!(
             app.status.contains("drums: playing"),
             "play must echo: {:?}",
             app.status
         );
-        let stop = galley_at(&mut app, &ctx, "stop")
-            .expect("stop button")
-            .center();
+        let stop = galley_centers(&mut app, &ctx, "stop", true)
+            .into_iter()
+            .find(in_win)
+            .expect("stop button in the drum window");
         click_pt(&mut app, &ctx, stop);
         assert!(
             app.status.contains("drums: stopped"),
@@ -69208,9 +69229,10 @@ mod tests {
             app.status
         );
         // clear-all: whole-pattern verb.
-        let ca = galley_at(&mut app, &ctx, "clear all")
-            .expect("clear all button")
-            .center();
+        let ca = galley_centers(&mut app, &ctx, "clear all", true)
+            .into_iter()
+            .find(in_win)
+            .expect("clear-all button in the drum window");
         click_pt(&mut app, &ctx, ca);
         assert!(
             app.status.contains("cleared the whole pattern"),
@@ -69324,7 +69346,7 @@ mod tests {
         let prod = v178_prod();
         // The drum grid reads the home…
         let d0 = prod.find("fn drum_win_body").expect("drum body");
-        let d1 = d0 + prod[d0..].find("fn master_out_window").expect("body end");
+        let d1 = d0 + prod[d0..].find("fn auto_window").expect("body end");
         let drum = &prod[d0..d1];
         for c in ["INSTR_ROW_H", "INSTR_NAME_W", "INSTR_STEP_W", "INSTR_PLAY_W", "INSTR_KILL_W"] {
             assert!(drum.contains(c), "drum grid lost {c}");
@@ -69391,7 +69413,7 @@ mod tests {
         for (name, start) in slices {
             let end_rel = match name {
                 "drum_win_body" => prod[start..]
-                    .find("fn master_out_window")
+                    .find("fn auto_window")
                     .expect("drum end"),
                 "sample_edit_window" => {
                     prod[start..].find("fn rekey_path_state").expect("se end")
@@ -69463,7 +69485,7 @@ mod tests {
         let i = prod
             .find("kz.on_hover_text(")
             .expect("piano strip hover attach");
-        let seg = &prod[i..(i + 500).min(prod.len())]);
+        let seg = &prod[i..(i + 500).min(prod.len())];
         assert!(
             seg.contains("click / drag a key") && seg.contains("drop a rack sample"),
             "piano strip hover lost the gesture copy: {seg}"
@@ -69553,6 +69575,13 @@ mod tests {
         let (mut app, ctx) = v65_synth_win("v178kitecho");
         // Mute pad 1 (stock name Kick): the ●→m flip needs naming.
         let mut dots = galley_centers(&mut app, &ctx, "\u{25cf}", true);
+        if dots.is_empty() {
+            let shorts: Vec<String> = v129_texts(&mut app, &ctx)
+                .into_iter()
+                .filter(|s| s.chars().count() <= 10)
+                .collect();
+            panic!("no \u{25cf} galley; short painted texts: {shorts:?}");
+        }
         dots.sort_by(|a, b| a.y.total_cmp(&b.y));
         click_pt(&mut app, &ctx, *dots.first().expect("pad mute buttons"));
         assert!(
@@ -69647,7 +69676,7 @@ mod tests {
         }
         let prod = v178_prod();
         let d0 = prod.find("fn drum_win_body").expect("drum body");
-        let d1 = d0 + prod[d0..].find("fn master_out_window").expect("body end");
+        let d1 = d0 + prod[d0..].find("fn auto_window").expect("body end");
         assert!(
             !prod[d0..d1].contains("presetbar::render"),
             "the drum body must never fork the preset bar"
