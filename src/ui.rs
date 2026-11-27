@@ -60991,7 +60991,6 @@ mod tests {
         let body = live.join("\n");
         for needle in [
             "saved ({n} params)",
-            "loaded ({n} params)",
             "deleted\"",
             "refused by the plugin",
         ] {
@@ -61000,6 +60999,14 @@ mod tests {
                 "params preset/preset-bar echo lost {needle:?}"
             );
         }
+        // v179: the APPLY echo moved INTO apply_param_preset and names the
+        // plugin — both the editor's own sliders and the stand-in window
+        // share the status strip, so the echo lives in the seam itself.
+        let ap = v86_fn_region(prod, "fn apply_param_preset(");
+        assert!(
+            ap.contains("applied \\u{b7} {} \\u{b7} {n} params"),
+            "apply_param_preset must echo the applied preset (names the plugin)"
+        );
     }
 
     /// v86 R5: the two chain-window add-combos TOOLTIP while closed —
