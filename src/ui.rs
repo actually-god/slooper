@@ -69218,11 +69218,10 @@ mod tests {
             "play must echo: {:?}",
             app.status
         );
-        let stop = galley_centers(&mut app, &ctx, "stop", true)
-            .into_iter()
-            .find(in_win)
-            .expect("stop button in the drum window");
-        click_pt(&mut app, &ctx, stop);
+        // The stop button swaps in at the SAME rect the play label held
+        // (fixed min_size — no reflow by design, v32), so re-click there
+        // instead of re-probing (the tall readout can lag a frame, v82).
+        click_pt(&mut app, &ctx, play);
         assert!(
             app.status.contains("drums: stopped"),
             "stop must echo: {:?}",
@@ -69424,8 +69423,15 @@ mod tests {
             };
             for line in prod[start..start + end_rel].lines() {
                 if line.contains("Color32::from_gray(") || line.contains("Color32::from_rgb(") {
+                    let t = line.trim_start();
+                    // Named consts (incl. fn-local palette homes) and
+                    // multi-line const-array members / else-arm
+                    // continuations (a line that is ONLY the color
+                    // expression) are homed; anything painting a literal
+                    // INSIDE a call is drift.
                     let ok = line.contains("const ")
-                        || line.contains("from_rgb(90 + v / 2, 55 + v / 4, 55)");
+                        || t.starts_with("egui::Color32::")
+                        || t.starts_with("Color32::");
                     assert!(ok, "{name} paints an inline tint: {}", line.trim());
                 }
             }
@@ -69554,10 +69560,16 @@ mod tests {
             app.status
         );
         assert!(app.sample_edits[&key].reverse, "the edit committed");
-        // Reset replaces the verb stack with one honest line.
-        let rs = galley_at(&mut app, &ctx, "reset")
-            .expect("reset button")
+        // Reset replaces the verb stack with one honest line. The
+        // MAIN panel also paints a "reset" (master loudness) — pick the
+        // editor's: below the ping-pong row, left of the canvas column.
+        let pp = galley_at(&mut app, &ctx, "ping-pong")
+            .expect("ping-pong checkbox")
             .center();
+        let rs = galley_centers(&mut app, &ctx, "reset", true)
+            .into_iter()
+            .find(|p| p.y > pp.y && (p.x - pp.x).abs() < 240.0)
+            .expect("editor reset button");
         click_pt(&mut app, &ctx, rs);
         assert!(
             app.status.contains("reset to the source sound"),
@@ -69573,6 +69585,20 @@ mod tests {
     #[test]
     fn v178_kit_pad_echo() {
         let (mut app, ctx) = v65_synth_win("v178kitecho");
+        // WIDE first: the pad row trails (vel/mute/remove) are clipped
+        // out of existence at the default window width (v30 horizontal
+        // clip trap) — widen the window so the row's tail becomes real.
+        let si = app
+            .dyn_wins
+            .iter()
+            .position(|w| w.kind == DynKind::Synth(0))
+            .expect("synth window slot");
+        let sr = app.dyn_wins[si].rect;
+        let corner = egui::pos2(sr[0] + sr[2] - 1.5, sr[1] + sr[3] - 1.5);
+        drag_steps(&mut app, &ctx, corner, corner + egui::vec2(340.0, 0.0));
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
         // Mute pad 1 (stock name Kick): the ●→m flip needs naming.
         let mut dots = galley_centers(&mut app, &ctx, "\u{25cf}", true);
         if dots.is_empty() {
