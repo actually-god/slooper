@@ -69998,4 +69998,384 @@ mod tests {
             "the drum body must never fork the preset bar"
         );
     }
+
+    // ============ v179 (ts-024): automation surfaces ============
+    //
+    // Automation window (canvas + rows), value picker, learn states and
+    // sidechain chips raised to the kit standard: every gesture echoes
+    // with the target NAMED (identity is the historical fragility class),
+    // hovers explain the affordance, palette/geometry live in one home.
+    // Doctrine: v97 (hover source-scan), v26/v27 (manager/picker rigs).
+
+    /// AC1: picking a new output in the value picker must echo BOTH the
+    // human label and the raw target id — the id is what lands in the
+    // asset file, so it must be readable at the moment it is written.
+    #[test]
+    fn v179_pick_echoes_target_identity() {
+        let mut app = headless_app("v179pick");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        app.auto_pick_open = true;
+        v26_settle(&mut app, &ctx);
+        let strip = *galleys_all(&mut app, &ctx, "T1")
+            .last()
+            .expect("the picker paints its T1 strip");
+        click_pt(&mut app, &ctx, strip);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("automation now drives")
+                && app.status.contains("track volume")
+                && app.status.contains("track.vol"),
+            "the pick echo names label AND raw id: {:?}",
+            app.status
+        );
+        assert!(!app.auto_pick_open, "picker closes after binding");
+        let ed = app.auto_edit.as_ref().unwrap();
+        assert_eq!(ed.target, crate::automation::TARGET_TRACK_VOL);
+    }
+
+    /// AC1: state changes inside the manager echo with the target named,
+    /// and the last-node refusal says WHY instead of doing nothing.
+    #[test]
+    fn v179_manager_state_edits_echo() {
+        let mut app = headless_app("v179mgr");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        v26_settle(&mut app, &ctx);
+        // snap toggle
+        click_last_exact(&mut app, &ctx, "snap");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("automation snap"),
+            "snap toggle echoes: {:?}",
+            app.status
+        );
+        // delete the selected node (fresh curve = 2 nodes)
+        click_last_exact(&mut app, &ctx, "delete");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("node #1 deleted") && app.status.contains("track.vol"),
+            "node delete names the node and the target: {:?}",
+            app.status
+        );
+        assert_eq!(app.auto_edit.as_ref().unwrap().nodes.len(), 1);
+        // refusal polarity: the last node never disappears — and says so.
+        click_last_exact(&mut app, &ctx, "delete");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("last node always stays"),
+            "the refusal must explain itself: {:?}",
+            app.status
+        );
+        assert_eq!(app.auto_edit.as_ref().unwrap().nodes.len(), 1);
+    }
+
+    /// AC2: a MIDI listen is a STATE — arming echoes what it listens for,
+    /// Esc cancels audibly, and the refusal of a second wizard already
+    /// says why (v177). Slot 2 has no default binding, so the test cannot
+    /// collide with shipped shortcuts.
+    #[test]
+    fn v179_midi_listen_arm_echo_and_esc() {
+        let mut app = headless_app("v179listen");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let label = crate::MidiAction::ALL[2].label().to_string();
+        app.arm_midi_slot(2);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("listening for MIDI") && app.status.contains(&label),
+            "arming names the action it listens for: {:?}",
+            app.status
+        );
+        // Esc through real key events (press + release, v99 pace).
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                key_ev(egui::Key::Escape, egui::Modifiers::NONE),
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("listening cancelled") && app.status.contains(&label),
+            "cancel echoes with the action: {:?}",
+            app.status
+        );
+        assert!(app.midi_learning_slot.is_none(), "cancel unarms");
+    }
+
+    /// AC2: a key bind commits with an echo naming key AND action (the
+    /// cell blanking alone was too quiet to trust).
+    #[test]
+    fn v179_key_bind_commit_echo() {
+        let mut app = headless_app("v179key");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let label = crate::MidiAction::ALL[2].label().to_string();
+        app.arm_key_slot(2);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("press a key for") && app.status.contains(&label),
+            "key arming echoes: {:?}",
+            app.status
+        );
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                key_ev(egui::Key::F8, egui::Modifiers::NONE),
+                egui::Event::Key {
+                    key: egui::Key::F8,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("bound key F8") && app.status.contains(&label),
+            "the commit names key and action: {:?}",
+            app.status
+        );
+        assert_eq!(app.short_keys[2], Some(egui::Key::F8));
+    }
+
+    /// AC3: a sidechain chip click is a ROUTING change the grid never
+    /// shows — add and remove both echo as "T{s} keys T{r}" with the
+    /// sender and receiver named, and the mask follows.
+    #[test]
+    fn v179_sidechain_route_roundtrip() {
+        let mut app = headless_app("v179scrout");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.sc_send[1] = 1 << 0;
+        app.backend.engine.set_sc_send(1, 1 << 0);
+        app.fx_window = Some(1);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let chip = *galleys_all(&mut app, &ctx, "[1]")
+            .first()
+            .expect("the routed chip paints as exact [1]");
+        click_pt(&mut app, &ctx, chip);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("T1 no longer keys T2"),
+            "removal names the route it cut: {:?}",
+            app.status
+        );
+        assert_eq!(app.sc_send[1] & 1, 0, "the mask follows");
+        // Re-add: the bare chip moved slightly (brackets gone) — probe
+        // fresh and click the center THIS frame (v82 freshness law).
+        let cand = galleys_all(&mut app, &ctx, "1")
+            .into_iter()
+            .filter(|p| (p.y - chip.y).abs() < 6.0)
+            .min_by(|a, b| {
+                (a.x - chip.x)
+                    .abs()
+                    .partial_cmp(&(b.x - chip.x).abs())
+                    .unwrap()
+            })
+            .expect("the sender chip repainted un-routed");
+        click_pt(&mut app, &ctx, cand);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("T1 now keys T2"),
+            "the add names the route it made: {:?}",
+            app.status
+        );
+        assert_eq!(app.sc_send[1] & 1, 1, "the route is back");
+    }
+
+    /// AC3: multi-select is legible — the keyed-by readout is a human
+    /// list, and "none" clears with the receiver named.
+    #[test]
+    fn v179_keyed_by_human_list() {
+        let mut app = headless_app("v179keylist");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let mask = (1u128 << 0) | (1u128 << 1);
+        app.sc_send[2] = mask;
+        app.backend.engine.set_sc_send(2, mask);
+        app.fx_window = Some(2);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let list = galleys_all(&mut app, &ctx, "keyed by T1, T2");
+        assert_eq!(
+            list.len(),
+            1,
+            "the multi-key readout is a human list, not debug output"
+        );
+        click_last_exact(&mut app, &ctx, "none");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("T3 no longer keyed by anything"),
+            "clearing all keys names the receiver: {:?}",
+            app.status
+        );
+        assert_eq!(app.sc_send[2], 0);
+    }
+
+    /// AC1: the Set-value dialog commits with an echo naming the target,
+    /// the value and the unit — the same sentence the hover promised.
+    #[test]
+    fn v179_set_value_dialog_echo() {
+        let mut app = headless_app("v179setval");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.value_dialog = Some((0, "track.vol".to_string(), "100".to_string()));
+        app.value_dialog_focus = true;
+        frame(&mut app, &ctx, vec![]);
+        click_last_exact(&mut app, &ctx, "Apply");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("set value")
+                && app.status.contains("track volume")
+                && app.status.contains("100"),
+            "the commit names target + value + unit: {:?}",
+            app.status
+        );
+        assert!(app.value_dialog.is_none(), "apply closes the dialog");
+    }
+
+    /// Palette home (ts-028 ask): every automation-curve / picker color
+    /// lives ONLY in its named const — the const line exists exactly
+    /// once, and the historical raw body forms never return.
+    #[test]
+    fn v179_auto_curve_palette_home() {
+        let prod = v178_prod();
+        for line in [
+            "const COL_AUTO_CANVAS: Color32 = Color32::from_rgb(16, 18, 24);",
+            "const COL_AUTO_EDGE: Color32 = Color32::from_gray(60);",
+            "const COL_AUTO_GRID: Color32 = Color32::from_gray(35);",
+            "const COL_AUTO_BAR_LINE: Color32 = Color32::from_gray(52);",
+            "const COL_AUTO_BEAT_LINE: Color32 = Color32::from_gray(32);",
+            "const COL_AUTO_BAR_TXT: Color32 = Color32::from_gray(130);",
+            "const COL_AUTO_LINE: Color32 = Color32::from_rgb(255, 120, 120);",
+            "const COL_AUTO_FILL: Color32 = Color32::from_rgba_premultiplied(255, 120, 120, 36);",
+            "const COL_AUTO_SEL: Color32 = Color32::from_rgb(255, 210, 120);",
+            "const COL_AUTO_NODE_TXT: Color32 = Color32::from_rgb(255, 220, 150);",
+            "const COL_PICK_STRIP: Color32 = Color32::from_rgb(28, 30, 38);",
+            "const COL_PICK_STRIP_SEL: Color32 = Color32::from_rgb(40, 42, 54);",
+            "const COL_PICK_MASTER: Color32 = Color32::from_rgb(44, 38, 30);",
+            "const COL_PICK_PANEL: Color32 = Color32::from_rgb(210, 175, 120);",
+            "const COL_AMBER_SEL: Color32 = Color32::from_rgb(255, 210, 120);",
+        ] {
+            assert_eq!(
+                prod.matches(line).count(),
+                1,
+                "palette home line must exist exactly once:\n{line}"
+            );
+        }
+        // Historical raw forms (the ts-024 filed drift) must stay dead.
+        for old in [
+            ".fill(Color32::from_rgb(44, 38, 30))",
+            ".rect_filled(rect, 0.0, Color32::from_rgb(16, 18, 24));",
+            "let fill = Color32::from_rgba_premultiplied(255, 120, 120, 36);",
+            ".button(RichText::new(\"Delete\").color(Color32::from_rgb(255, 120, 120)))",
+        ] {
+            assert!(!prod.contains(old), "raw color form {old:?} survived");
+        }
+    }
+
+    /// Geometry home: the automation window + picker sizes exist ONLY as
+    /// the v179 consts — each defined once AND adopted at a call site.
+    #[test]
+    fn v179_auto_geometry_home() {
+        let prod = v178_prod();
+        for line in [
+            "const AUTO_WIN_W: f32 = 685.0;",
+            "const AUTO_WIN_H: f32 = 460.0;",
+            "const AUTO_CANVAS_W: f32 = 596.0;",
+            "const AUTO_CANVAS_H: f32 = 240.0;",
+            "const PICK_WIN_W: f32 = 760.0;",
+            "const PICK_SCROLL_H: f32 = 440.0;",
+            "const PICK_STRIP_W: f32 = 56.0;",
+            "const PICK_MASTER_W: f32 = 64.0;",
+            "const PICK_CELL_W: f32 = 54.0;",
+            "const PICK_FADER_H: f32 = 72.0;",
+            "const PICK_BAR_H: f32 = 28.0;",
+            "const PICK_LAMP_H: f32 = 18.0;",
+            "const PICK_PARAM_W: f32 = 122.0;",
+            "const PICK_PARAM_H: f32 = 30.0;",
+        ] {
+            let name = line.split(':').next().unwrap().trim().strip_prefix("const ").unwrap();
+            assert_eq!(prod.matches(line).count(), 1, "geom const defined once: {name}");
+            assert!(
+                prod.matches(name).count() >= 2,
+                "geom const {name} must be adopted at a call site"
+            );
+        }
+    }
+
+    /// Hover/echo copy source-scan (v97 doctrine): the copy the runtime
+    /// pins cannot observe exists EXACTLY as written in prod.
+    #[test]
+    fn v179_hover_and_echo_copy_present() {
+        let prod = v178_prod();
+        for (needle, n) in [
+            ("automation now drives", 1usize),
+            ("listening cancelled: ", 2),
+            ("knob learn cancelled: ", 1),
+            ("press a key for: ", 1),
+            ("listening for MIDI: ", 1),
+            ("no longer keyed by anything", 1),
+            ("now keys T", 1),
+            ("no longer keys T", 1),
+            ("type an exact value in", 1),
+            ("keyboard binding for this action", 1),
+            ("as a sidechain key for T", 1),
+            ("click to remove the route", 1),
+            ("edits live in this window only", 1),
+            ("drives {} from", 1),
+            ("bound target: {cur}", 1),
+            ("remove every sidechain key of T", 1),
+            ("param preset \\u{201c}{name}\\u{201d} applied", 1),
+            ("automation: node #{} added @", 1),
+            ("automation: node #{} moved to", 1),
+            ("automation: segment into node #", 1),
+            ("curve rescaled", 1),
+            ("target {id}", 2),
+            ("bind this curve to", 1),
+            ("switching to bars quantizes", 1),
+            (".button(RichText::new(\"Delete\").color(crate::kit::DESTROY))", 1),
+        ] {
+            assert_eq!(
+                prod.matches(needle).count(),
+                n,
+                "hover/echo copy {needle:?} must exist exactly {n}x in prod"
+            );
+        }
+    }
+
+    /// AC4: at the frozen default size every bottom-bar affordance of the
+    /// Automation window is reachable — Save/Close paint, and the node
+    /// readout row is on screen (nothing clipped at the window floor).
+    #[test]
+    fn v179_auto_floor_rows_visible() {
+        let mut app = headless_app("v179floor");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        v26_settle(&mut app, &ctx);
+        for label in [
+            "Close",
+            "Save as new asset + clip",
+            "snap",
+            "curve",
+            "node 1",
+        ] {
+            assert!(
+                !galleys_all(&mut app, &ctx, label).is_empty(),
+                "Automation window lost {label:?} at its default size"
+            );
+        }
+    }
 }
