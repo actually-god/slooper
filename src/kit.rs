@@ -245,6 +245,14 @@ pub(crate) struct ConfirmAsk {
     pub note: Option<String>,
     /// Destructive action button label, e.g. "Remove", "Delete".
     pub confirm_label: &'static str,
+    /// v181 (TS-025): optional escape-hatch button between the confirm
+    /// and Cancel slots — for confirmations where the safe path is a
+    /// THIRD action, e.g. "Save current & load" on the project-load
+    /// gate. Some(label) paints it; the verdict is `Confirm::Alt`.
+    pub alt_label: Option<&'static str>,
+    /// Hover copy for the Alt slot (dynamic — may name the file the
+    /// hatch writes). Only read when `alt_label` is Some.
+    pub alt_hover: Option<String>,
     /// Some(text) draws a Never-warn checkbox with this label;
     /// None = a plain confirm/cancel pair.
     pub never_warn_label: Option<&'static str>,
@@ -259,6 +267,9 @@ pub(crate) enum Confirm {
     Open,
     /// Destructive action accepted (read `ask.never_warn` NOW).
     Yes,
+    /// v181: the escape-hatch button was pressed (read `ask.alt_label`
+    /// for which hatch). Fires exactly once, like the other verdicts.
+    Alt,
     /// Cancelled — button, window close, or Escape. Safe default.
     No,
 }
@@ -295,6 +306,18 @@ pub(crate) fn confirm(ui: &Ui, ask: &mut ConfirmAsk) -> Confirm {
                     .clicked()
                 {
                     verdict = Confirm::Yes;
+                }
+                // v181: optional escape hatch between the destructive
+                // button and Cancel — same slot law, same chrome.
+                if let Some(alt) = ask.alt_label {
+                    let resp = ui.button(alt);
+                    let resp = match ask.alt_hover.as_deref() {
+                        Some(h) => resp.on_hover_text(h),
+                        None => resp,
+                    };
+                    if resp.clicked() {
+                        verdict = Confirm::Alt;
+                    }
                 }
                 if ui
                     .button("Cancel")
@@ -531,7 +554,7 @@ mod tests {
                 egui::Area::new(egui::Id::new("v170_host"))
                     .fixed_pos(egui::pos2(4.0, 4.0))
                     .show(ctx, |ui| match confirm(ui, ask) {
-                        Confirm::Yes | Confirm::No => resolved = true,
+                        Confirm::Yes | Confirm::Alt | Confirm::No => resolved = true,
                         Confirm::Open => {}
                     });
             });
@@ -555,6 +578,8 @@ mod tests {
             body: "It holds 2 clips \u{2014} they are lost.".into(),
             note: Some("The assets stay saved in the asset rack.".into()),
             confirm_label: "Remove",
+            alt_label: None,
+            alt_hover: None,
             never_warn_label,
             never_warn: false,
         }
@@ -605,6 +630,28 @@ mod tests {
         assert!(
             !t2.iter().any(|t| t.contains("Never warn again")),
             "checkbox must not paint without a label"
+        );
+    }
+
+    #[test]
+    fn v181_kit_confirm_alt_painted() {
+        // v181 (TS-025 R1): the optional escape-hatch slot. Some(label)
+        // paints it between the confirm button and Cancel; None paints
+        // nothing (negative polarity — the lane_rm shape must not grow
+        // a phantom third button).
+        let mut ask = v170_ask(None);
+        ask.alt_label = Some("Save current & load");
+        ask.alt_hover = Some("save as \"demo\" first, then load".into());
+        let (_, texts) = v170_probe(&mut ask, vec![]);
+        assert!(
+            texts.iter().any(|t| t.contains("Save current & load")),
+            "Some(alt_label) must paint the hatch; galleys {texts:?}"
+        );
+        let mut plain = v170_ask(None);
+        let (_, t2) = v170_probe(&mut plain, vec![]);
+        assert!(
+            !t2.iter().any(|t| t.contains("Save current & load")),
+            "None(alt_label) must paint no hatch"
         );
     }
 }

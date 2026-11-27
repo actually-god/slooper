@@ -800,6 +800,12 @@ pub struct Config {
     /// data-loss popup (empty child lanes never pop regardless).
     #[serde(default)]
     pub lane_rm_never_warn: bool,
+    /// v181 (TS-025 R3): "Never warn again" for saving over an EXISTING
+    /// project file whose name differs from the loaded project. Set from
+    /// the standard confirm dialog; true = the save-as overwrite popup is
+    /// skipped (saving over the loaded project's own path never pops).
+    #[serde(default)]
+    pub save_overwrite_never_warn: bool,
     #[serde(default = "default_true")]
     pub show_midi: bool,
     /// v30 R4: the project-value-bindings window now belongs to the MAIN
@@ -957,6 +963,7 @@ impl Default for Config {
             mixer_follow_tracks: true,
             spectrum_line: false,
             lane_rm_never_warn: false,
+            save_overwrite_never_warn: false,
             show_midi: true,
             show_binds: true,
             side_wins: SideWins::default(),
@@ -2053,6 +2060,31 @@ mod tests {
             (legacy.edo_n, legacy.edo_root),
             (crate::tune::EDO_DEFAULT_N, crate::tune::EDO_DEFAULT_ROOT),
             "pre-v164 file defaults to standard tuning"
+        );
+    }
+
+    #[test]
+    fn v181_cfg_save_overwrite_never_warn_roundtrip() {
+        // v181 (TS-025 R3): the save-as overwrite never-warn latch —
+        // serde-default = warn ON for old files; the choice round-trips.
+        let legacy: Config = serde_json::from_str("{}").unwrap();
+        assert!(
+            !legacy.save_overwrite_never_warn,
+            "absence = warn (popup ON)"
+        );
+        let c = Config {
+            save_overwrite_never_warn: true,
+            ..Config::default()
+        };
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(
+            j.contains("\"save_overwrite_never_warn\":true"),
+            "the key is written"
+        );
+        let back: Config = serde_json::from_str(&j).unwrap();
+        assert!(
+            back.save_overwrite_never_warn,
+            "the choice survives save+reload"
         );
     }
 
