@@ -21489,7 +21489,7 @@ impl App {
 /// compact tier / full row), measured at the painted clusters.
 const TOPBAR_TITLE_W: f32 = 140.0;
 /// Heading line height + the row gap under it (probe-measured 25.75/2.0).
-const TOPBAR_TITLE_H: f32 = 27.75;
+const TOPBAR_TITLE_H: f32 = 25.75;
 const TOPBAR_STATUS_MAX_W: f32 = 300.0;
 const TOPBAR_STATUS_MIN_W: f32 = 96.0;
 const TOPBAR_FOLD_AVAIL: f32 = 1138.0;
@@ -21558,11 +21558,18 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                         egui::vec2(TOPBAR_TITLE_W, TOPBAR_TITLE_H),
                         egui::Label::new(RichText::new(&title).strong().heading()).truncate(),
                     );
-                    ui.label(
-                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                            .weak()
-                            .small(),
-                    );
+                    // v182: the heading galley sits ~2 pt right of the slot
+                    // edge (probe: 58.0 vs the plain label's 56.0 at the
+                    // same cursor) — the v91 pin demands ONE left edge for
+                    // the name+version stack, so the version row nudges.
+                    ui.horizontal(|ui| {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .weak()
+                                .small(),
+                        );
+                    });
                 })
                 .response
                 .on_hover_text(title);
@@ -59664,7 +59671,7 @@ mod tests {
         assert!(rows.iter().any(|(t, _)| t == "PLAY" || t == "STOP"), "PLAY stays inline");
         assert!(rows.iter().any(|(t, _)| t.contains("More")), "More… painted at 780");
         assert!(
-            !v182_topbar_rows(&mut app2, &ctx, 780.0, vec![], 200.0)
+            !v182_topbar_rows(&mut app2, &ctx, 780.0, vec![], 320.0)
                 .iter()
                 .any(|(t, _)| t == "bpm"),
             "grid folded at 780 (nothing below the bar either)"
@@ -59675,16 +59682,23 @@ mod tests {
             .expect("More… button")
             .1
             .center();
-        v182_topbar_rows(&mut app2, &ctx, 780.0, vec![moved(m)], 200.0);
-        v182_topbar_rows(&mut app2, &ctx, 780.0, vec![btn(m, egui::PointerButton::Primary, true)], 200.0);
+        // click_pt shape: moved+press in ONE frame (a standalone moved frame
+        // dies on the RTL-cluster hit-test — v82 settle/sampling law).
+        v182_topbar_rows(
+            &mut app2,
+            &ctx,
+            780.0,
+            vec![moved(m), btn(m, egui::PointerButton::Primary, true)],
+            320.0,
+        );
         v182_topbar_rows(
             &mut app2,
             &ctx,
             780.0,
             vec![btn(m, egui::PointerButton::Primary, false)],
-            200.0,
+            320.0,
         );
-        let rows = v182_topbar_rows(&mut app2, &ctx, 780.0, vec![], 200.0);
+        let rows = v182_topbar_rows(&mut app2, &ctx, 780.0, vec![], 320.0);
         assert!(rows.iter().any(|(t, _)| t == "bpm"), "popup carries the bpm box");
         assert!(
             rows.iter().any(|(t, _)| t.contains("REC GROUP")),

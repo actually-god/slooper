@@ -347,9 +347,9 @@ const COLOR_BASE: &[(&str, &str, usize)] = &[
     ("ui.rs", "Color32::from_rgb(255, 200, 110)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(255, 210, 210),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgb(255, 225, 130)", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
-    ("ui.rs", "Color32::from_rgb(48, 52, 60),", 1), // drift filed to ts-026 follow-up (t_2076e182 audit)
+    ("ui.rs", "const COL_DOCK_BTN: egui::Color32 = egui::Color32::from_rgb(48, 52, 60);", 1), // v182 ts-026: dock-chrome home block (chrome, not data — ts-028 audit)
     ("ui.rs", "Color32::from_rgb(64, 196, 176),", 1), // track-hue data palette (kit.rs module doc)
-    ("ui.rs", "Color32::from_rgb(70, 96, 128),", 1), // drift filed to ts-026 follow-up (t_2076e182 audit)
+    ("ui.rs", "const COL_DOCK_BTN_HOT: egui::Color32 = egui::Color32::from_rgb(70, 96, 128);", 1), // v182 ts-026: dock-chrome home block
     ("ui.rs", "Color32::from_rgb(86, 178, 234),", 1), // track-hue data palette (kit.rs module doc)
     ("ui.rs", "Color32::from_rgba_premultiplied(10, 10, 14, 160),", 2), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "Color32::from_rgba_premultiplied(90, 150, 230, 55),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
@@ -395,7 +395,6 @@ const COLOR_BASE: &[(&str, &str, usize)] = &[
     ("ui.rs", "egui::Color32::from_rgb(220, 120, 90),", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Color32::from_rgb(90, 140, 220),", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Color32::from_rgb(90, 180, 190),", 1), // drift filed to ts-023 follow-up (t_2076e182 audit)
-    ("ui.rs", "egui::Stroke::new(1.0, Color32::from_gray(110)),", 1), // drift filed to ts-026 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.0, Color32::from_gray(70)),", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.0, Color32::from_gray(90)),", 2), // drift filed to ts-026 follow-up (t_2076e182 audit)
     ("ui.rs", "egui::Stroke::new(1.0, Color32::from_rgb(255, 150, 150)),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
@@ -407,7 +406,7 @@ const COLOR_BASE: &[(&str, &str, usize)] = &[
     ("ui.rs", "egui::Stroke::new(2.0, Color32::from_rgb(255, 214, 120)),", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "let wedge = Color32::from_black_alpha(120);", 1), // drift filed to ts-021 follow-up (t_2076e182 audit)
     ("ui.rs", "p.rect_filled(sq, 2.0, Color32::from_rgb(230, 70, 70));", 1), // drift filed to v174/ts-022 filed (t_2076e182 audit)
-    ("ui.rs", "p.rect_filled(tr, 3.0, Color32::from_rgb(24, 26, 30));", 1), // drift filed to ts-026 follow-up (t_2076e182 audit)
+    ("ui.rs", "const COL_DOCK_TAB_BG: egui::Color32 = egui::Color32::from_rgb(24, 26, 30);", 1), // v182 ts-026: dock-chrome home block
     ("ui.rs", "painter.rect_filled(bend_lane, 0.0, Color32::from_gray(16));", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "painter.rect_filled(hbar, 0.0, Color32::from_black_alpha(90));", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
     ("ui.rs", "painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 22, 26));", 1), // drift filed to ts-022 follow-up (t_2076e182 audit)
@@ -491,12 +490,23 @@ const GEOM_BASE: &[(&str, &str, usize)] = &[
     ("audio/mod.rs", "const MIDI_QUIET_BLOCKS: u32 = 6;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
     ("audio/mod.rs", "const MIDI_SILENCE_FLOOR: f32 = 1e-4;", 1), // non-UI file audio/mod.rs: ABI/plumbing const
     ("ui/mcp_windows.rs", "const MIN_H: f32 = 80.0;", 1), // non-UI file ui/mcp_windows.rs: ABI/plumbing const
-    ("ui.rs", "const MIN_SHARE: f32 = 56.0;", 2), // geometry single-home declaration
+    ("ui.rs", "const MIN_SHARE: f32 = 56.0;", 1), // v182 ts-026: hoisted to one home (was declared twice)
     ("ui/mcp_windows.rs", "const MIN_VIS: f32 = 60.0;", 1), // non-UI file ui/mcp_windows.rs: ABI/plumbing const
     ("ui/mcp_windows.rs", "const MIN_W: f32 = 120.0;", 1), // non-UI file ui/mcp_windows.rs: ABI/plumbing const
     ("ui.rs", "const MIX_COL_GAP: f32 = 8.0;", 1), // geometry single-home declaration
     ("ui.rs", "const MIX_COL_W: f32 = 130.0;", 1), // geometry single-home declaration
-    ("ui.rs", "const NOTICE_FADE_SECS: f64 = 12.0;", 1), // lane geometry home (filed to ts-026 follow-up)
+    ("ui.rs", "const STATUS_FADE_FLOOR: f32 = 0.15;", 1), // v182 ts-026: echo-strip lifetime home (v182_echo_lifetime)
+    ("ui.rs", "const STATUS_FADE_START_S: f64 = 6.0;", 1), // v182 ts-026: echo-strip lifetime home
+    ("ui.rs", "const STATUS_TTL_S: f64 = 12.0;", 1), // v182 ts-026: echo-strip lifetime home
+    ("ui.rs", "const TOPBAR_COMPACT_AVAIL: f32 = 700.0;", 1), // v182 ts-026: topbar fold-tier single home (v182_topbar_narrow_floor)
+    ("ui.rs", "const TOPBAR_FOLD_AVAIL: f32 = 1138.0;", 1), // v182 ts-026: topbar fold-tier single home
+    ("ui.rs", "const TOPBAR_STATUS_MAX_W: f32 = 300.0;", 1), // v182 ts-026: status-strip width home
+    ("ui.rs", "const TOPBAR_STATUS_MIN_W: f32 = 96.0;", 1), // v182 ts-026: status-strip width home
+    ("ui.rs", "const TOPBAR_TAIL_COMPACT: f32 = 346.0;", 1), // v182 ts-026: topbar fold-tier single home
+    ("ui.rs", "const TOPBAR_TAIL_FOLD: f32 = 600.0;", 1), // v182 ts-026: topbar fold-tier single home
+    ("ui.rs", "const TOPBAR_TAIL_FULL: f32 = 850.0;", 1), // v182 ts-026: topbar fold-tier single home
+    ("ui.rs", "const TOPBAR_TITLE_H: f32 = 25.75;", 1), // v182 ts-026: topbar title block home (probe-measured)
+    ("ui.rs", "const TOPBAR_TITLE_W: f32 = 140.0;", 1), // v182 ts-026: topbar title block home
     ("claphost.rs", "const OUT_RING: usize = 256;", 1), // non-UI file claphost.rs: ABI/plumbing const
     ("ui.rs", "const PAN_WHEEL_LINE: f32 = 80.0;", 1), // lane geometry home (filed to ts-021 follow-up)
     ("vsthost.rs", "const RING_CAP: usize = 1 << 16;", 1), // non-UI file vsthost.rs: ABI/plumbing const
