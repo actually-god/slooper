@@ -70794,7 +70794,7 @@ mod tests {
             "Alt continues into the slice chooser"
         );
         assert!(
-            app.status.contains("saved project \u{201cother}\u{201d}"),
+            app.status.contains("saved project \u{201c}other\u{201d}"),
             "the save echoes: {}",
             app.status
         );
@@ -70829,7 +70829,7 @@ mod tests {
             "Cancel replaces nothing"
         );
         assert!(
-            app.status.contains("save aborted") && app.status.contains("\u{201ctwo}\u{201d}"),
+            app.status.contains("save aborted") && app.status.contains("\u{201c}two\u{201d}"),
             "the refusal names the file kept: {}",
             app.status
         );
@@ -70868,7 +70868,7 @@ mod tests {
         let pdir = v181_temp_projects(&mut app, "v181savecho");
         app.do_save("solo");
         assert!(
-            app.status.starts_with("saved project \u{201csolo}\u{201d}"),
+            app.status.starts_with("saved project \u{201c}solo\u{201d}"),
             "echo keeps its contract prefix: {}",
             app.status
         );
@@ -70914,6 +70914,11 @@ mod tests {
             "the refusal echoes: {}",
             app.status
         );
+        // Re-arm and confirm. Fresh rect, never the stale `p`: the
+        // status-bar change re-flowed the strip by a whole row (v82
+        // sample-the-target-IMMEDIATELY-before-click law, proven here:
+        // the stale rect sat 30 px below the button).
+        let p = v170_click_target(&mut app, &ctx, "Reset to Defaults");
         click_pt(&mut app, &ctx, p);
         frame(&mut app, &ctx, vec![]);
         let yes = v170_click_target(&mut app, &ctx, "Reset");
@@ -71017,13 +71022,20 @@ mod tests {
         // visually identified; the harmless slots stay plain.
         let mut app = headless_app("v181destr");
         let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        let dir = crate::paths::data_dir().join("track-templates");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("brass.json"), "{}").unwrap();
+        v61_open_template_window(&mut app, &ctx);
+        // The delete slot lives INSIDE the opened "templates" picker
+        // (v77 picker contract, as the v61 delete pin drives it).
+        click_exact(&mut app, &ctx, "templates");
         frame(&mut app, &ctx, vec![]);
-        app.tpl_name = "brass".into();
-        app.track_template_save(0);
-        app.show_tpl = true;
-        app.tpl_track = 0;
-        frame(&mut app, &ctx, vec![]);
-        frame(&mut app, &ctx, vec![]);
+        assert!(
+            galley_at_last(&mut app, &ctx, "delete template").is_some(),
+            "delete slot paints in the picker"
+        );
         assert_eq!(
             v181_galley_color(&mut app, &ctx, "delete template"),
             crate::kit::DESTROY,
@@ -71075,7 +71087,7 @@ mod tests {
         assert_eq!(
             active(concat!("ConfirmEffect::LoadPro", "ject")),
             3,
-            "enum def + arm + dispatch (+ echo arm share the {..} pattern)"
+            "arm + dispatch + refusal echo, exactly"
         );
         assert_eq!(
             active(concat!("ConfirmEffect::SaveOve", "rwrite")),
