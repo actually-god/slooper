@@ -1239,7 +1239,10 @@ mod tests {
         let l = wins(&mut app2);
         assert_eq!(
             find(&l, "drums")["float_rect"],
-            json!([140.0, 80.0, 260.0, 180.0]),
+            // v178: the drum grid is a ScrollArea — the window's minimum
+            // content height (and thus a restored rect that under-fits)
+            // is 10 px shorter than the old flat grid.
+            json!([140.0, 80.0, 260.0, 170.0]),
             "float geometry reproduced after drawing"
         );
     }

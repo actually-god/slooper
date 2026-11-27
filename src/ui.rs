@@ -2342,6 +2342,29 @@ const SMAP_WHITE_KEYS: [u8; 75] = smap_white_keys_build();
 /// Total roll width in points (the horizontal ScrollArea scrolls it).
 const SMAP_ROLL_W: f32 = 75.0 * SMAP_WW;
 
+// ---- v178 (TS-023): ONE geometry home for the stock instrument grids ----
+// The drum step grid and the sampler-map lane/key grid build their
+// in-row chrome from these constants. Before v178 the smap grid carried
+// fn-local LANE_H/KEY_H/HDR_W copies while the drum grid painted from
+// anonymous literals — two grids, one row language, nothing pinning it.
+// Values frozen + no-inline-literal scans: v178_instr_grid_single_home.
+/// In-grid control height (drum pad buttons/labels, kit-row buttons).
+const INSTR_ROW_H: f32 = 18.0;
+/// Drum grid name-cell width (first column, monospace pad label).
+const INSTR_NAME_W: f32 = 52.0;
+/// Row audition '▶' button width (drum grid + kit rows).
+const INSTR_PLAY_W: f32 = 18.0;
+/// Row clear/remove '×'-class button width (drum grid + kit rows).
+const INSTR_KILL_W: f32 = 16.0;
+/// Drum step cell min width.
+const INSTR_STEP_W: f32 = 14.0;
+/// Sampler-map lane row height.
+const SMAP_LANE_H: f32 = 24.0;
+/// Sampler-map piano key strip height.
+const SMAP_KEY_H: f32 = 22.0;
+/// Sampler-map lane header cell width (layer combo + velocity + kill).
+const SMAP_HDR_W: f32 = 190.0;
+
 /// Left edge + width of the painted key / lane block for `note`
 /// (x0 = roll origin). Black notes straddle the boundary they paint.
 fn smap_note_rect(x0: f32, note: u8) -> (f32, f32) {
@@ -7561,8 +7584,8 @@ impl App {
                 );
                 let p = ui.painter();
                 let rect = canvas;
-                p.rect_filled(rect, 0.0, egui::Color32::from_rgb(14, 16, 22));
-                p.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(55)), egui::StrokeKind::Inside);
+                p.rect_filled(rect, 0.0, COL_SE_CANVAS);
+                p.rect_stroke(rect, 0.0, egui::Stroke::new(1.0, COL_SE_CANVAS_EDGE), egui::StrokeKind::Inside);
                 // Time domain: the WIDER of source and output, so a stretched
                 // sample visibly grows past the source tick and a compressed
                 // one visibly shrinks short of it.
@@ -7576,14 +7599,14 @@ impl App {
                     let gx = rect.min.x + rect.width() * gi as f32 / 8.0;
                     p.line_segment(
                         [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(30)),
+                        egui::Stroke::new(1.0, COL_SE_GRID_LINE),
                     );
                     p.text(
                         egui::pos2(gx + 2.0, rect.max.y - 8.0),
                         egui::Align2::LEFT_CENTER,
                         format!("{:.2}s", domain * gi as f64 / 8.0 / sr),
                         egui::FontId::proportional(9.0),
-                        egui::Color32::from_gray(105),
+                        COL_SE_TIME_TXT,
                     );
                 }
                 // waveform: min/max column per pixel, peak-normalized like the
@@ -7628,7 +7651,9 @@ impl App {
                 }
                 p.line_segment(
                     [egui::pos2(rect.min.x, mid), egui::pos2(rect.max.x, mid)],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(48)),
+                    // v178 (ts-028 exact-token adoption): the zero axis IS
+                    // the kit separator gray.
+                    egui::Stroke::new(1.0, crate::kit::SEP_SOFT),
                 );
                 // fades as translucent curves ON the waveform
                 let fin_s = (ed.fade_in_ms.max(0.0) as f64 * sr / 1000.0).min(out_len as f64);
@@ -7683,19 +7708,19 @@ impl App {
                     }
                 }
                 // ---- stretch strip ----------------------------------------
-                p.rect_filled(strip, 0.0, egui::Color32::from_rgb(22, 25, 32));
-                p.rect_stroke(strip, 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(48)), egui::StrokeKind::Inside);
+                p.rect_filled(strip, 0.0, COL_SE_STRIP_BG);
+                p.rect_stroke(strip, 0.0, egui::Stroke::new(1.0, crate::kit::SEP_SOFT), egui::StrokeKind::Inside);
                 let src_x = x_of(src_len as f64);
                 p.line_segment(
                     [egui::pos2(src_x, strip.min.y + 2.0), egui::pos2(src_x, strip.max.y - 2.0)],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
+                    egui::Stroke::new(1.0, COL_SE_SRC_TICK),
                 );
                 p.text(
                     egui::pos2(src_x + 3.0, strip.center().y),
                     egui::Align2::LEFT_CENTER,
                     "src",
                     egui::FontId::proportional(9.0),
-                    egui::Color32::from_gray(130),
+                    COL_SE_SRC_TXT,
                 );
                 let stretch_x = x_of((out_len as f64).min(domain));
                 p.line_segment(
@@ -7708,7 +7733,7 @@ impl App {
                     egui::Align2::RIGHT_CENTER,
                     format!("{:.2}s  \u{d7}{:.2}", out_len as f64 / sr, ed.stretch),
                     egui::FontId::proportional(9.0),
-                    egui::Color32::from_gray(150),
+                    COL_SE_READOUT,
                 );
                 let geom = SeGeom {
                     rect,
@@ -7809,7 +7834,10 @@ impl App {
                             .logarithmic(true)
                             .text("\u{d7}")
                             .custom_formatter(|v, _| format!("{v:.2}")),
-                    );
+                    )
+                        // v178 (TS-023): the strip marker mirrors this
+                        // slider — the hover ties them together.
+                        .on_hover_text("length without pitch: \u{d7}1.00 = as-is; drag the strip marker for the same edit");
                     ui.checkbox(&mut ed.preserve_pitch, "keep pitch")
                         .on_hover_text("on: WSOLA time stretch (pitch preserved); off: resample (pitch rides)");
                 });
@@ -7820,7 +7848,10 @@ impl App {
                             .range(-2400.0..=2400.0)
                             .speed(5.0)
                             .suffix(" ct"),
-                    );
+                    )
+                        // v178 (TS-023): same gesture, other end — pair
+                        // the two hovers (the 'end' one already explained).
+                        .on_hover_text("pitch sweep start (left end of the amber line; same as dragging its dot)");
                     ui.label("end");
                     ui.add(
                         egui::DragValue::new(&mut ed.bend_end_cents)
@@ -7839,7 +7870,10 @@ impl App {
                                 .range(0.0..=60_000.0)
                                 .speed(1.0)
                                 .suffix(" ms"),
-                        );
+                        )
+                        // v178 (TS-023): the on-canvas fade handle is the
+                        // same edit — say so.
+                        .on_hover_text("fade length (drag the matching handle on the canvas for the same edit)");
                         egui::ComboBox::from_id_salt(format!("se-curve-{label}"))
                             .selected_text(c.name())
                             .show_ui(ui, |ui| {
@@ -7863,7 +7897,10 @@ impl App {
                 ));
                 ui.horizontal(|ui| {
                     ui.label("save as");
-                    ui.add(egui::TextEdit::singleline(&mut self.se_name).desired_width(140.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.se_name).desired_width(140.0))
+                        // v178 (TS-023): leave it empty for the auto
+                        // "<name> (edit)" stem — the box never said so.
+                        .on_hover_text("new asset name (empty = original name + \" (edit)\")");
                     if ui
                         .button("save as new asset")
                         .on_hover_text("render into the recordings folder (right-click a folder to set it)")
@@ -7905,6 +7942,60 @@ impl App {
             } else {
                 self.se_apply(&key);
                 self.se_defer = None;
+            }
+            // v178 (TS-023): every committed edit echoes one line naming
+            // what moved — a 1-px fade-handle nudge otherwise looked like
+            // nothing happened (the strip/canvas are far from the label
+            // rows the user is watching). LAST, so se_apply's length
+            // readout never overwrites the verb line.
+            let verbs: Vec<String> = if reset {
+                vec!["reset to the source sound \u{b7} edits cleared".into()]
+            } else {
+                let mut v: Vec<String> = Vec::new();
+                if ed.reverse != cur.reverse {
+                    v.push(format!("reverse {}", if ed.reverse { "on" } else { "off" }));
+                }
+                if ed.pingpong != cur.pingpong {
+                    v.push(format!("ping-pong {}", if ed.pingpong { "on" } else { "off" }));
+                }
+                if ed.preserve_pitch != cur.preserve_pitch {
+                    v.push(format!(
+                        "keep pitch {}",
+                        if ed.preserve_pitch { "on" } else { "off" }
+                    ));
+                }
+                if (ed.pitch_cents - cur.pitch_cents).abs() > 1e-6 {
+                    v.push(format!("pitch {:+.0} ct", ed.pitch_cents));
+                }
+                if (ed.bend_start_cents - cur.bend_start_cents).abs() > 1e-6
+                    || (ed.bend_end_cents - cur.bend_end_cents).abs() > 1e-6
+                {
+                    v.push(format!(
+                        "bend {:+.0}\u{2192}{:+.0} ct",
+                        ed.bend_start_cents, ed.bend_end_cents
+                    ));
+                }
+                if (ed.stretch - cur.stretch).abs() > 1e-6 {
+                    v.push(format!("stretch \u{d7}{:.2}", ed.stretch));
+                }
+                if (ed.fade_in_ms - cur.fade_in_ms).abs() > 0.01 || ed.fade_in != cur.fade_in {
+                    v.push(format!(
+                        "fade in {:.0} ms \u{b7} {}",
+                        ed.fade_in_ms,
+                        ed.fade_in.name()
+                    ));
+                }
+                if (ed.fade_out_ms - cur.fade_out_ms).abs() > 0.01 || ed.fade_out != cur.fade_out {
+                    v.push(format!(
+                        "fade out {:.0} ms \u{b7} {}",
+                        ed.fade_out_ms,
+                        ed.fade_out.name()
+                    ));
+                }
+                v
+            };
+            if !verbs.is_empty() {
+                self.status = format!("sample edit: {aname} \u{b7} {}", verbs.join(" \u{b7} "));
             }
         } else if self.se_drag.is_none() {
             if let Some(k) = self.se_defer.take() {
@@ -10197,6 +10288,14 @@ impl App {
     /// so both placements behave identically.
     fn drum_win_body(&mut self, ui: &mut egui::Ui) {
         self.drum_resolve();
+        // v178 (TS-023): drum step-grid chrome palette, named and homed
+        // at its painter (kit.rs module doc: data palettes live with
+        // their painter). The painted hit cell is a velocity RAMP
+        // (computed from the pad value), not a palette member. Values
+        // frozen + no-inline-literal scan: v178_stock_tints_single_home.
+        const COL_PAD_DOWN: egui::Color32 = egui::Color32::from_gray(74);
+        const COL_PAD_STEP: egui::Color32 = egui::Color32::from_gray(56);
+        const COL_PAD_DOT: egui::Color32 = egui::Color32::from_gray(130);
         let mut dirty = false;
         let mut commit_now = false;
         let ctx = ui.ctx().clone();
@@ -10228,6 +10327,9 @@ impl App {
                         {
                             self.drum.track = t;
                             dirty = true;
+                            // v178 (TS-023): the whole grid re-renders for
+                            // another track's kit — say which one.
+                            self.status = format!("drums: editing track {}\u{2019}s kit", t + 1);
                         }
                     }
                 });
@@ -10248,6 +10350,12 @@ impl App {
                             .changed()
                         {
                             dirty = true;
+                            // v178 (TS-023): the grid width silently
+                            // re-derives from the subdivision — echo it.
+                            self.status = format!(
+                                "drums: {label} \u{b7} {} steps per bar",
+                                (self.beats().max(1) as usize * *s as usize).clamp(2, 256)
+                            );
                         }
                     }
                 });
@@ -10264,6 +10372,13 @@ impl App {
                 self.drum.playing = !self.drum.playing;
                 self.drum.step_start = self.backend.engine.pos();
                 self.drum.last_step = usize::MAX;
+                // v178 (TS-023): the step clock starts/stops with no other
+                // feedback than a moving outline — echo the transport verb.
+                self.status = if self.drum.playing {
+                    format!("drums: playing \u{b7} {} steps", self.drum.steps)
+                } else {
+                    "drums: stopped".into()
+                };
             }
             if ui.button("clear all")
                 .on_hover_text("erase every step on every pad")
@@ -10273,6 +10388,10 @@ impl App {
                     row.iter_mut().for_each(|v| *v = 0);
                 }
                 dirty = true;
+                self.status = format!(
+                    "drums: cleared the whole pattern \u{b7} {} pads",
+                    self.drum.grid.len()
+                );
             }
             if ui
                 .button("commit to track")
@@ -10320,23 +10439,49 @@ impl App {
                 self.audition_impulse(k, v);
             }
         }
-        egui::Grid::new("drum_grid")
-            .num_columns(self.drum.steps + 3)
-            .spacing([2.0, 3.0])
+        // v178 (TS-023): the grid SCROLLS. This body paints inside
+        // body_clipped, so before v178 a shrunk window (or the full
+        // 16-pad kit, or a wide subdivision) silently lost rows at the
+        // floor and columns at the right — the exact v89 sampler-map
+        // class. Vertical is bounded against the offered height (floored
+        // so tiny frames still show a strip of pads, the v44 kit-list
+        // rule); an unbounded (auto-sized) window keeps painting straight
+        // through. Solid chrome per v89: dormant 2-px scrollbars read as
+        // "no scroll here".
+        let grid_h = (ui.available_height() - 42.0).max(88.0);
+        let old_scroll_style = ui.spacing().scroll;
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+        egui::ScrollArea::both()
+            .id_salt("drumgrid")
+            .max_height(grid_h)
+            .auto_shrink([false, true])
             .show(ui, |ui| {
+                egui::Grid::new("drum_grid")
+                    .num_columns(self.drum.steps + 3)
+                    .spacing([2.0, 3.0])
+                    .show(ui, |ui| {
                 for (p, pad) in pads.iter().enumerate() {
-                    ui.add_sized(
-                        [52.0, 18.0],
+                    // v178 (TS-023): 52 px of monospace silently loses a
+                    // long pad name — a clipped row hovers its identity
+                    // first (v87 law, kit::row_clipped detects).
+                    let nresp = ui.add_sized(
+                        [INSTR_NAME_W, INSTR_ROW_H],
                         egui::Label::new(RichText::new(pad.name.clone()).monospace().small())
                             .selectable(false),
-                    )
-                    .on_hover_text(format!(
+                    );
+                    let base_tip = format!(
                         "kit pad {} \u{b7} sound, velocity and mute are \
                                  edited in this track's SYNTHS window",
                         p + 1
-                    ));
+                    );
+                    let tip = if crate::kit::row_clipped(&nresp, ui) {
+                        format!("pad \u{201c}{}\u{201d}\n{base_tip}", pad.name)
+                    } else {
+                        base_tip
+                    };
+                    nresp.on_hover_text(tip);
                     if ui
-                        .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
+                        .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(INSTR_PLAY_W, INSTR_ROW_H)))
                         .on_hover_text("Audition this pad")
                         .clicked()
                     {
@@ -10346,7 +10491,7 @@ impl App {
                         }
                     }
                     if ui
-                        .add(egui::Button::new("x").min_size(egui::vec2(16.0, 18.0)))
+                        .add(egui::Button::new("x").min_size(egui::vec2(INSTR_KILL_W, INSTR_ROW_H)))
                         .on_hover_text("Clear this pad's row")
                         .clicked()
                     {
@@ -10354,25 +10499,32 @@ impl App {
                             row.iter_mut().for_each(|v| *v = 0);
                         }
                         dirty = true;
+                        // v178 (TS-023): a whole row emptying at once is a
+                        // big invisible change — name the pad.
+                        self.status = format!(
+                            "drums: cleared pad \u{201c}{}\u{201d}'s row",
+                            pad.name
+                        );
                     }
                     for s in 0..self.drum.steps {
                         let v = self.drum.grid[p][s];
                         let fill = if v == 0 {
-                            egui::Color32::from_gray(if s % sub == 0 { 74 } else { 56 })
+                            if s % sub == 0 { COL_PAD_DOWN } else { COL_PAD_STEP }
                         } else {
+                            // velocity ramp (computed, not a palette member)
                             egui::Color32::from_rgb(90 + v / 2, 55 + v / 4, 55)
                         };
                         let mut b = egui::Button::new(
                             egui::RichText::new(if v == 0 { " " } else { "\u{25cf}" }).color(
                                 if v == 0 {
-                                    egui::Color32::from_gray(130)
+                                    COL_PAD_DOT
                                 } else {
                                     egui::Color32::WHITE
                                 },
                             ),
                         )
                         .fill(fill)
-                        .min_size(egui::vec2(14.0, 18.0));
+                        .min_size(egui::vec2(INSTR_STEP_W, INSTR_ROW_H));
                         if cur == s {
                             b = b.stroke(egui::Stroke::new(1.5, ui.visuals().hyperlink_color));
                         }
@@ -10419,7 +10571,9 @@ impl App {
                     }
                     ui.end_row();
                 }
+                    });
             });
+        ui.spacing_mut().scroll = old_scroll_style;
         ui.label(
             RichText::new(format!(
                 "kit of track {} \u{b7} sounds, velocities and mute: \
@@ -15705,11 +15859,14 @@ impl App {
         // including the first one after a restart — warm the table (cheap
         // no-op once warm; a gone file hits only the poison memo).
         self.warm_sampler_map(t);
-        const LANE_H: f32 = 24.0;
-        const KEY_H: f32 = 22.0;
-        const HDR_W: f32 = 190.0;
         let roll_w = SMAP_ROLL_W;
-        let palette = [
+        // v178 (TS-023): sampler-map data palette, named and homed next to
+        // its painter (kit.rs module doc: data palettes live with their
+        // painter). Row geometry reads the shared instrument home
+        // (SMAP_LANE_H / SMAP_KEY_H / SMAP_HDR_W next to smap_note_rect).
+        // Layer tints cycle per resolved slot; values frozen by
+        // v178_stock_tints_single_home.
+        const SMAP_TINTS: [egui::Color32; 6] = [
             egui::Color32::from_rgb(90, 140, 220),
             egui::Color32::from_rgb(220, 120, 90),
             egui::Color32::from_rgb(110, 190, 120),
@@ -15717,6 +15874,17 @@ impl App {
             egui::Color32::from_rgb(160, 110, 200),
             egui::Color32::from_rgb(90, 180, 190),
         ];
+        const COL_SMAP_LANE: egui::Color32 = egui::Color32::from_rgb(24, 26, 32);
+        const COL_SMAP_LANE_XF: egui::Color32 = egui::Color32::from_rgb(28, 30, 38);
+        const COL_SMAP_SEL: egui::Color32 = egui::Color32::from_rgb(46, 52, 72);
+        const COL_SMAP_ZONE: egui::Color32 = egui::Color32::from_gray(70);
+        const COL_SMAP_MISSING: egui::Color32 = egui::Color32::from_gray(90);
+        const COL_SMAP_KEY_WHITE: egui::Color32 = egui::Color32::from_gray(210);
+        const COL_SMAP_KEY_EDGE: egui::Color32 = egui::Color32::from_gray(90);
+        const COL_SMAP_KEY_BLACK: egui::Color32 = egui::Color32::from_gray(28);
+        const COL_SMAP_KEY_LBL: egui::Color32 = egui::Color32::from_gray(60);
+        const COL_SMAP_ROOT: egui::Color32 = egui::Color32::from_rgb(255, 190, 60);
+        const COL_SMAP_SEL_TXT: egui::Color32 = egui::Color32::from_gray(150);
         // Snapshot the rack's audio assets (picker source) + slot info.
         let audio_assets: Vec<(usize, String)> = self
             .assets
@@ -15739,6 +15907,10 @@ impl App {
                     m.mode = 0;
                     self.push_sampler_map(t);
                     self.save_config();
+                    // v178 (TS-023): the mode row repaints in a 12-px
+                    // highlight that reads as unchanged at a glance — the
+                    // status line carries the decision.
+                    self.status = "sampler map: mode \u{b7} hard cutoff".into();
                 }
             }
             if ui
@@ -15751,6 +15923,7 @@ impl App {
                     m.mode = 1;
                     self.push_sampler_map(t);
                     self.save_config();
+                    self.status = "sampler map: mode \u{b7} crossfade".into();
                 }
             }
             ui.separator();
@@ -15776,9 +15949,20 @@ impl App {
                                     asset: sp.clone(),
                                     root,
                                 });
-                                self.smap_sel = Some(m.slots.len() - 1);
+                                // v178 (TS-023): the new lane appears far
+                                // below the header; echo what landed where.
+                                // (count hoisted before the self-calls: the
+                                // m borrow must end before push/save.)
+                                let n = m.slots.len();
+                                self.smap_sel = Some(n - 1);
                                 self.push_sampler_map(t);
                                 self.save_config();
+                                self.status = format!(
+                                    "sampler map: + {} \u{b7} root {} \u{b7} {} mapped",
+                                    self.assets[k].name,
+                                    note_name(root),
+                                    n
+                                );
                             }
                         }
                     }
@@ -15910,6 +16094,9 @@ impl App {
                 .unwrap_or(127);
             let mut new_asset: Option<String> = None;
             let mut new_vel: Option<u8> = None;
+            // v178 (TS-023): last root this row's block was dragged to —
+            // echoed once when the drag lands (per-frame would spam).
+            let mut moved_to: Option<u8> = None;
             ui.horizontal(|ui| {
                 // v56 R1: BOTH the header cell and the roll strip are
                 // allocated at exact sizes (the old allocate_ui_with_layout
@@ -15917,9 +16104,9 @@ impl App {
                 // keyboard header cell started its keys ~145 px left of the
                 // lane grid — the reported misalignment).
                 let (hr, _) =
-                    ui.allocate_exact_size(egui::vec2(HDR_W, LANE_H), egui::Sense::hover());
+                    ui.allocate_exact_size(egui::vec2(SMAP_HDR_W, SMAP_LANE_H), egui::Sense::hover());
                 let (lr, _) =
-                    ui.allocate_exact_size(egui::vec2(roll_w, LANE_H), egui::Sense::hover());
+                    ui.allocate_exact_size(egui::vec2(roll_w, SMAP_LANE_H), egui::Sense::hover());
                 if i == 0 {
                     probe_lane = Some((lr.min.x, lr.min.y));
                 }
@@ -15931,7 +16118,7 @@ impl App {
                     );
                     let cur = format!("#{} {}", i + 1, name);
                     egui::ComboBox::from_id_salt(("smapcombo", t, i))
-                        .width(HDR_W - 100.0)
+                        .width(SMAP_HDR_W - 100.0)
                         .selected_text(RichText::new(cur).small())
                         .show_ui(&mut ch, |ui| {
                             for (k, nm) in &audio_assets {
@@ -15987,18 +16174,14 @@ impl App {
                     self.smap_sel = Some(i);
                 }
                 let base = if mode == 1 {
-                    egui::Color32::from_rgb(28, 30, 38)
+                    COL_SMAP_LANE_XF
                 } else {
-                    egui::Color32::from_rgb(24, 26, 32)
+                    COL_SMAP_LANE
                 };
                 ui.painter().rect_filled(
                     lr,
                     2.0,
-                    if sel {
-                        egui::Color32::from_rgb(46, 52, 72)
-                    } else {
-                        base
-                    },
+                    if sel { COL_SMAP_SEL } else { base },
                 );
                 // Zone overlay: cutoff draws the switch points (midpoints
                 // of the two key CENTERS), crossfade draws the blend
@@ -16013,7 +16196,7 @@ impl App {
                         };
                         ui.painter().line_segment(
                             [egui::pos2(x, lr.min.y), egui::pos2(x, lr.max.y)],
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+                            egui::Stroke::new(1.0, COL_SMAP_ZONE),
                         );
                     }
                 }
@@ -16026,9 +16209,9 @@ impl App {
                     egui::pos2(bx + bw, lr.max.y - 2.0),
                 );
                 let col = if resolved {
-                    palette[i % palette.len()]
+                    SMAP_TINTS[i % SMAP_TINTS.len()]
                 } else {
-                    egui::Color32::from_gray(90)
+                    COL_SMAP_MISSING
                 };
                 ui.painter().rect_filled(
                     block,
@@ -16040,7 +16223,9 @@ impl App {
                     egui::Align2::LEFT_CENTER,
                     format!("{}{}", name, if resolved { "" } else { " (missing)" }),
                     egui::FontId::proportional(10.0),
-                    egui::Color32::from_gray(170),
+                    // v178 (TS-023): exact-token adoption (ts-028 audit):
+                    // this gray IS kit::TEXT.
+                    crate::kit::TEXT,
                 );
                 let bresp = ui.interact(
                     block.expand(4.0),
@@ -16070,6 +16255,7 @@ impl App {
                             }
                             self.push_sampler_map(t);
                             dirty_order = true;
+                            moved_to = Some(note);
                             self.smap_audition(t, note);
                         }
                     }
@@ -16081,6 +16267,10 @@ impl App {
                     if dirty_order {
                         self.save_config();
                         dirty_order = false;
+                    }
+                    if let Some(nn) = moved_to.take() {
+                        self.status =
+                            format!("sampler map: #{} root \u{2192} {}", i + 1, note_name(nn));
                     }
                 }
                 // v90: the lane strip is a rack-drop target. Hover sense
@@ -16111,11 +16301,15 @@ impl App {
                 ));
             });
             if let Some(sp) = new_asset {
+                // v178 (TS-023): replacing a layer's sample echoes which
+                // layer took which sound (stem law shared with the rack).
+                let nm = sample_stem_label(&sp);
                 if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
                     if let Some(s) = m.slots.get_mut(i) {
                         s.asset = sp;
                         self.push_sampler_map(t);
                         self.save_config();
+                        self.status = format!("sampler map: #{} \u{2192} {}", i + 1, nm);
                     }
                 }
             }
@@ -16140,10 +16334,20 @@ impl App {
         if let Some(i) = del_row {
             if let Some(Some(m)) = self.sampler_maps.get_mut(t) {
                 if i < m.slots.len() {
+                    // v178 (TS-023): name what vanished (the lanes below
+                    // also shift, so the echo carries the remaining count).
+                    // (count hoisted before the self-calls: the m borrow
+                    // must end before push/save.)
+                    let nm = infos[i].0.clone();
                     m.slots.remove(i);
+                    let n = m.slots.len();
                     self.smap_sel = None;
                     self.push_sampler_map(t);
                     self.save_config();
+                    self.status = format!(
+                        "sampler map: \u{201c}{nm}\u{201d} removed \u{b7} {} mapped",
+                        n
+                    );
                 }
             }
         }
@@ -16181,9 +16385,9 @@ impl App {
             // Header cell at EXACTLY the lane rows' header size (v56 R1):
             // the roll and the keys now share one x origin by construction.
             let (hr, _) =
-                ui.allocate_exact_size(egui::vec2(HDR_W, KEY_H), egui::Sense::hover());
+                ui.allocate_exact_size(egui::vec2(SMAP_HDR_W, SMAP_KEY_H), egui::Sense::hover());
             let (kr, kresp) =
-                ui.allocate_exact_size(egui::vec2(roll_w, KEY_H), egui::Sense::click_and_drag());
+                ui.allocate_exact_size(egui::vec2(roll_w, SMAP_KEY_H), egui::Sense::click_and_drag());
             let sel_note = self
                 .smap_sel
                 .and_then(|i| infos.get(i))
@@ -16194,7 +16398,7 @@ impl App {
                 egui::Align2::LEFT_CENTER,
                 format!("selected: {sel_note}"),
                 egui::FontId::proportional(10.0),
-                egui::Color32::from_gray(150),
+                COL_SMAP_SEL_TXT,
             );
             probe_kr = Some(kr);
             // White keys (uniform, full height), then C labels.
@@ -16203,11 +16407,11 @@ impl App {
                 let r =
                     egui::Rect::from_min_max(egui::pos2(x, kr.min.y), egui::pos2(x + w, kr.max.y));
                 ui.painter()
-                    .rect_filled(r, 1.0, egui::Color32::from_gray(210));
+                    .rect_filled(r, 1.0, COL_SMAP_KEY_WHITE);
                 ui.painter().rect_stroke(
                     r,
                     1.0,
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+                    egui::Stroke::new(1.0, COL_SMAP_KEY_EDGE),
                     egui::StrokeKind::Inside,
                 );
                 if wn.is_multiple_of(12) {
@@ -16216,7 +16420,7 @@ impl App {
                     // v172: paint via the single seam (font-pack aware).
                     let lab = crate::tune::label_live(wn);
                     let col = if lab.anchor {
-                        egui::Color32::from_gray(60)
+                        COL_SMAP_KEY_LBL
                     } else {
                         crate::kit::MUTED
                     };
@@ -16241,10 +16445,9 @@ impl App {
                 let (x, w) = smap_note_rect(kr.min.x, bn);
                 let r = egui::Rect::from_min_max(
                     egui::pos2(x, kr.min.y),
-                    egui::pos2(x + w, kr.min.y + KEY_H * 0.62),
+                    egui::pos2(x + w, kr.min.y + SMAP_KEY_H * 0.62),
                 );
-                ui.painter()
-                    .rect_filled(r, 1.0, egui::Color32::from_gray(28));
+                ui.painter().rect_filled(r, 1.0, COL_SMAP_KEY_BLACK);
                 if bn == 37 {
                     self.smap_black_probe = Some(r);
                 }
@@ -16253,11 +16456,8 @@ impl App {
             if let Some(i) = self.smap_sel.filter(|i| *i < n) {
                 let root = infos[i].1;
                 let px = smap_note_center(kr.min.x, root);
-                ui.painter().circle_filled(
-                    egui::pos2(px, kr.min.y + 3.0),
-                    3.0,
-                    egui::Color32::from_rgb(255, 190, 60),
-                );
+                ui.painter()
+                    .circle_filled(egui::pos2(px, kr.min.y + 3.0), 3.0, COL_SMAP_ROOT);
             }
             if let (Some(lr0), Some(kr)) = (probe_lane, probe_kr) {
                 self.smap_probe = Some((kr.min.x, kr.min.y, lr0.0, lr0.1, roll_w));
@@ -16280,6 +16480,10 @@ impl App {
                         }
                         me.push_sampler_map(t);
                         me.save_config();
+                        // v178 (TS-023): key-click retarget echoes the
+                        // same "#N root -> note" line the block drag uses.
+                        me.status =
+                            format!("sampler map: #{} root \u{2192} {}", i + 1, note_name(note));
                     }
                 }
                 me.smap_audition(t, note);
@@ -16323,9 +16527,11 @@ impl App {
                 self.sampler_map_drop_asset(t, SmapDrop::Key(note), a);
             }
             kz.on_hover_text(
-                "drop a rack sample here to replace the WHOLE mapping of \
-                 the key under the cursor \u{2014} every velocity layer on \
-                 that note (a key with no layers gets one)",
+                "click / drag a key: preview its sample here and move the \
+                 selected layer's root key to it \u{b7} or drop a rack sample \
+                 here to replace the WHOLE mapping of the key under the \
+                 cursor \u{2014} every velocity layer on that note (a key \
+                 with no layers gets one)",
             );
         });
     }
@@ -16750,12 +16956,21 @@ impl App {
                                     .desired_width(56.0)
                                     .font(egui::TextStyle::Monospace),
                             )
+                            // v178 (TS-023): the box is the pad's rename
+                            // field — say so (and where the name shows up).
+                            .on_hover_text(
+                                "pad name \u{b7} rename here (shows in the \
+                                 DRUMS window row and the audition echo)",
+                            )
                             .changed()
                         {
                             kit_changed = true;
                         }
                         if ui
-                            .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
+                            .add(
+                                egui::Button::new("\u{25b6}")
+                                    .min_size(egui::vec2(INSTR_PLAY_W, INSTR_ROW_H)),
+                            )
                             .on_hover_text("Audition this pad")
                             .clicked()
                         {
@@ -16772,8 +16987,30 @@ impl App {
                         // v129: separator-safe stem label (was a slash-only
                         // rsplit — full path on Windows scans, card t_b47cb577).
                         let label = sample_stem_label(&cur_path);
+                        // v178 (TS-023): the 110-px combo silently elides a
+                        // long stem — a clipped pick hovers the FULL sound
+                        // name (v87 law; label_clipped measures the same
+                        // elision the combo applies, ~84 px after the
+                        // button-arrow reserve). The hover rides the
+                        // statement chain so the v173 combo-owner rule
+                        // sees it.
+                        let lbl_clipped = crate::kit::label_clipped(
+                            ui,
+                            &label,
+                            84.0,
+                            egui::TextStyle::Button,
+                            None,
+                        );
+                        let kit_hover = if lbl_clipped {
+                            format!(
+                                "sound \u{201c}{label}\u{201d} \u{b7} click to change it"
+                            )
+                        } else {
+                            "change this pad's sound (click for the sample list)"
+                                .to_string()
+                        };
                         egui::ComboBox::from_id_salt(format!("kit_asset_{t}_{p}"))
-                            .selected_text(label)
+                            .selected_text(label.clone())
                             .width(110.0)
                             .show_ui(ui, |ui| {
                                 if ui
@@ -16784,6 +17021,12 @@ impl App {
                                     kit[p].asset_path.clear();
                                     kit[p].asset = None;
                                     kit_changed = true;
+                                    // v178 (TS-023): "silent" is only one
+                                    // combo label — name the pad it hit.
+                                    self.status = format!(
+                                        "drum kit: pad {} \u{b7} silent (sample unassigned)",
+                                        p + 1
+                                    );
                                 }
                                 for (path, nm) in &audio_rows {
                                     if ui
@@ -16794,9 +17037,19 @@ impl App {
                                         kit[p].asset_path = path.clone();
                                         kit[p].asset = None;
                                         kit_changed = true;
+                                        // v178 (TS-023): the combo picks up
+                                        // the new label, but a pick on row
+                                        // 12 read from row 2 shows nothing —
+                                        // the echo names pad and sample.
+                                        self.status = format!(
+                                            "drum kit: pad {} \u{b7} sample \u{201c}{nm}\u{201d}",
+                                            p + 1
+                                        );
                                     }
                                 }
-                            });
+                            })
+                            .response
+                            .on_hover_text(kit_hover);
                         // v69 (S1): import a sound straight from disk —
                         // no file-manager round-trip for a drop. The
                         // dialog is native (unreachable headless), so
@@ -16845,16 +17098,27 @@ impl App {
                         if ui
                             .add(
                                 egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
-                                    .min_size(egui::vec2(16.0, 18.0)),
+                                    .min_size(egui::vec2(INSTR_KILL_W, INSTR_ROW_H)),
                             )
                             .on_hover_text("Mute pad")
                             .clicked()
                         {
                             kit[p].muted = !kit[p].muted;
                             kit_changed = true;
+                            // v178 (TS-023): a ●→m flip on one row of up to
+                            // 16 is easy to miss — echo which pad changed.
+                            self.status = format!(
+                                "drum kit: pad {} {} \u{b7} {}",
+                                p + 1,
+                                if kit[p].muted { "muted" } else { "unmuted" },
+                                kit[p].name
+                            );
                         }
                         if ui
-                            .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
+                            .add(
+                                egui::Button::new("\u{2715}")
+                                    .min_size(egui::vec2(INSTR_KILL_W, INSTR_ROW_H)),
+                            )
                             .on_hover_text("Remove this pad")
                             .clicked()
                             && kit.len() > 1
@@ -16916,6 +17180,12 @@ impl App {
                     muted: false,
                 });
                 kit_changed = true;
+                // v178 (TS-023): a silent new row at the list bottom can
+                // sit below the fold — echo the add + the pad count.
+                self.status = format!(
+                    "drum kit: added a pad \u{b7} {} of {DRUM_MAX_PADS}",
+                    kit.len()
+                );
             }
             ui.label(
                 RichText::new(format!("{} / {DRUM_MAX_PADS} pads", kit.len()))
@@ -16924,8 +17194,15 @@ impl App {
             );
         });
         if let Some(p) = remove_pad {
+            // v178 (TS-023): a whole row vanishing needs naming (which
+            // pad left, and that its grid row went with it).
+            let gone = kit.get(p).map(|k| k.name.clone()).unwrap_or_default();
             kit.remove(p);
             kit_changed = true;
+            self.status = format!(
+                "drum kit: removed pad \u{201c}{gone}\u{201d} \u{b7} {} pads left",
+                kit.len()
+            );
         }
         if kit_changed {
             *self.kit_mut(t) = kit;
@@ -21431,6 +21708,19 @@ const COL_SE_FO: egui::Color32 = egui::Color32::from_rgb(255, 150, 120);
 /// v63: pitch line (mint) and pitch-bend sweep line (amber).
 const COL_SE_PITCH: egui::Color32 = egui::Color32::from_rgb(120, 255, 170);
 const COL_SE_BEND: egui::Color32 = egui::Color32::from_rgb(255, 200, 90);
+// v178 (TS-023): the canvas chrome grays joined the same home (ts-028
+// audit: they were forked literals at the painter). Values frozen by
+// v178_stock_tints_single_home. The zero axis and the strip frame are
+// kit::SEP_SOFT — the v175 token this gray already is (ts-028 exact
+// -token adoption).
+const COL_SE_CANVAS: egui::Color32 = egui::Color32::from_rgb(14, 16, 22);
+const COL_SE_CANVAS_EDGE: egui::Color32 = egui::Color32::from_gray(55);
+const COL_SE_GRID_LINE: egui::Color32 = egui::Color32::from_gray(30);
+const COL_SE_TIME_TXT: egui::Color32 = egui::Color32::from_gray(105);
+const COL_SE_STRIP_BG: egui::Color32 = egui::Color32::from_rgb(22, 25, 32);
+const COL_SE_SRC_TICK: egui::Color32 = egui::Color32::from_gray(120);
+const COL_SE_SRC_TXT: egui::Color32 = egui::Color32::from_gray(130);
+const COL_SE_READOUT: egui::Color32 = egui::Color32::from_gray(150);
 
 /// v63: paint one fade as a PARTIALLY TRANSPARENT gain curve over the
 /// waveform (`x0` = region start, `x1` = region end; gain runs 0→1 across
@@ -60782,14 +61072,14 @@ mod tests {
         };
         assert_eq!(
             prod.matches("kit::row_clipped(").count(),
-            3,
-            "chain row + both add-combo popups detect right-overflow via kit"
+            4,
+            "chain row + both add-combo popups + the drum grid pad-name label detect right-overflow via kit"
         );
         assert_eq!(
             prod.matches("kit::label_clipped(").count(),
-            2,
-            "the fixed-height ♪ rows + the v174 strip device row are the \
-             pre-paint probes"
+            3,
+            "the fixed-height ♪ rows + the v174 strip device row + the v178 \
+             kit pad asset combo are the pre-paint probes"
         );
         assert_eq!(
             prod.matches("row_dir: Some(").count(),
@@ -66425,9 +66715,13 @@ mod tests {
             "strip intermediate tint is the kit token"
         );
         assert_eq!(
-            strip.matches("from_gray(60)").count(),
+            strip.matches("COL_SMAP_KEY_LBL").count(),
             1,
-            "strip anchors keep today's ink"
+            "strip anchors paint the named home"
+        );
+        assert!(
+            ui_src.contains("const COL_SMAP_KEY_LBL: egui::Color32 = egui::Color32::from_gray(60);"),
+            "the home holds today's ink (v166 freeze; v178 renamed the site, not the color)"
         );
     }
 
@@ -68859,6 +69153,580 @@ mod tests {
         assert!(
             canvas.contains(lab.center()),
             "lane label must ride the canvas rect (canvas {canvas:?}, label {lab:?})"
+        );
+    }
+
+    // =================================================================
+    // v178 — TS-023: STOCK INSTRUMENT EDITORS (drum machine, sampler
+    // map, sample editor, synth-slider/kit window). Hover + echo
+    // completeness, ONE geometry/tint home per surface, drum-grid
+    // scroll, preset-bar parity. Every contract pinned here ships its
+    // behavior in the same commit (acceptance-pass rule).
+    // =================================================================
+
+    /// prod source up to `mod tests` (source-scan pins).
+    fn v178_prod() -> &'static str {
+        let srcs = include_str!("ui.rs");
+        &srcs[..srcs.find("\nmod tests").expect("mod tests anchor")]
+    }
+
+    /// v178 R2.1: the drum machine echoes transport + edit state
+    /// changes: per-row clear, play, stop, clear-all.
+    #[test]
+    fn v178_drum_echo_state_changes() {
+        let mut app = headless_app("v178druecho");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        // Paint a hit on pad 1 so the clears have something to erase.
+        let cell = app
+            .drum_probe
+            .iter()
+            .find(|(p, s, _)| *p == 0 && *s == 0)
+            .map(|(_, _, r)| *r)
+            .expect("grid cell (0,0) painted");
+        click_pt(&mut app, &ctx, cell.center());
+        assert!(app.drum.grid[0][0] > 0, "cell click paints a hit");
+        // Everything must be targeted INSIDE the drum window rect (the
+        // panels underneath paint competing "x"/"play" galleys).
+        let wr = app
+            .dyn_wins
+            .iter()
+            .find(|w| w.kind == DynKind::Drums)
+            .expect("drum slot")
+            .rect;
+        let wrect = egui::Rect::from_min_max(
+            egui::pos2(wr[0], wr[1]),
+            egui::pos2(wr[0] + wr[2], wr[1] + wr[3]),
+        );
+        let in_win = |p: &egui::Pos2| wrect.expand(2.0).contains(*p);
+        // Per-row clear: the "x" sitting LEFT of the first step cell, on
+        // the first row's line.
+        let mut xs: Vec<egui::Pos2> = galley_centers(&mut app, &ctx, "x", true)
+            .into_iter()
+            .filter(|p| in_win(p) && (p.y - cell.center().y).abs() < 10.0 && p.x < cell.min.x)
+            .collect();
+        xs.sort_by(|a, b| a.x.total_cmp(&b.x));
+        let clear_x = *xs.last().expect("pad-1 row clear button");
+        click_pt(&mut app, &ctx, clear_x);
+        assert!(
+            app.status.starts_with("drums: cleared pad"),
+            "row clear must name the emptied pad: {:?}",
+            app.status
+        );
+        // Transport verbs (window-scoped).
+        let play = galley_centers(&mut app, &ctx, "play", true)
+            .into_iter()
+            .find(in_win)
+            .expect("play button in the drum window");
+        click_pt(&mut app, &ctx, play);
+        assert!(
+            app.status.contains("drums: playing"),
+            "play must echo: {:?}",
+            app.status
+        );
+        // The stop button swaps in at the SAME rect the play label held
+        // (fixed min_size — no reflow by design, v32), so re-click there
+        // instead of re-probing (the tall readout can lag a frame, v82).
+        click_pt(&mut app, &ctx, play);
+        assert!(
+            app.status.contains("drums: stopped"),
+            "stop must echo: {:?}",
+            app.status
+        );
+        // clear-all: whole-pattern verb.
+        let ca = galley_centers(&mut app, &ctx, "clear all", true)
+            .into_iter()
+            .find(in_win)
+            .expect("clear-all button in the drum window");
+        click_pt(&mut app, &ctx, ca);
+        assert!(
+            app.status.contains("cleared the whole pattern"),
+            "clear-all must echo: {:?}",
+            app.status
+        );
+        // Subdivision echo + track-switch echo are combo popups — pinned
+        // at source level here (popup re-arm budget, v50 trap (e)).
+        let prod = v178_prod();
+        let d0 = prod.find("fn drum_win_body").expect("drum body");
+        let drum = &prod[d0..];
+        assert!(
+            drum.contains("\"drums: {label}"),
+            "subdivision change lost its steps-per-bar echo"
+        );
+        assert!(
+            drum.contains("editing track"),
+            "drum track switch lost its kit echo"
+        );
+    }
+
+    /// v178 R4.1: the drum grid SCROLLS — shrink the window below the
+    /// pad stack and the bottom pad becomes reachable by wheeling
+    /// (before v178 those rows died silently at the window floor).
+    #[test]
+    fn v178_drum_grid_scrollable() {
+        let mut app = headless_app("v178drumscroll");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let i = app
+            .dyn_wins
+            .iter()
+            .position(|w| w.kind == DynKind::Drums)
+            .expect("drum registry slot");
+        let r0 = app.dyn_wins[i].rect;
+        // Corner-drag the window down to ~160 px — far below the 8-row stack.
+        let c = egui::pos2(r0[0] + r0[2] - 1.5, r0[1] + r0[3] - 1.5);
+        let to = egui::pos2(c.x, r0[1] + 160.0);
+        drag_steps(&mut app, &ctx, c, to);
+        for _ in 0..6 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let wr = app.dyn_wins[i].rect;
+        assert!(wr[3] < 260.0, "window actually shrank: {wr:?}");
+        // BOTTOM pad row exists but sits BELOW the window floor.
+        let perc = app
+            .drum_probe
+            .iter()
+            .find(|(p, _, _)| *p == 7)
+            .map(|(_, _, r)| *r)
+            .expect("bottom pad row allocated");
+        assert!(
+            perc.max.y > wr[1] + wr[3],
+            "pre-scroll the bottom row must hang below the window floor \
+             (probe {perc:?} window {wr:?})"
+        );
+        // Wheel over the visible grid -> the stack scrolls up.
+        let probe = app
+            .drum_probe
+            .iter()
+            .find(|(p, _, _)| *p == 0)
+            .map(|(_, _, r)| *r)
+            .expect("top row visible");
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![moved(probe.center())]);
+        }
+        for _ in 0..2 {
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -400.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: Default::default(),
+                }],
+            );
+        }
+        for _ in 0..25 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let perc2 = app
+            .drum_probe
+            .iter()
+            .find(|(p, _, _)| *p == 7)
+            .map(|(_, _, r)| *r)
+            .expect("bottom pad row still allocated");
+        let wr2 = app.dyn_wins[i].rect;
+        assert!(
+            perc2.max.y <= wr2[1] + wr2[3] + 1.0 && perc2.min.y >= wr2[1],
+            "wheeling must bring the bottom pad row fully inside the \
+             window (probe {perc2:?} window {wr2:?})"
+        );
+    }
+
+    /// v178 R4.2: the instrument grids build their chrome from the ONE
+    /// geometry home — values frozen, no inline row literals left in the
+    /// drum grid or the kit pad rows.
+    #[test]
+    fn v178_instr_grid_single_home() {
+        assert_eq!(INSTR_ROW_H, 18.0);
+        assert_eq!(INSTR_NAME_W, 52.0);
+        assert_eq!(INSTR_PLAY_W, 18.0);
+        assert_eq!(INSTR_KILL_W, 16.0);
+        assert_eq!(INSTR_STEP_W, 14.0);
+        assert_eq!(SMAP_LANE_H, 24.0);
+        assert_eq!(SMAP_KEY_H, 22.0);
+        let prod = v178_prod();
+        // The drum grid reads the home…
+        let d0 = prod.find("fn drum_win_body").expect("drum body");
+        let d1 = d0 + prod[d0..].find("fn auto_window").expect("body end");
+        let drum = &prod[d0..d1];
+        for c in ["INSTR_ROW_H", "INSTR_NAME_W", "INSTR_STEP_W", "INSTR_PLAY_W", "INSTR_KILL_W"] {
+            assert!(drum.contains(c), "drum grid lost {c}");
+        }
+        // …and the old anonymous literals are GONE (sabotage-proof: put
+        // any tuple back and this scan trips).
+        for lit in [
+            "vec2(14.0, 18.0)",
+            "vec2(52.0, 18.0)",
+            "vec2(18.0, 18.0)",
+            "vec2(16.0, 18.0)",
+        ] {
+            assert!(!drum.contains(lit), "drum grid still paints {lit} inline");
+        }
+        // The kit pad rows joined the same home (synth window section).
+        let k0 = prod
+            .find("v69: named kit presets")
+            .expect("kit section start");
+        let k1 = k0
+            + prod[k0..]
+                .find("end of the !sampler (drum kit) section")
+                .expect("kit section end");
+        let kit = &prod[k0..k1];
+        assert!(kit.contains("INSTR_PLAY_W") && kit.contains("INSTR_KILL_W"));
+        for lit in ["vec2(18.0, 18.0)", "vec2(16.0, 18.0)"] {
+            assert!(!kit.contains(lit), "kit pad rows still paint {lit} inline");
+        }
+        // The smap home survived the move to module level.
+        assert!(
+            prod.contains("const SMAP_LANE_H")
+                && prod.contains("const SMAP_KEY_H")
+                && prod.contains("const SMAP_HDR_W"),
+            "smap geometry home vanished"
+        );
+    }
+
+    /// v178 R5.1: instrument-surface tints live in their named homes —
+    /// values frozen bit-for-bit from the pre-v178 literals (zero visual
+    /// drift) and no inline Color32 literals left in the swept bodies.
+    #[test]
+    fn v178_stock_tints_single_home() {
+        assert_eq!(COL_SE_CANVAS, egui::Color32::from_rgb(14, 16, 22));
+        assert_eq!(COL_SE_CANVAS_EDGE, egui::Color32::from_gray(55));
+        assert_eq!(COL_SE_GRID_LINE, egui::Color32::from_gray(30));
+        assert_eq!(COL_SE_TIME_TXT, egui::Color32::from_gray(105));
+        assert_eq!(COL_SE_STRIP_BG, egui::Color32::from_rgb(22, 25, 32));
+        assert_eq!(COL_SE_SRC_TICK, egui::Color32::from_gray(120));
+        assert_eq!(COL_SE_SRC_TXT, egui::Color32::from_gray(130));
+        assert_eq!(COL_SE_READOUT, egui::Color32::from_gray(150));
+        // ts-028 exact-token adoptions carry their documented values:
+        assert_eq!(crate::kit::SEP_SOFT, egui::Color32::from_gray(48));
+        assert_eq!(crate::kit::TEXT, egui::Color32::from_gray(170));
+        // Body scans: every Color32::from_* line in the swept bodies is
+        // either a named `const` or the computed velocity ramp.
+        let prod = v178_prod();
+        let slices = [
+            ("drum_win_body", prod.find("fn drum_win_body").expect("drum body")),
+            (
+                "sample_edit_window",
+                prod.find("fn sample_edit_window").expect("sample editor"),
+            ),
+            ("smap_body", prod.find("fn smap_body").expect("smap body")),
+        ];
+        for (name, start) in slices {
+            let end_rel = match name {
+                "drum_win_body" => prod[start..]
+                    .find("fn auto_window")
+                    .expect("drum end"),
+                "sample_edit_window" => {
+                    prod[start..].find("fn rekey_path_state").expect("se end")
+                }
+                _ => prod[start..]
+                    .find("fn sampler_editor_open")
+                    .expect("smap end"),
+            };
+            for line in prod[start..start + end_rel].lines() {
+                if line.contains("Color32::from_gray(") || line.contains("Color32::from_rgb(") {
+                    let t = line.trim_start();
+                    // Named consts (incl. fn-local palette homes) and
+                    // multi-line const-array members / else-arm
+                    // continuations (a line that is ONLY the color
+                    // expression) are homed; anything painting a literal
+                    // INSIDE a call is drift.
+                    let ok = line.contains("const ")
+                        || t.starts_with("egui::Color32::")
+                        || t.starts_with("Color32::");
+                    assert!(ok, "{name} paints an inline tint: {}", line.trim());
+                }
+            }
+        }
+    }
+
+    /// v178 R2.2: sampler-map slot operations echo — mode toggle, lane
+    /// add, lane removal all name themselves in the status line.
+    #[test]
+    fn v178_smap_echo_slot_ops() {
+        let (mut app, ctx) = v56_open_sampler_map("v178smapecho");
+        let xf = galley_at(&mut app, &ctx, "crossfade")
+            .expect("mode row")
+            .center();
+        click_pt(&mut app, &ctx, xf);
+        assert!(
+            app.status.contains("mode") && app.status.contains("crossfade"),
+            "mode toggle must echo: {:?}",
+            app.status
+        );
+        let hc = galley_at(&mut app, &ctx, "hard cutoff")
+            .expect("mode row")
+            .center();
+        click_pt(&mut app, &ctx, hc);
+        assert!(
+            app.status.contains("hard cutoff"),
+            "mode echo lost hard-cutoff: {:?}",
+            app.status
+        );
+        // Lane add: the new lane lands far below the header — echo it.
+        let add = galley_at(&mut app, &ctx, "+ add sample")
+            .expect("add button")
+            .center();
+        click_pt(&mut app, &ctx, add);
+        assert!(
+            app.status.starts_with("sampler map: +") && app.status.contains("mapped"),
+            "lane add must echo: {:?}",
+            app.status
+        );
+        // Lane removal names the victim + the remaining count.
+        let mut xs = galley_centers(&mut app, &ctx, "\u{d7}", true);
+        xs.sort_by(|a, b| a.y.total_cmp(&b.y));
+        let rem = *xs.last().expect("per-row kill buttons");
+        click_pt(&mut app, &ctx, rem);
+        assert!(
+            app.status.contains("removed") && app.status.contains("mapped"),
+            "lane removal must echo: {:?}",
+            app.status
+        );
+    }
+
+    /// v178 R1.2: the sampler-map piano strip explains its whole gesture
+    /// set (click/drag retarget + rack-sample drop) on hover.
+    #[test]
+    fn v178_smap_keys_hover() {
+        let prod = v178_prod();
+        let i = prod
+            .find("kz.on_hover_text(")
+            .expect("piano strip hover attach");
+        let seg = &prod[i..(i + 500).min(prod.len())];
+        assert!(
+            seg.contains("click / drag a key") && seg.contains("drop a rack sample"),
+            "piano strip hover lost the gesture copy: {seg}"
+        );
+    }
+
+    /// v178 R1.1: the sample editor's numeric controls explain that the
+    /// canvas carries the same gesture (stretch marker, bend start,
+    /// fade handles, save-as auto-name).
+    #[test]
+    fn v178_sample_edit_hover() {
+        let prod = v178_prod();
+        let e0 = prod
+            .find("fn sample_edit_window")
+            .expect("sample editor");
+        let e1 = e0 + prod[e0..].find("fn rekey_path_state").expect("editor end");
+        let body = &prod[e0..e1];
+        for (site, needle) in [
+            ("stretch slider", "Slider::new(&mut ed.stretch"),
+            ("bend start", "DragValue::new(&mut ed.bend_start_cents"),
+            ("fade ms pair", "DragValue::new(ms)"),
+            ("save-as box", "TextEdit::singleline(&mut self.se_name"),
+        ] {
+            let i = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("{site} lost its call-site shape"));
+            let seg = &body[i..(i + 500).min(body.len())];
+            let seg = &seg[..seg.find(';').unwrap_or(seg.len())];
+            assert!(
+                seg.contains("on_hover_text"),
+                "sample-editor {site} carries no hover explanation"
+            );
+        }
+    }
+
+    /// v178 R2.3: every COMMITTED sample-editor edit echoes one line
+    /// naming what moved; reset says so instead of stacking verbs.
+    #[test]
+    fn v178_sample_edit_echo() {
+        let mut app = headless_app("v178seecho");
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v178seecho")
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "rev.wav");
+        let wav = samples.join("rev.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&wav);
+        let key = wav.to_string_lossy().into_owned();
+        // Hermetic: a prior run of this very pin committed a reverse
+        // into the autosaved project — the window reads the map every
+        // frame, so clear it to pin the FRESH click semantics.
+        app.sample_edits.remove(&key);
+        app.sample_edit_win = Some(key.clone());
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        // Toggle reverse: the commit lands straight away.
+        let rev = galley_at(&mut app, &ctx, "reverse")
+            .expect("reverse checkbox")
+            .center();
+        click_pt(&mut app, &ctx, rev);
+        assert!(
+            app.status.starts_with("sample edit:")
+                && app.status.contains("reverse on")
+                && app.status.contains("rev"),
+            "reverse commit must echo verb + asset: {:?}",
+            app.status
+        );
+        assert!(app.sample_edits[&key].reverse, "the edit committed");
+        // Reset replaces the verb stack with one honest line. The
+        // MAIN panel also paints a "reset" (master loudness) — pick the
+        // editor's: below the ping-pong row, left of the canvas column.
+        let pp = galley_at(&mut app, &ctx, "ping-pong")
+            .expect("ping-pong checkbox")
+            .center();
+        let rs = galley_centers(&mut app, &ctx, "reset", true)
+            .into_iter()
+            .find(|p| p.y > pp.y && (p.x - pp.x).abs() < 240.0)
+            .expect("editor reset button");
+        click_pt(&mut app, &ctx, rs);
+        assert!(
+            app.status.contains("reset to the source sound"),
+            "reset must echo its own verb: {:?}",
+            app.status
+        );
+        // Identity edits are pruned by se_apply (the source file is
+        // then the truth) — the reset's echo + a cleared map entry are
+        // the two halves of the honest outcome.
+        assert!(
+            !app.sample_edits.contains_key(&key),
+            "reset must clear the edit entry: {:?}",
+            app.sample_edits.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// v178 R2.4: the kit pad rows echo — mute names pad+sound, removal
+    /// names the victim, add counts; the combo/drop/import echoes are
+    /// pinned at source level (popup/dialog reachability, v50 trap (e)).
+    #[test]
+    fn v178_kit_pad_echo() {
+        let (mut app, ctx) = v65_synth_win("v178kitecho");
+        // WIDE first: the pad row trails (vel/mute/remove) are clipped
+        // out of existence at the default window width (v30 horizontal
+        // clip trap) — widen the window so the row's tail becomes real.
+        let si = app
+            .dyn_wins
+            .iter()
+            .position(|w| w.kind == DynKind::Synth(0))
+            .expect("synth window slot");
+        let sr = app.dyn_wins[si].rect;
+        let corner = egui::pos2(sr[0] + sr[2] - 1.5, sr[1] + sr[3] - 1.5);
+        drag_steps(&mut app, &ctx, corner, corner + egui::vec2(340.0, 0.0));
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        // Mute pad 1 (stock name Kick): the ●→m flip needs naming.
+        let mut dots = galley_centers(&mut app, &ctx, "\u{25cf}", true);
+        if dots.is_empty() {
+            let shorts: Vec<String> = v129_texts(&mut app, &ctx)
+                .into_iter()
+                .filter(|s| s.chars().count() <= 10)
+                .collect();
+            panic!("no \u{25cf} galley; short painted texts: {shorts:?}");
+        }
+        dots.sort_by(|a, b| a.y.total_cmp(&b.y));
+        click_pt(&mut app, &ctx, *dots.first().expect("pad mute buttons"));
+        assert!(
+            app.status.starts_with("drum kit: pad 1 muted")
+                && app.status.contains("Kick"),
+            "mute must name pad + sound: {:?}",
+            app.status
+        );
+        // Remove pad 2 (Snare): a whole row vanishing must be named.
+        let mut xx = galley_centers(&mut app, &ctx, "\u{2715}", true);
+        xx.sort_by(|a, b| a.y.total_cmp(&b.y));
+        click_pt(&mut app, &ctx, xx[1]);
+        assert!(
+            app.status.contains("removed pad")
+                && app.status.contains("Snare")
+                && app.status.contains("pads left"),
+            "pad removal must name the victim + count: {:?}",
+            app.status
+        );
+        // Add pad: the new row can land below the fold — echo counts.
+        let ap = galley_at(&mut app, &ctx, "+ add pad")
+            .expect("add pad button")
+            .center();
+        click_pt(&mut app, &ctx, ap);
+        assert!(
+            app.status.contains("added a pad") && app.status.contains("of"),
+            "pad add must echo the count: {:?}",
+            app.status
+        );
+        // Source-level echoes (combo / drop / import):
+        let prod = v178_prod();
+        let k0 = prod.find("v69: named kit presets").expect("kit start");
+        let k1 = k0
+            + prod[k0..]
+                .find("end of the !sampler (drum kit) section")
+                .expect("kit end");
+        let kit = &prod[k0..k1];
+        assert!(
+            kit.contains("kit[p].asset_path.clear();")
+                && kit[kit.find("kit[p].asset_path.clear();").unwrap()..].contains("silent (sample unassigned)"),
+            "unassign lost its echo"
+        );
+        assert!(
+            kit.contains("sample \\u{201c}{nm}\\u{201d}\""),
+            "combo assign lost its echo"
+        );
+        assert!(
+            kit.contains("dropped asset"),
+            "pad drop echo vanished (v34 contract)"
+        );
+        // The clip combo hovers the FULL sound name (v87 identity law):
+        assert!(
+            kit.contains("kit::label_clipped("),
+            "kit combo dropped the v87 clipped-identity check"
+        );
+    }
+
+    /// v178 R3.1: the stock surfaces share the ONE preset bar and the
+    /// drum machine paints NO preset chrome of its own (TS-003 rule
+    /// extended to the stock instrument family; extends, never
+    /// replaces, v77_preset_bar_parity).
+    #[test]
+    fn v178_preset_bar_parity_stock() {
+        // Synth window: user-synth bar AND kit bar through the renderer.
+        let (mut app, ctx) = v65_synth_win("v178paritysyn");
+        for label in ["user preset", "kit preset"] {
+            assert!(
+                !galleys_all(&mut app, &ctx, label).is_empty(),
+                "synth window lost the {label:?} bar"
+            );
+        }
+        // Sampler-map window: its v56 bar through the same renderer.
+        let (mut app2, ctx2) = v56_open_sampler_map("v178paritysam");
+        assert!(
+            !galleys_all(&mut app2, &ctx2, "preset \u{b7}").is_empty(),
+            "sampler map lost its shared bar"
+        );
+        // Drum window: NO preset chrome — the pointer row to SYNTHS owns
+        // kit presets (source scan: no presetbar call in the drum body).
+        let mut app3 = headless_app("v178paritydrum");
+        let ctx3 = egui::Context::default();
+        clear_canvas(&mut app3);
+        frame(&mut app3, &ctx3, vec![]);
+        app3.show_drums = true;
+        frame(&mut app3, &ctx3, vec![]);
+        frame(&mut app3, &ctx3, vec![]);
+        for label in ["save kit", "kit preset", "load kit"] {
+            assert!(
+                galleys_all(&mut app3, &ctx3, label).is_empty(),
+                "drum window grew per-surface preset chrome {label:?}"
+            );
+        }
+        let prod = v178_prod();
+        let d0 = prod.find("fn drum_win_body").expect("drum body");
+        let d1 = d0 + prod[d0..].find("fn auto_window").expect("body end");
+        assert!(
+            !prod[d0..d1].contains("presetbar::render"),
+            "the drum body must never fork the preset bar"
         );
     }
 }
