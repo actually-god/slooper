@@ -40,7 +40,8 @@ run live and in export.
    audio engine is up.
 3. Click the **hamburger ☰** (top-left) → settings panel:
    - **INPUTS** — tick the remote output ports you want to record (your mic /
-     instrument chain). Multiple inputs are summed.
+     instrument chain). With several ticked, each device records as its own
+     clip (see [Recording takes](#recording-takes)).
    - **OUTPUTS** — for each port tick **L**, **R** or both: `L` plays only
      the left side of the stereo mix, `R` only the right, and both play a
      mono downmix (the default behaviour).
@@ -64,9 +65,9 @@ run live and in export.
 
 | Region | Contents |
 | --- | --- |
-| **Top bar** | ☰ settings · status/echo strip · **PLAY/STOP** (transport) · bar.beat position · **METRO/STOP** button + bpm + beats/measure · **Windows** menu · **Load / Save as / Save / Export** — in a narrow window the grid and view controls fold into a **More…** popup (nothing is ever clipped) |
+| **Top bar** | ☰ settings · status/echo strip · **PLAY/STOP** (transport) · **REC GROUP** master (grey until a record group is joined) · bar.beat position · **METRO/STOP** button + bpm + beats/measure · **Windows** menu · **Load / Save as / Save / Export** — in a narrow window the grid and view controls fold into a **More…** popup (nothing is ever clipped) |
 | **Left panel** | the [asset rack](#the-asset-rack); ☰ docks the **settings panel to its left**, ☰ again closes it |
-| **Grid toolbar** | **loop** toggle + mode dropdown (see [Transport & playhead](#transport--playhead)), auto-quantize checkbox, **quantize** subdivision, **snap** on/off checkbox + subdivision, **MIX** full-page mixer toggle ([mix page](#the-mix-page-f9)), **♫ Piano roll** (opens the [note editor](#piano-roll)), zoom slider |
+| **Grid toolbar** | **loop** toggle + mode dropdown (see [Transport & playhead](#transport--playhead)), auto-quantize checkbox, **quantize** subdivision, **snap** on/off checkbox + subdivision, **✎ Automation** ([automation manager](#automation-and-value-automation)), **MIX** full-page mixer toggle ([mix page](#the-mix-page-f9)), **♫ Piano roll** (opens the [note editor](#piano-roll)), zoom slider |
 | **Timeline** | **ruler pinned above the tracks** (bar numbers; click/drag scrubs) + one **seamless block per track** — one tall lane strip per lane, hairline separators between tracks (no gaps), one continuous red playhead line drawn across every track, and the **loop region** tinted between its draggable handles; MIDI clips draw their **notes** right on the grid |
 | **Mixer** (right dock) | one strip per track, aligned to the exact pixel its timeline block occupies (shared heights + scroll): **name · REC/STOP · on/mute · MREC · +/− child** header row, then **vol / gain / pan** sliders (−∞…+6 dB / raw MIDI readout / **0** reset button), an **FX** chip + enabled chain-slot buttons, and a **synth picker** + **sliders** — strips scroll in lockstep with the timeline. (The master volume/meters are NOT here — they live in the **master out** window, one place, one set of controls. **F9** opens the [full-page mix page](#the-mix-page-f9).) |
 | **Bottom** | MIDI monitor (every event on `slooper:midi_in`) |
@@ -267,6 +268,14 @@ the playhead first, then punch in), or while the project plays. The
 metronome can keep rolling while you record — its click is output-only and
 is **never** captured into a take.
 
+**Several devices, several clips.** With more than one input device ticked
+in the INPUTS list, each ticked device is captured **separately** and lands
+as its own clip on the armed track, named
+`project name-input device name-Track number` (e.g. `Live set-Motif M2-Track 3`).
+Recording the same device again appends `-2`, `-3`, …, so no take is ever
+overwritten. Nothing ticked, or only one thing ticked, records one clip as
+before.
+
 ### Preview bounce (`p`)
 
 Tick **p** on a strip (between **a** and **l**) and press REC: the take now
@@ -288,6 +297,18 @@ itself. Press STOP (or stop the transport) to end the loop; the take cap
 ends it too. Needs the LOOP button on (the status line says so); records
 the raw input like **a**. A ~50 ms hand-off gap at each wrap is normal —
 it is the asset being written between passes.
+
+### Record groups
+
+Join several tracks so ONE master arms and stops them together: select the
+tracks, use the track **head menu → REC group (selection)** (a later
+selection can **Leave group** without dissolving the rest). The top-bar
+**REC GROUP** button then arms every member at once — each with its own
+ticked sources — and flips to **STOP GROUP** while any member records,
+stopping them together. The **loop (`l`)** selector is LINKED across
+members (joiners inherit the oldest member's value; a toggle mirrors to
+all); every other selector stays per-track. With an empty group the button
+is greyed and says why on hover.
 
 ## MIDI recording (MREC)
 
@@ -477,6 +498,28 @@ the note body, no separate lane to discover:
 
 Design record and engine details: [SAMPLER-PITCH.md](SAMPLER-PITCH.md).
 
+## Automation and value automation
+
+**✎ Automation** on the grid toolbar opens the automation manager — a
+curve editor driving any automatable control (track volume, pan, sends,
+plugin/effect parameters, grid tempo, …):
+
+- With a red **automation clip** selected (or an AUTO asset picked in the
+  rack) it opens THAT curve; otherwise it starts a fresh one, and **save**
+  creates a new asset + clip. The status line names the raw target id on
+  every edit, so you always know what a curve drives.
+- **Right-click any automatable control** (sliders, knobs, the grid tempo
+  box) to record movement into a curve or create one from scratch; the
+  manager's node canvas lets you add/move/delete points, snap, and shape
+  curvature — every gesture echoes with the target named.
+- **MIDI-to-value bindings** map a controller knob or button onto a
+  project value (e.g. a hardware fader → track volume, a pad → mute).
+  Open the dockable **MIDI bindings** window (Windows menu or Settings →
+  GUI), pick a target with **bind to →** (searchable), and **learn** —
+  knobs read the raw 0–127, switches toggle. Each bound row carries
+  **relearn** and an **✕** to unbind. These bindings save with the
+  project, separately from the global action bindings above.
+
 ## Transport & playhead
 
 - **PLAY/STOP** (top bar, or `Space`, or bound MIDI) runs **everything**
@@ -572,7 +615,13 @@ windowing lives on the clip — see [Clip trimming](#clip-trimming).)
   (save-as). The **Save** button mirrors the key; **Save as** opens the
   prompt.
 - **Load** lists every project in the projects folder, newest first —
-  clicking one asks **what to import** (v42): the arrangement (tracks,
+  clicking one asks first (**Load project?**): *Load* proceeds, *Cancel*
+  (or `Esc`) keeps your current session untouched, and when your session
+  already has a name a one-step **Save current & load** saves it before
+  loading. Saving a session under a name that is already a DIFFERENT
+  project file asks before overwriting (with a remembered *Never warn
+  again*); saving over your own loaded project never asks. Then it asks
+  **what to import** (v42): the arrangement (tracks,
   clips, assets) always travels, and checkboxes pick the setup slices —
   **main instruments**, **synth setup** (patches + slider values), **MIDI
   bindings**, **mixer levels**, **effects setup** (chains), **drum
@@ -670,8 +719,9 @@ slooper exposes a JACK MIDI input port, **`slooper:midi_in`**. Every
 incoming event is parsed and shown in the bottom monitor panel (and on
 stdout), so you can verify a controller before binding anything.
 
-**Binding**: settings → *MIDI bindings* → click an action's cell (it turns
-blue, *listening…*) → send a **Note On/Off, CC, or Program Change**. The
+**Binding**: Settings → **MIDI + KEYBOARD BINDINGS** (search `bindings`) →
+click an action's cell (it turns blue, *listening…*) → send a
+**Note On/Off, CC, or Program Change**. The
 first message of the matching kind becomes the binding. Velocity / CC value
 is ignored for trigger actions — the per-track **volume / gain / pan
 (knob)** bindings act on the value (0–127) and support the **three-step
@@ -690,8 +740,14 @@ Messages that are **not bound to anything** are the ones
 
 - Click the cell again or press `Esc` to cancel; `Del` while a cell listens
   clears that binding.
-- **Reset to defaults** restores the factory keyboard table.
+- **Reset to Defaults** (asks first) restores every shortcut AND clears the
+  app-global MIDI bindings and knob calibrations — per-project bindings in
+  the MIDI bindings window are untouched.
 - Bindings persist across sessions.
+- **Per-project value bindings** live in a separate, dockable **MIDI
+  bindings** window (tick it in the Windows menu or Settings → GUI): map
+  controller knobs and buttons onto project values. See
+  [Automation](#automation-and-value-automation).
 
 ### MPE (polyphonic expression)
 

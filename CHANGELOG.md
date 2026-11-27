@@ -77,6 +77,27 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   the projection at full resolution (per-cell max-hold, nearest-bin
   fallback below 2 kHz), and the added analysis stays off the audio
   thread entirely (measured: 291 µs per UI frame, zero RT-thread change).
+- **The whole interface speaks with one voice.** A program-wide
+  consistency pass took every surface — mixer strips and master out,
+  the arrangement grid, piano roll and MIDI windows, the stock
+  editors (drums, sampler map, sample editor), automation, dialogs,
+  and the top bar — and gave them one law: every action echoes a
+  plain-language verdict to the status line, every hover states what
+  the control acts on, and a verb that can't run is *disabled with
+  the reason in its hover* instead of clicking silently (an empty
+  record group is the example you'll meet first). The top bar now
+  folds its grid controls into a **More…** popup as windows shrink —
+  nothing clips at any usable width. Status echoes fade after ~6 s
+  and hand the line back to the engine summary at ~12 s; the full
+  text always survives in the strip's tooltip. Color and geometry
+  now live in single frozen homes, so two surfaces can no longer
+  drift apart.
+- **Confirmations are all the same dialog now.** Loading a project
+  asks first and offers a one-step **Save current & load** escape
+  hatch; saving under a name that belongs to another project asks
+  before overwriting, with a remembered *Never warn again*; Settings
+  ▸ Reset to Defaults names everything it clears and confirms first.
+  All share the standard look, the safe-default Cancel, and `Esc`.
 
 ### Fixed
 
@@ -92,7 +113,15 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
   scripted synths since v100 (script ABI v2) and per-note pressure
   since v106 (script ABI v3), and all nine bundled scripts export the
   v3 table today. The hover now says both reach hosted plugins **and**
-  the built-in scripted synths.
+  the  built-in scripted synths.
+- **Three clipping bugs, found by the same pass that unified the
+  hovers.** Long MIDI-binding labels pushed the **relearn / ×** buttons
+  off-screen, leaving bindings you could not edit or remove; the drum
+  pad grid silently lost its bottom row of pads in short windows;
+  and the kit pad row's tail (mute / unassign) was cut off at the
+  synth window's default width. All three now render fully at any
+  usable size, with the row layout and window defaults measured to
+  prove it.
 
 ## [0.24.0] — 2026-11-24
 
