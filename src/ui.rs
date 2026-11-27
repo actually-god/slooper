@@ -2422,11 +2422,12 @@ const SMAP_HDR_W: f32 = 190.0;
 /// v180 (card t_bd658af5): default size of the floating script-synth
 /// window. The old non-sampler default 420 silently CLIPPED the kit pad
 /// rows' tail (v30 horizontal-clip trap): the row is left-anchored and
-/// its ✕ right edge measures 461.4 pt from the window left edge (name 56
-/// + ▶ 18 + combo 110 + wav 24 + vel 52 + ● 16 + ✕ 16 + spacing), so at
-/// 420 the mute/remove buttons did not exist until the user widened the
-/// window. 490 = 461.4 + 8 window margin + 14 scrollbar reserve + ~7 pt
-/// slack. Values frozen + seam scan: v180_synth_win_default_home.
+/// its ✕ right edge measures 461.4 pt from the window left edge —
+/// name 56, ▶ 18, combo 110, wav 24, vel 52, ● 16, ✕ 16, spacing — so
+/// at 420 the mute/remove buttons did not exist until the user widened
+/// the window. 490 = 461.4 tail + 8 window margin + 14 scrollbar
+/// reserve, plus ~7 pt slack. Values frozen + seam scan:
+/// v180_synth_win_default_home.
 const SYNTH_WIN_DEF_W: f32 = 490.0;
 /// Synth window default height (v180 home; unchanged from the old pair).
 const SYNTH_WIN_DEF_H: f32 = 430.0;
@@ -70043,9 +70044,11 @@ mod tests {
     #[test]
     fn v180_synth_win_default_home() {
         // Budget floor: 461.4 tail + 8 margin + 14 scrollbar reserve,
-        // measured by the card's probe run (card t_bd658af5).
+        // measured by the card's probe run (card t_bd658af5). Bound
+        // through a let so clippy sees a non-constant comparison.
+        let budget_floor = SYNTH_WIN_DEF_W;
         assert!(
-            SYNTH_WIN_DEF_W >= 483.0,
+            budget_floor >= 483.0,
             "synth default width {SYNTH_WIN_DEF_W} dropped under the measured kit-row budget"
         );
         assert_eq!(SYNTH_WIN_DEF_W, 490.0);
