@@ -925,6 +925,61 @@ const COL_BIND_TRACK: Color32 = Color32::from_rgb(24, 26, 32);
 const COL_BIND_FILL: Color32 = Color32::from_rgb(96, 104, 132);
 const COL_BIND_NEEDLE: Color32 = Color32::from_gray(215);
 
+// v179 (ts-028 design-language audit, ts-024 pass): the AUTOMATION
+// surfaces' palette + geometry — ONE home each (v177/v178 doctrine:
+// values frozen at the historical literals = zero visual drift; the
+// adoption sites reference these names; tripwired by
+// v179_auto_curve_palette_home + v179_auto_geometry_home). This drains
+// the ts-024 `drift filed to ts-024 follow-up` rows in design_audit.rs.
+//
+// Curve canvas (the automation manager): ink + chrome. The curve RED is
+// the automation-ASSET identity (same family as the grid's
+// COL_AUTO_CURVE clip tint — the window draws the asset itself, so its
+// ink is one step deeper; do not merge the two numbers, v176 rule).
+const COL_AUTO_CANVAS: Color32 = Color32::from_rgb(16, 18, 24);
+const COL_AUTO_EDGE: Color32 = Color32::from_gray(60);
+const COL_AUTO_GRID: Color32 = Color32::from_gray(35);
+/// Bars-mode grid: bar line / beat line.
+const COL_AUTO_BAR_LINE: Color32 = Color32::from_gray(52);
+const COL_AUTO_BEAT_LINE: Color32 = Color32::from_gray(32);
+/// Axis tick text — the exact kit MUTED value (ts-028 exact-token rule).
+const COL_AUTO_TICK_TXT: Color32 = crate::kit::MUTED;
+const COL_AUTO_BAR_TXT: Color32 = Color32::from_gray(130);
+/// Curve stroke + unselected node dots (one ink, one meaning).
+const COL_AUTO_LINE: Color32 = Color32::from_rgb(255, 120, 120);
+const COL_AUTO_FILL: Color32 = Color32::from_rgba_premultiplied(255, 120, 120, 36);
+/// The SELECTED node's amber (dot, ring, readout text share it).
+const COL_AUTO_SEL: Color32 = Color32::from_rgb(255, 210, 120);
+const COL_AUTO_NODE_TXT: Color32 = Color32::from_rgb(255, 220, 150);
+/// The value picker's mixer-strip frames: resting / selected track /
+/// master column.
+const COL_PICK_STRIP: Color32 = Color32::from_rgb(28, 30, 38);
+const COL_PICK_STRIP_SEL: Color32 = Color32::from_rgb(40, 42, 54);
+const COL_PICK_MASTER: Color32 = Color32::from_rgb(44, 38, 30);
+/// Panel-header tan — numerically the rack's AUDIO-badge tan, but that
+/// value's meaning (asset-kind identity) lives in `rack_kind_color`;
+/// the picker keeps its own named value (v176 do-not-merge rule).
+const COL_PICK_PANEL: Color32 = Color32::from_rgb(210, 175, 120);
+/// The value picker's `◀` current-track mark — same selection amber as
+/// the automation manager's selected node (ONE palette, ts-028 ask).
+const COL_AMBER_SEL: Color32 = Color32::from_rgb(255, 210, 120);
+
+/// v179: geometry homes for the automation surfaces (values frozen).
+const AUTO_WIN_W: f32 = 685.0;
+const AUTO_WIN_H: f32 = 460.0;
+const AUTO_CANVAS_W: f32 = 596.0;
+const AUTO_CANVAS_H: f32 = 240.0;
+const PICK_WIN_W: f32 = 760.0;
+const PICK_SCROLL_H: f32 = 440.0;
+const PICK_STRIP_W: f32 = 56.0;
+const PICK_MASTER_W: f32 = 64.0;
+const PICK_CELL_W: f32 = 54.0;
+const PICK_FADER_H: f32 = 72.0;
+const PICK_BAR_H: f32 = 28.0;
+const PICK_LAMP_H: f32 = 18.0;
+const PICK_PARAM_W: f32 = 122.0;
+const PICK_PARAM_H: f32 = 30.0;
+
 /// v112: the arrangement's asset-length lookup (asset id → timeline
 /// samples) as a borrow-cheap closure for `place_auto`/`Lane::occupied`.
 /// Takes the table + sample rate as plain args so callers can pass
@@ -2992,6 +3047,12 @@ impl App {
     pub fn arm_midi_slot(&mut self, idx: usize) {
         self.midi_learning_slot = Some(idx);
         self.learning_slot = None;
+        // v179 (TS-024 AC2): arming is a STATE the user must see even
+        // before the window repaints — echo what is being listened for.
+        self.status = format!(
+            "listening for MIDI: {} \u{b7} move a control or play a note (Esc cancels)",
+            MidiAction::ALL[idx].label()
+        );
     }
 
     /// Start the three-step knob learn for continuous slot `idx`: opens a
@@ -3164,6 +3225,10 @@ impl App {
     pub fn arm_key_slot(&mut self, idx: usize) {
         self.learning_slot = Some(idx);
         self.midi_learning_slot = None;
+        self.status = format!(
+            "press a key for: {} (Esc cancels)",
+            MidiAction::ALL[idx].label()
+        );
     }
 
     /// The currently captured MIDI binding for slot `idx`, if any.
@@ -3397,6 +3462,9 @@ impl App {
                 if k == egui::Key::Escape {
                     self.learning_slot = None; // cancel
                     self.midi_learning_slot = None;
+                    // v179: the cell blanking is easy to miss — echo it.
+                    self.status =
+                        format!("key learn cancelled: {}", MidiAction::ALL[slot].label());
                 } else if k == egui::Key::Delete {
                     // Delete is reserved: it can never be bound. Pressing it
                     // while a key cell listens unbinds that slot (blank),
@@ -3415,6 +3483,11 @@ impl App {
                             self.short_keys[slot] = Some(k);
                             self.learning_slot = None;
                             self.save_config();
+                            self.status = format!(
+                                "bound key {} \u{2192} {}",
+                                key_display(k),
+                                MidiAction::ALL[slot].label()
+                            );
                         }
                     }
                 }
@@ -3450,6 +3523,9 @@ impl App {
             if let Some(k) = key {
                 if k == egui::Key::Escape {
                     self.midi_learning_slot = None;
+                    // v179: cancel must echo like arm/commit do.
+                    self.status =
+                        format!("listening cancelled: {}", MidiAction::ALL[slot].label());
                 } else if k == egui::Key::Delete {
                     // Delete clears this MIDI cell's binding (the knob
                     // wizard is handled in its own branch above).
@@ -4179,6 +4255,14 @@ impl App {
                 n += 1;
             }
         }
+        // v179 (TS-024, coverage gap row): the apply happens inside the
+        // plugin's own sliders or a stand-in window — the status strip is
+        // the ONE surface both share, so the echo lives here and names
+        // the plugin (cf. apply_fx_dir's echo).
+        self.status = format!(
+            "param preset \u{201c}{name}\u{201d} applied \u{b7} {} \u{b7} {n} params",
+            entry.name()
+        );
         Ok(n)
     }
     fn delete_param_preset(&mut self, target: GuiTarget, name: &str) -> Result<(), String> {
@@ -4778,9 +4862,10 @@ impl App {
             }
         }
         if let Some(nm) = load_name {
-            match self.apply_param_preset(target, &nm) {
-                Ok(n) => self.status = format!("preset \u{201c}{nm}\u{201d} loaded ({n} params)"),
-                Err(e) => self.status = format!("preset: {e}"),
+            // v179: success echo moved INTO apply_param_preset (names the
+            // plugin there); the caller keeps the failure path.
+            if let Err(e) = self.apply_param_preset(target, &nm) {
+                self.status = format!("preset: {e}");
             }
         }
         if do_del {
@@ -9591,7 +9676,7 @@ impl App {
         egui::Window::new("Select value to automate")
             .id(egui::Id::new("auto_pick"))
             .default_pos([240.0, 110.0])
-            .default_width(760.0)
+            .default_width(PICK_WIN_W)
             .open(&mut open)
             .show(ui.ctx(), |ui| {
                 ui.label(
@@ -9606,7 +9691,7 @@ impl App {
                 let q = target_search_box(ui, "filter parameter names");
                 let ql = q.to_lowercase();
                 egui::ScrollArea::vertical()
-                    .max_height(440.0)
+                    .max_height(PICK_SCROLL_H)
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         // ---- the mixer: one strip per track + master ----
@@ -9615,16 +9700,12 @@ impl App {
                             for t in 0..self.n_tracks {
                                 let sel = t == track;
                                 egui::Frame::new()
-                                    .fill(if sel {
-                                        Color32::from_rgb(40, 42, 54)
-                                    } else {
-                                        Color32::from_rgb(28, 30, 38)
-                                    })
+                                    .fill(if sel { COL_PICK_STRIP_SEL } else { COL_PICK_STRIP })
                                     .corner_radius(4.0)
                                     .inner_margin(4.0)
                                     .show(ui, |ui| {
                                         ui.vertical(|ui| {
-                                        ui.set_width(56.0);
+                                        ui.set_width(PICK_STRIP_W);
                                         let nr = ui
                                             .horizontal(|ui| {
                                                 ui.label(
@@ -9633,9 +9714,11 @@ impl App {
                                                         .small(),
                                                 );
                                                 if sel {
-                                                    ui.label(RichText::new("\u{25c0}").small().color(
-                                                        Color32::from_rgb(255, 210, 120),
-                                                    ));
+                                                    ui.label(
+                                                        RichText::new("\u{25c0}")
+                                                            .small()
+                                                            .color(COL_AMBER_SEL),
+                                                    );
                                                 }
                                             })
                                             .response
@@ -9703,12 +9786,12 @@ impl App {
                             }
                             // master strip
                             egui::Frame::new()
-                                .fill(Color32::from_rgb(44, 38, 30))
+                                .fill(COL_PICK_MASTER)
                                 .corner_radius(4.0)
                                 .inner_margin(4.0)
                                 .show(ui, |ui| {
                                     ui.vertical(|ui| {
-                                    ui.set_width(64.0);
+                                    ui.set_width(PICK_MASTER_W);
                                     ui.label(
                                         RichText::new("MASTER").strong().small().size(10.0),
                                     );
@@ -9843,7 +9926,7 @@ impl App {
                                 RichText::new(format!("{title} \u{b7} static panel"))
                                     .strong()
                                     .small()
-                                    .color(Color32::from_rgb(210, 175, 120)),
+                                    .color(COL_PICK_PANEL),
                             );
                             // Cap the visible grid (Surge: ~2.9k params) —
                             // the filter box above reaches the rest.
@@ -9888,6 +9971,7 @@ impl App {
                     });
             });
         if let Some((id, label)) = pick {
+            let (tid, label) = (id.clone(), label);
             if let Some(ed) = self.auto_edit.as_mut() {
                 // min/max follow the selected output: rescale the shape.
                 let (omin, omax) = crate::automation::target_range(&ed.target);
@@ -9900,7 +9984,10 @@ impl App {
                 ed.changed = true;
             }
             self.auto_pick_open = false;
-            self.status = format!("automation now drives {label}");
+            // v179 (TS-024 AC1): the echo names BOTH the human label and
+            // the raw target id — the identity that gets written into the
+            // asset file is the one that must be readable.
+            self.status = format!("automation now drives {label} \u{b7} {tid}");
         }
         if !open {
             self.auto_pick_open = false;
@@ -10660,8 +10747,8 @@ impl App {
                 // v44: explicit natural size (HEAD auto-expanded from
                 // content to ~685x459; a clipped body needs the defaults —
                 // 620 was too narrow and truncated the length DragValue).
-                .default_width(685.0)
-                .default_height(460.0)
+                .default_width(AUTO_WIN_W)
+                .default_height(AUTO_WIN_H)
                 .min_width(80.0)
                 .min_height(70.0)
                 .open(&mut open);
@@ -10732,7 +10819,7 @@ impl App {
                         .map(|(_, l)| l.clone())
                         .unwrap_or_else(|| ed.target.clone());
                     egui::ComboBox::from_id_salt("auto_target")
-                        .selected_text(cur)
+                        .selected_text(cur.clone())
                         .width(240.0)
                         .show_ui(ui, |ui| {
                             for (id, label) in shown.iter() {
@@ -10740,7 +10827,14 @@ impl App {
                                 // curve — the asset's min/max follow the
                                 // selected output's limits automatically.
                                 let (omin, omax) = crate::automation::target_range(&ed.target);
-                                if ui.selectable_value(&mut ed.target, id.clone(), label).changed()
+                                // v179 (TS-024 AC1): every row hovers its
+                                // RAW target id — the `fx:<row>:<idx>`
+                                // positional-bind bug class dies when the
+                                // identity is readable at the pick.
+                                if ui
+                                    .selectable_value(&mut ed.target, id.clone(), label)
+                                    .on_hover_text(format!("{label} · target {id}"))
+                                    .changed()
                                 {
                                     let (nmin, nmax) =
                                         crate::automation::target_range(&ed.target);
@@ -10750,18 +10844,41 @@ impl App {
                                         n.v = nmin + f * (nmax - nmin);
                                     }
                                     ed.changed = true;
+                                    // v179: re-pointing the curve echoes
+                                    // with BOTH names and says what
+                                    // happened to the node values.
+                                    self.status = format!(
+                                        "automation target \u{2192} {label} \u{b7} {id} \u{b7} curve rescaled"
+                                    );
                                 }
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text(format!(
+                            "bound target: {cur} \u{b7} {id} \u{b7} switching outputs rescales the curve",
+                            id = ed.target
+                        ));
                     // ---- v34 R1: the manager's OWN snap selector ------
                     // (persisted in config; previously the canvas only
                     // ever beat-snapped in bars mode, with no choice)
                     ui.separator();
                     let mut so = ed.snap_on;
-                    if ui.checkbox(&mut so, "snap").changed() {
+                    if ui
+                        .checkbox(&mut so, "snap")
+                        .on_hover_text(format!(
+                            "snap curve nodes to the grid ({})",
+                            SUBDIVISIONS[ed.snap_sub.min(SUBDIVISIONS.len() - 1)].1
+                        ))
+                        .changed()
+                    {
                         ed.snap_on = so;
                         self.auto_snap_on = so;
                         self.save_config();
+                        self.status = format!(
+                            "automation snap {} \u{b7} {}",
+                            if so { "on" } else { "off" },
+                            SUBDIVISIONS[ed.snap_sub.min(SUBDIVISIONS.len() - 1)].1
+                        );
                     }
                     let mut ss = ed.snap_sub;
                     egui::ComboBox::from_id_salt("auto_snap_sub_cb")
@@ -10770,11 +10887,17 @@ impl App {
                             for (i, (c, l)) in SUBDIVISIONS.iter().enumerate() {
                                 ui.selectable_value(&mut ss, i, format!("{l} ({c}/beat)"));
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text("node snap subdivision (beats per grid step)");
                     if ss != ed.snap_sub {
                         ed.snap_sub = ss;
                         self.auto_snap_sub = ss;
                         self.save_config();
+                        self.status = format!(
+                            "automation snap \u{b7} {}",
+                            SUBDIVISIONS[ss.min(SUBDIVISIONS.len() - 1)].1
+                        );
                     }
                     // ---- v26: length in SECONDS or in BARS -------------
                     // Bars are the metronome's: length comes from bpm and
@@ -10798,7 +10921,11 @@ impl App {
                                     .round() as i64;
                                 ed.changed = true;
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text(
+                            "length unit: seconds, or metronome bars (lengths quantize to beats)",
+                        );
                     if ed.len_bars {
                         let mut bars = ed.len_samples as f64 / bar_s;
                         let before = bars;
@@ -10821,6 +10948,11 @@ impl App {
                             ed.len_samples =
                                 ((bars * beats).round().max(1.0) * beat_s).round() as i64;
                             ed.changed = true;
+                            self.status = format!(
+                                "automation length = {bars:.2} bars ({:.2} s) \u{b7} {id}",
+                                ed.len_samples as f64 / sr,
+                                id = ed.target
+                            );
                         }
                         ui.label(
                             RichText::new(format!(
@@ -10840,11 +10972,16 @@ impl App {
                                     .speed(0.05)
                                     .range(0.05..=600.0),
                             )
-                            ;
+                            .on_hover_text("curve length in seconds \u{b7} switching to bars quantizes to whole bars");
                         if p_changed(&bs, before, &mut secs)
                         {
                             ed.len_samples = ((secs * sr) as i64).max((sr / 10.0) as i64);
                             ed.changed = true;
+                            self.status = format!(
+                                "automation length = {:.2} s \u{b7} {id}",
+                                ed.len_samples as f64 / sr,
+                                id = ed.target
+                            );
                         }
                     }
                 });
@@ -10852,6 +10989,9 @@ impl App {
                     ui.label("name");
                     if ui
                         .add(egui::TextEdit::singleline(&mut ed.name).desired_width(160.0))
+                        .on_hover_text(
+                            "asset name \u{b7} \u{201c}Save as new asset + clip\u{201d} files the curve under this name",
+                        )
                         .changed()
                     {
                         ed.changed = true;
@@ -10881,7 +11021,7 @@ impl App {
 
         // ---- the curve canvas ------------------------------------
         let (rect, resp) =
-            ui.allocate_at_least(egui::vec2(596.0, 240.0), egui::Sense::click_and_drag());
+            ui.allocate_at_least(egui::vec2(AUTO_CANVAS_W, AUTO_CANVAS_H), egui::Sense::click_and_drag());
         // v26: in bars mode times label as bar.beat. v34 R1: node
         // placement follows the manager's own snap selector
         // (Alt = freehand), not just the beat grid.
@@ -10930,11 +11070,11 @@ impl App {
             (rmin as f64 + f.clamp(0.0, 1.0) * (rmax - rmin).max(1e-9) as f64) as f32
         };
         ui.painter()
-            .rect_filled(rect, 0.0, Color32::from_rgb(16, 18, 24));
+            .rect_filled(rect, 0.0, COL_AUTO_CANVAS);
         ui.painter().rect_stroke(
             rect,
             0.0,
-            egui::Stroke::new(1.0, Color32::from_gray(60)),
+            egui::Stroke::new(1.0, COL_AUTO_EDGE),
             egui::StrokeKind::Inside,
         );
         // grid with ABSOLUTE value labels (the absolute-mode difference)
@@ -10957,7 +11097,10 @@ impl App {
                     let gx = x_of((bi as f64 * beat_s).round() as i64);
                     ui.painter().line_segment(
                         [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
-                        egui::Stroke::new(1.0, Color32::from_gray(if is_bar { 52 } else { 32 })),
+                        egui::Stroke::new(
+                            1.0,
+                            if is_bar { COL_AUTO_BAR_LINE } else { COL_AUTO_BEAT_LINE },
+                        ),
                     );
                     if is_bar && bi / beats_i % lbl_every.max(1) == 0 {
                         ui.painter().text(
@@ -10965,7 +11108,7 @@ impl App {
                             egui::Align2::LEFT_CENTER,
                             format!("{}", bi / beats_i),
                             egui::FontId::proportional(9.0),
-                            Color32::from_gray(130),
+                            COL_AUTO_BAR_TXT,
                         );
                     }
                 }
@@ -10976,7 +11119,7 @@ impl App {
                 let gx = rect.min.x + rect.width() * gi as f32 / 8.0;
                 ui.painter().line_segment(
                     [egui::pos2(gx, rect.min.y), egui::pos2(gx, rect.max.y)],
-                    egui::Stroke::new(1.0, Color32::from_gray(35)),
+                    egui::Stroke::new(1.0, COL_AUTO_GRID),
                 );
                 let gt = len as f64 * gi as f64 / 8.0;
                 ui.painter().text(
@@ -10984,7 +11127,7 @@ impl App {
                     egui::Align2::LEFT_CENTER,
                     format!("{:.2}s", gt / sr),
                     egui::FontId::proportional(9.0),
-                    Color32::from_gray(110),
+                    COL_AUTO_TICK_TXT,
                 );
             }
         }
@@ -10993,14 +11136,14 @@ impl App {
             let gy = y_of(gv);
             ui.painter().line_segment(
                 [egui::pos2(rect.min.x, gy), egui::pos2(rect.max.x, gy)],
-                egui::Stroke::new(1.0, Color32::from_gray(35)),
+                egui::Stroke::new(1.0, COL_AUTO_GRID),
             );
             ui.painter().text(
                 egui::pos2(rect.min.x + 2.0, gy - 6.0),
                 egui::Align2::LEFT_CENTER,
                 format_gv(gv),
                 egui::FontId::proportional(9.0),
-                Color32::from_gray(110),
+                COL_AUTO_TICK_TXT,
             );
         }
         // the curve
@@ -11027,7 +11170,7 @@ impl App {
             // (no seams between the strips).
             let base = rect.max.y;
             let mut mesh = egui::epaint::Mesh::default();
-            let fill = Color32::from_rgba_premultiplied(255, 120, 120, 36);
+            let fill = COL_AUTO_FILL;
             for w in pts.windows(2) {
                 if (w[1].x - w[0].x).abs() < 0.01 {
                     continue;
@@ -11049,7 +11192,7 @@ impl App {
             for w in pts.windows(2) {
                 ui.painter().line_segment(
                     [w[0], w[1]],
-                    egui::Stroke::new(1.6, Color32::from_rgb(255, 120, 120)),
+                    egui::Stroke::new(1.6, COL_AUTO_LINE),
                 );
             }
         }
@@ -11060,25 +11203,21 @@ impl App {
             ui.painter().circle_filled(
                 c,
                 if sel { 5.0 } else { 3.5 },
-                if sel {
-                    Color32::from_rgb(255, 210, 120)
-                } else {
-                    Color32::from_rgb(255, 120, 120)
-                },
+                if sel { COL_AUTO_SEL } else { COL_AUTO_LINE },
             );
             if sel {
                 ui.painter().circle(
                     c,
                     8.0,
                     Color32::TRANSPARENT,
-                    egui::Stroke::new(1.0, Color32::from_rgb(255, 210, 120)),
+                    egui::Stroke::new(1.0, COL_AUTO_SEL),
                 );
                 ui.painter().text(
                     egui::pos2(c.x + 10.0, c.y - 10.0),
                     egui::Align2::LEFT_BOTTOM,
                     format!("{:.3} @ {}", n.v, pos_label(n.t)),
                     egui::FontId::proportional(10.0),
-                    Color32::from_rgb(255, 220, 150),
+                    COL_AUTO_NODE_TXT,
                 );
             }
         }
@@ -11101,6 +11240,16 @@ impl App {
                     ed.sel = at;
                     ed.drag = Some(at);
                     ed.changed = true;
+                    // v179 (TS-024 AC1): the canvas is a pure painter, so
+                    // without this echo a click can LOOK like it did
+                    // nothing — every node op names position + target.
+                    self.status = format!(
+                        "automation: node #{} added @ {} = {:.3} \u{b7} {id}",
+                        at + 1,
+                        pos_label(t),
+                        v,
+                        id = ed.target
+                    );
                 }
             }
         }
@@ -11152,6 +11301,20 @@ impl App {
                 }
             }
         }
+        if resp.drag_stopped() {
+            // v179: the move echoes ONCE at release (mid-drag would spam).
+            if let Some(idx) = ed.drag {
+                if let Some(n) = ed.nodes.get(idx) {
+                    self.status = format!(
+                        "automation: node #{} moved to {} = {:.3} \u{b7} {id}",
+                        idx + 1,
+                        pos_label(n.t),
+                        n.v,
+                        id = ed.target
+                    );
+                }
+            }
+        }
         if resp.secondary_clicked() {
             let pos = ui.input(|i| i.pointer.interact_pos()).unwrap();
             if let Some(idx) = nearest_auto_node(&ed.nodes, pos, x_of, y_of) {
@@ -11160,6 +11323,15 @@ impl App {
                     ed.sel = ed.sel.min(ed.nodes.len().saturating_sub(1));
                     ed.drag = None;
                     ed.changed = true;
+                    self.status = format!(
+                        "automation: node #{} deleted \u{b7} {id}",
+                        idx + 1,
+                        id = ed.target
+                    );
+                } else {
+                    self.status =
+                        "automation: the last node always stays \u{b7} use Close to discard"
+                            .to_string();
                 }
             }
         }
@@ -11183,13 +11355,31 @@ impl App {
                     }
                     ed.sel = idx;
                     ed.changed = true;
+                    // v179: the curvature cycle is invisible until the
+                    // next repaint settles — echo the new shape word.
+                    let shape = match ed.nodes.get(idx).map(|n| n.c) {
+                        Some(c) if c.abs() < 1e-6 => "straight",
+                        Some(c) if c > 0.0 => "settle",
+                        _ => "rush",
+                    };
+                    self.status = format!(
+                        "automation: segment into node #{} \u{2192} {shape} \u{b7} {id}",
+                        idx + 1,
+                        id = ed.target
+                    );
                 }
             }
         }
         if !ui.input(|i| i.pointer.any_down()) {
             ed.drag = None;
         }
-        resp.on_hover_text("automation curve: click empty space to add a node, drag nodes to move them, double-click a node to cycle its segment curvature, right-click a node to delete it");
+        resp.on_hover_text(format!(
+            "automation curve for {} (drives {} from {:.2} to {:.2}): click empty space to add a node, drag nodes to move them, double-click a node to cycle its segment curvature, right-click a node to delete it",
+            ed.target,
+            crate::automation::describe_target(&ed.target),
+            rmin,
+            rmax
+        ));
 
         // ---- node editor ------------------------------------------
         let mut resort: Option<i64> = None;
@@ -11264,11 +11454,21 @@ impl App {
                     .button("delete")
                     .on_hover_text("remove the selected curve node (one node always stays)")
                     .clicked()
-                    && ed.nodes.len() > 1
                 {
-                    ed.nodes.remove(ed.sel);
-                    ed.sel = ed.sel.saturating_sub(1);
-                    ed.changed = true;
+                    if ed.nodes.len() > 1 {
+                        let gone = ed.sel + 1;
+                        ed.nodes.remove(ed.sel);
+                        ed.sel = ed.sel.saturating_sub(1);
+                        ed.changed = true;
+                        self.status = format!(
+                            "automation: node #{gone} deleted \u{b7} {id}",
+                            id = ed.target
+                        );
+                    } else {
+                        self.status =
+                            "automation: the last node always stays \u{b7} use Close to discard"
+                                .to_string();
+                    }
                 }
             } else {
                 ui.label("no node selected \u{2014} click the curve to add one");
@@ -11306,9 +11506,19 @@ impl App {
                             ed.sel = 0;
                             ed.drag = None;
                             ed.changed = true;
+                            // v179: a preset REPLACES every node — the
+                            // user must see what landed and where.
+                            self.status = format!(
+                                "automation: preset \u{201c}{name}\u{201d} applied \u{b7} {} nodes \u{b7} {id}",
+                                ed.nodes.len(),
+                                id = ed.target
+                            );
                         }
                         None => {
-                            self.status = format!("preset \u{201c}{name}\u{201d} is unreadable")
+                            self.status = format!(
+                                "preset \u{201c}{name}\u{201d} is unreadable \u{b7} {id} unchanged",
+                                id = ed.target
+                            )
                         }
                     }
                 }
@@ -11365,7 +11575,9 @@ impl App {
                 *action = 3;
             }
             if ed.changed {
-                ui.label(RichText::new("unsaved").weak().italics());
+                ui.label(RichText::new("unsaved").weak().italics()).on_hover_text(
+                    "edits live in this window only \u{b7} a Save button writes the asset",
+                );
             }
         });
     }
@@ -21061,7 +21273,10 @@ impl App {
                     );
                     ui.horizontal(|ui| {
                         if ui
-                            .button(RichText::new("Delete").color(Color32::from_rgb(255, 120, 120)))
+                            // v179 (ts-028): the destructive-label red is
+                            // kit::DESTROY — the token frozen at exactly
+                            // this historical value.
+                            .button(RichText::new("Delete").color(crate::kit::DESTROY))
                             .on_hover_text("the file itself is removed \u{b7} cannot be undone")
                             .clicked()
                         {
@@ -21106,7 +21321,9 @@ impl App {
                     let re = ui.add_sized(
                         egui::vec2(240.0, 22.0),
                         egui::TextEdit::singleline(&mut txt).font(egui::TextStyle::Monospace),
-                    );
+                    ).on_hover_text(format!(
+                        "{title} \u{b7} type an exact value in {unit}; Enter applies, Esc cancels"
+                    ));
                     if self.value_dialog_focus {
                         re.request_focus();
                         self.value_dialog_focus = false;
@@ -21135,6 +21352,12 @@ impl App {
                 });
             if apply {
                 if self.apply_user_value(track, &target, &txt) {
+                    // v179 (TS-024 AC1): a committed value moves the real
+                    // fader/param — echo the named result (the parse
+                    // failure already echoes inside apply_user_value).
+                    self.status = format!(
+                        "set value \u{b7} {title} = {txt} {unit}"
+                    );
                     self.value_dialog = None;
                 }
             } else if cancel || !open {
@@ -22003,7 +22226,9 @@ fn bind_overlay(
             .min_size(rect.size()),
     );
     if btn
-        .on_hover_text(format!("bind this curve to {full}"))
+        .on_hover_text(format!(
+            "bind this curve to {full} \u{b7} target {id} \u{b7} the curve\u{2019}s values rescale to its range"
+        ))
         .clicked()
     {
         *pick = Some((id.to_string(), full.to_string()));
@@ -22049,9 +22274,9 @@ fn bind_fader_cell(
     on: bool,
 ) {
     let size = if vertical {
-        egui::vec2(54.0, 72.0)
+        egui::vec2(PICK_CELL_W, PICK_FADER_H)
     } else {
-        egui::vec2(54.0, 28.0)
+        egui::vec2(PICK_CELL_W, PICK_BAR_H)
     };
     let (r, _) = ui.allocate_at_least(size, egui::Sense::hover());
     let f = frac.clamp(0.0, 1.0);
@@ -22125,7 +22350,7 @@ fn bind_lamp_cell(
     lit: bool,
     on: bool,
 ) {
-    let (r, _) = ui.allocate_at_least(egui::vec2(54.0, 18.0), egui::Sense::hover());
+    let (r, _) = ui.allocate_at_least(egui::vec2(PICK_CELL_W, PICK_LAMP_H), egui::Sense::hover());
     let p = ui.painter();
     let sq = egui::Rect::from_min_size(
         egui::pos2(r.min.x + 1.0, r.center().y - 6.0),
@@ -22177,7 +22402,7 @@ fn bind_param_cell(
     label: String,
     frac: f32,
 ) {
-    let (r, _) = ui.allocate_at_least(egui::vec2(122.0, 30.0), egui::Sense::hover());
+    let (r, _) = ui.allocate_at_least(egui::vec2(PICK_PARAM_W, PICK_PARAM_H), egui::Sense::hover());
     let p = ui.painter();
     let short: String = label.chars().take(15).collect();
     p.text(
@@ -31607,10 +31832,18 @@ fn bind_row(ui: &mut egui::Ui, app: &mut App, a: MidiAction) {
         if resp.clicked() {
             if learning_knob {
                 app.knob_learn = None;
+                // v179: closing the wizard this way is a cancel — echo it
+                // like the window's own Cancel button does.
+                app.status = format!(
+                    "knob learn cancelled: {}",
+                    MidiAction::ALL[idx].label()
+                );
             } else if knob {
                 app.arm_knob_learn(idx);
             } else if listening {
                 app.midi_learning_slot = None;
+                app.status =
+                    format!("listening cancelled: {}", MidiAction::ALL[idx].label());
             } else {
                 app.arm_midi_slot(idx);
             }
@@ -31632,7 +31865,17 @@ fn bind_row(ui: &mut egui::Ui, app: &mut App, a: MidiAction) {
         if learning {
             btn = btn.fill(Color32::from_rgb(60, 90, 120));
         }
-        if ui.add(btn).clicked() {
+        // v179 (TS-024 AC2, coverage gap row): the 44px monospace cell
+        // was the one un-explained bind affordance — it now says what a
+        // click arms and how it commits/cancels.
+        if ui
+            .add(btn)
+            .on_hover_text(
+                "keyboard binding for this action: click, then press a key. \
+                 Esc cancels; Delete clears the key binding.",
+            )
+            .clicked()
+        {
             app.arm_key_slot(idx);
         }
     });
@@ -32047,23 +32290,40 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
             let self_bit = s == loop_i;
             let on = m & bit != 0;
             let lbl = format!("{}", s + 1);
+            // v179 (TS-024 AC3): every chip states the ROUTE — sender ->
+            // receiver — in its hover, not just a bare number.
             let resp = if on {
                 ui.button(format!("[{lbl}]")).on_hover_text(if self_bit {
-                    "a track cannot key itself"
+                    "a track cannot key itself".to_string()
                 } else {
-                    "sidechain source — click to remove"
+                    format!(
+                        "sidechain: T{} keys T{} \u{b7} click to remove the route",
+                        s + 1,
+                        loop_i + 1
+                    )
                 })
             } else {
                 ui.button(&lbl).on_hover_text(if self_bit {
-                    "a track cannot key itself"
+                    "a track cannot key itself".to_string()
                 } else {
-                    "click to route this track as a sidechain source"
+                    format!(
+                        "click to route T{}'s audio as a sidechain key for T{}",
+                        s + 1,
+                        loop_i + 1
+                    )
                 })
             };
             if resp.clicked() && !self_bit {
                 let v = (app.sc_send[loop_i] ^ bit) & !(1u128 << loop_i);
                 app.set_sc_send_mask(loop_i, v);
                 app.fx_save_pending = true;
+                // v179: routing is engine state the grid never shows —
+                // the status line is the only place the route is named.
+                app.status = if v & bit != 0 {
+                    format!("sidechain: T{} now keys T{}", s + 1, loop_i + 1)
+                } else {
+                    format!("sidechain: T{} no longer keys T{}", s + 1, loop_i + 1)
+                };
             }
             // v97 (sc-4): a routed chip carries a per-send RECEIVE slider —
             // this chain's mix of the incoming keys (multiple sources sum).
@@ -32110,19 +32370,28 @@ fn chain_win_body(ui: &mut egui::Ui, app: &mut App, loop_i: usize) {
         if m != 0
             && ui
                 .small_button("none")
-                .on_hover_text("no other loop drives this chain's tempo or position")
+                .on_hover_text(format!(
+                    "remove every sidechain key of T{} (each sender keeps its own send-out level)",
+                    loop_i + 1
+                ))
                 .clicked()
         {
             app.sc_send[loop_i] = 0;
             app.backend.engine.set_sc_send(loop_i, 0);
             app.fx_save_pending = true;
+            // v179: the mask clears with no widget left to show it —
+            // echo the cleared receiver.
+            app.status = format!("sidechain: T{} no longer keyed by anything", loop_i + 1);
         }
         if m != 0 {
-            let names: Vec<usize> = (0..MAX_LOOPS)
+            // v179: human list (was `{:?}` debug output).
+            let names: Vec<String> = (0..MAX_LOOPS)
                 .filter(|s| m & (1u128 << s) != 0)
-                .map(|s| s + 1)
+                .map(|s| format!("T{}", s + 1))
                 .collect();
-            ui.label(RichText::new(format!("keyed by {names:?}")).weak().small());
+            ui.label(
+                RichText::new(format!("keyed by {}", names.join(", "))).weak().small(),
+            );
         }
     });
     ui.separator();
@@ -60722,7 +60991,6 @@ mod tests {
         let body = live.join("\n");
         for needle in [
             "saved ({n} params)",
-            "loaded ({n} params)",
             "deleted\"",
             "refused by the plugin",
         ] {
@@ -60731,6 +60999,14 @@ mod tests {
                 "params preset/preset-bar echo lost {needle:?}"
             );
         }
+        // v179: the APPLY echo moved INTO apply_param_preset and names the
+        // plugin — both the editor's own sliders and the stand-in window
+        // share the status strip, so the echo lives in the seam itself.
+        let ap = v86_fn_region(prod, "fn apply_param_preset(");
+        assert!(
+            ap.contains("applied \\u{b7} {} \\u{b7} {n} params"),
+            "apply_param_preset must echo the applied preset (names the plugin)"
+        );
     }
 
     /// v86 R5: the two chain-window add-combos TOOLTIP while closed —
@@ -69728,5 +70004,385 @@ mod tests {
             !prod[d0..d1].contains("presetbar::render"),
             "the drum body must never fork the preset bar"
         );
+    }
+
+    // ============ v179 (ts-024): automation surfaces ============
+    //
+    // Automation window (canvas + rows), value picker, learn states and
+    // sidechain chips raised to the kit standard: every gesture echoes
+    // with the target NAMED (identity is the historical fragility class),
+    // hovers explain the affordance, palette/geometry live in one home.
+    // Doctrine: v97 (hover source-scan), v26/v27 (manager/picker rigs).
+
+    /// AC1: picking a new output in the value picker must echo BOTH the
+    // human label and the raw target id — the id is what lands in the
+    // asset file, so it must be readable at the moment it is written.
+    #[test]
+    fn v179_pick_echoes_target_identity() {
+        let mut app = headless_app("v179pick");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        app.auto_pick_open = true;
+        v26_settle(&mut app, &ctx);
+        let strip = *galleys_all(&mut app, &ctx, "T1")
+            .last()
+            .expect("the picker paints its T1 strip");
+        click_pt(&mut app, &ctx, strip);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("automation now drives")
+                && app.status.contains("track volume")
+                && app.status.contains("track.vol"),
+            "the pick echo names label AND raw id: {:?}",
+            app.status
+        );
+        assert!(!app.auto_pick_open, "picker closes after binding");
+        let ed = app.auto_edit.as_ref().unwrap();
+        assert_eq!(ed.target, crate::automation::TARGET_TRACK_VOL);
+    }
+
+    /// AC1: state changes inside the manager echo with the target named,
+    /// and the last-node refusal says WHY instead of doing nothing.
+    #[test]
+    fn v179_manager_state_edits_echo() {
+        let mut app = headless_app("v179mgr");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        v26_settle(&mut app, &ctx);
+        // snap toggle
+        click_last_exact(&mut app, &ctx, "snap");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("automation snap"),
+            "snap toggle echoes: {:?}",
+            app.status
+        );
+        // delete the selected node (fresh curve = 2 nodes)
+        click_last_exact(&mut app, &ctx, "delete");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("node #1 deleted") && app.status.contains("track.vol"),
+            "node delete names the node and the target: {:?}",
+            app.status
+        );
+        assert_eq!(app.auto_edit.as_ref().unwrap().nodes.len(), 1);
+        // refusal polarity: the last node never disappears — and says so.
+        click_last_exact(&mut app, &ctx, "delete");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("last node always stays"),
+            "the refusal must explain itself: {:?}",
+            app.status
+        );
+        assert_eq!(app.auto_edit.as_ref().unwrap().nodes.len(), 1);
+    }
+
+    /// AC2: a MIDI listen is a STATE — arming echoes what it listens for,
+    /// Esc cancels audibly, and the refusal of a second wizard already
+    /// says why (v177). Slot 2 has no default binding, so the test cannot
+    /// collide with shipped shortcuts.
+    #[test]
+    fn v179_midi_listen_arm_echo_and_esc() {
+        let mut app = headless_app("v179listen");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let label = crate::MidiAction::ALL[2].label().to_string();
+        app.arm_midi_slot(2);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("listening for MIDI") && app.status.contains(&label),
+            "arming names the action it listens for: {:?}",
+            app.status
+        );
+        // Esc through real key events (press + release, v99 pace).
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                key_ev(egui::Key::Escape, egui::Modifiers::NONE),
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("listening cancelled") && app.status.contains(&label),
+            "cancel echoes with the action: {:?}",
+            app.status
+        );
+        assert!(app.midi_learning_slot.is_none(), "cancel unarms");
+    }
+
+    /// AC2: a key bind commits with an echo naming key AND action (the
+    /// cell blanking alone was too quiet to trust).
+    #[test]
+    fn v179_key_bind_commit_echo() {
+        let mut app = headless_app("v179key");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let label = crate::MidiAction::ALL[2].label().to_string();
+        app.arm_key_slot(2);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("press a key for") && app.status.contains(&label),
+            "key arming echoes: {:?}",
+            app.status
+        );
+        frame_keys(
+            &mut app,
+            &ctx,
+            vec![
+                key_ev(egui::Key::F8, egui::Modifiers::NONE),
+                egui::Event::Key {
+                    key: egui::Key::F8,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("bound key F8") && app.status.contains(&label),
+            "the commit names key and action: {:?}",
+            app.status
+        );
+        assert_eq!(app.short_keys[2], Some(egui::Key::F8));
+    }
+
+    /// AC3: a sidechain chip click is a ROUTING change the grid never
+    /// shows — add and remove both echo as "T{s} keys T{r}" with the
+    /// sender and receiver named, and the mask follows.
+    #[test]
+    fn v179_sidechain_route_roundtrip() {
+        let mut app = headless_app("v179scrout");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.sc_send[1] = 1 << 0;
+        app.backend.engine.set_sc_send(1, 1 << 0);
+        app.fx_window = Some(1);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let chip = *galleys_all(&mut app, &ctx, "[1]")
+            .first()
+            .expect("the routed chip paints as exact [1]");
+        click_pt(&mut app, &ctx, chip);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("T1 no longer keys T2"),
+            "removal names the route it cut: {:?}",
+            app.status
+        );
+        assert_eq!(app.sc_send[1] & 1, 0, "the mask follows");
+        // Re-add: the bare chip moved slightly (brackets gone) — probe
+        // fresh and click the center THIS frame (v82 freshness law).
+        let cand = galleys_all(&mut app, &ctx, "1")
+            .into_iter()
+            .filter(|p| (p.y - chip.y).abs() < 6.0)
+            .min_by(|a, b| {
+                (a.x - chip.x)
+                    .abs()
+                    .partial_cmp(&(b.x - chip.x).abs())
+                    .unwrap()
+            })
+            .expect("the sender chip repainted un-routed");
+        click_pt(&mut app, &ctx, cand);
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("T1 now keys T2"),
+            "the add names the route it made: {:?}",
+            app.status
+        );
+        assert_eq!(app.sc_send[1] & 1, 1, "the route is back");
+    }
+
+    /// AC3: multi-select is legible — the keyed-by readout is a human
+    /// list, and "none" clears with the receiver named.
+    #[test]
+    fn v179_keyed_by_human_list() {
+        let mut app = headless_app("v179keylist");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        let mask = (1u128 << 0) | (1u128 << 1);
+        app.sc_send[2] = mask;
+        app.backend.engine.set_sc_send(2, mask);
+        app.fx_window = Some(2);
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let list = galleys_all(&mut app, &ctx, "keyed by T1, T2");
+        assert_eq!(
+            list.len(),
+            1,
+            "the multi-key readout is a human list, not debug output"
+        );
+        click_last_exact(&mut app, &ctx, "none");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("T3 no longer keyed by anything"),
+            "clearing all keys names the receiver: {:?}",
+            app.status
+        );
+        assert_eq!(app.sc_send[2], 0);
+    }
+
+    /// AC1: the Set-value dialog commits with an echo naming the target,
+    /// the value and the unit — the same sentence the hover promised.
+    #[test]
+    fn v179_set_value_dialog_echo() {
+        let mut app = headless_app("v179setval");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        app.value_dialog = Some((0, "track.vol".to_string(), "100".to_string()));
+        app.value_dialog_focus = true;
+        frame(&mut app, &ctx, vec![]);
+        click_last_exact(&mut app, &ctx, "Apply");
+        frame(&mut app, &ctx, vec![]);
+        assert!(
+            app.status.contains("set value")
+                && app.status.contains("track volume")
+                && app.status.contains("100"),
+            "the commit names target + value + unit: {:?}",
+            app.status
+        );
+        assert!(app.value_dialog.is_none(), "apply closes the dialog");
+    }
+
+    /// Palette home (ts-028 ask): every automation-curve / picker color
+    /// lives ONLY in its named const — the const line exists exactly
+    /// once, and the historical raw body forms never return.
+    #[test]
+    fn v179_auto_curve_palette_home() {
+        let prod = v178_prod();
+        for line in [
+            "const COL_AUTO_CANVAS: Color32 = Color32::from_rgb(16, 18, 24);",
+            "const COL_AUTO_EDGE: Color32 = Color32::from_gray(60);",
+            "const COL_AUTO_GRID: Color32 = Color32::from_gray(35);",
+            "const COL_AUTO_BAR_LINE: Color32 = Color32::from_gray(52);",
+            "const COL_AUTO_BEAT_LINE: Color32 = Color32::from_gray(32);",
+            "const COL_AUTO_BAR_TXT: Color32 = Color32::from_gray(130);",
+            "const COL_AUTO_LINE: Color32 = Color32::from_rgb(255, 120, 120);",
+            "const COL_AUTO_FILL: Color32 = Color32::from_rgba_premultiplied(255, 120, 120, 36);",
+            "const COL_AUTO_SEL: Color32 = Color32::from_rgb(255, 210, 120);",
+            "const COL_AUTO_NODE_TXT: Color32 = Color32::from_rgb(255, 220, 150);",
+            "const COL_PICK_STRIP: Color32 = Color32::from_rgb(28, 30, 38);",
+            "const COL_PICK_STRIP_SEL: Color32 = Color32::from_rgb(40, 42, 54);",
+            "const COL_PICK_MASTER: Color32 = Color32::from_rgb(44, 38, 30);",
+            "const COL_PICK_PANEL: Color32 = Color32::from_rgb(210, 175, 120);",
+            "const COL_AMBER_SEL: Color32 = Color32::from_rgb(255, 210, 120);",
+        ] {
+            assert_eq!(
+                prod.matches(line).count(),
+                1,
+                "palette home line must exist exactly once:\n{line}"
+            );
+        }
+        // Historical raw forms (the ts-024 filed drift) must stay dead.
+        for old in [
+            ".fill(Color32::from_rgb(44, 38, 30))",
+            ".rect_filled(rect, 0.0, Color32::from_rgb(16, 18, 24));",
+            "let fill = Color32::from_rgba_premultiplied(255, 120, 120, 36);",
+            ".button(RichText::new(\"Delete\").color(Color32::from_rgb(255, 120, 120)))",
+        ] {
+            assert!(!prod.contains(old), "raw color form {old:?} survived");
+        }
+    }
+
+    /// Geometry home: the automation window + picker sizes exist ONLY as
+    /// the v179 consts — each defined once AND adopted at a call site.
+    #[test]
+    fn v179_auto_geometry_home() {
+        let prod = v178_prod();
+        for line in [
+            "const AUTO_WIN_W: f32 = 685.0;",
+            "const AUTO_WIN_H: f32 = 460.0;",
+            "const AUTO_CANVAS_W: f32 = 596.0;",
+            "const AUTO_CANVAS_H: f32 = 240.0;",
+            "const PICK_WIN_W: f32 = 760.0;",
+            "const PICK_SCROLL_H: f32 = 440.0;",
+            "const PICK_STRIP_W: f32 = 56.0;",
+            "const PICK_MASTER_W: f32 = 64.0;",
+            "const PICK_CELL_W: f32 = 54.0;",
+            "const PICK_FADER_H: f32 = 72.0;",
+            "const PICK_BAR_H: f32 = 28.0;",
+            "const PICK_LAMP_H: f32 = 18.0;",
+            "const PICK_PARAM_W: f32 = 122.0;",
+            "const PICK_PARAM_H: f32 = 30.0;",
+        ] {
+            let name = line.split(':').next().unwrap().trim().strip_prefix("const ").unwrap();
+            assert_eq!(prod.matches(line).count(), 1, "geom const defined once: {name}");
+            assert!(
+                prod.matches(name).count() >= 2,
+                "geom const {name} must be adopted at a call site"
+            );
+        }
+    }
+
+    /// Hover/echo copy source-scan (v97 doctrine): the copy the runtime
+    /// pins cannot observe exists EXACTLY as written in prod.
+    #[test]
+    fn v179_hover_and_echo_copy_present() {
+        let prod = v178_prod();
+        for (needle, n) in [
+            ("automation now drives", 1usize),
+            ("listening cancelled: ", 2),
+            ("knob learn cancelled: ", 1),
+            ("press a key for: ", 1),
+            ("listening for MIDI: ", 1),
+            ("no longer keyed by anything", 1),
+            ("now keys T", 1),
+            ("no longer keys T", 1),
+            ("type an exact value in", 1),
+            ("keyboard binding for this action", 1),
+            ("as a sidechain key for T", 1),
+            ("click to remove the route", 1),
+            ("edits live in this window only", 1),
+            ("drives {} from", 1),
+            ("bound target: {cur}", 1),
+            ("remove every sidechain key of T", 1),
+            ("param preset \\u{201c}{name}\\u{201d} applied", 1),
+            ("automation: node #{} added @", 1),
+            ("automation: node #{} moved to", 1),
+            ("automation: segment into node #", 1),
+            ("curve rescaled", 1),
+            ("target {id}", 2),
+            ("bind this curve to", 1),
+            ("switching to bars quantizes", 1),
+            (".button(RichText::new(\"Delete\").color(crate::kit::DESTROY))", 1),
+        ] {
+            assert_eq!(
+                prod.matches(needle).count(),
+                n,
+                "hover/echo copy {needle:?} must exist exactly {n}x in prod"
+            );
+        }
+    }
+
+    /// AC4: at the frozen default size every bottom-bar affordance of the
+    /// Automation window is reachable — Save/Close paint, and the node
+    /// readout row is on screen (nothing clipped at the window floor).
+    #[test]
+    fn v179_auto_floor_rows_visible() {
+        let mut app = headless_app("v179floor");
+        let ctx = egui::Context::default();
+        v26_manager_open(&mut app, &ctx);
+        v26_settle(&mut app, &ctx);
+        for label in [
+            "Close",
+            "Save as new asset + clip",
+            "snap",
+            "curve",
+            "node 1",
+        ] {
+            assert!(
+                !galleys_all(&mut app, &ctx, label).is_empty(),
+                "Automation window lost {label:?} at its default size"
+            );
+        }
     }
 }
