@@ -1777,6 +1777,10 @@ pub struct App {
     metro_num: String,
     /// Index into [`SUBDIVISIONS`] (click subdivision).
     metro_sub: usize,
+    /// v182 (TS-026): the last COMMITTED grid (bpm/num) the top-bar commit
+    /// echo reported — the echo fires only on real change, so clicking into
+    /// a box and back out never spams the strip.
+    metro_grid_key: String,
     /// Index into [`SUBDIVISIONS`] for content quantize / clip snap.
     snap_sub: usize,
     /// Index into [`SUBDIVISIONS`] for the quantize-button grid.
@@ -2766,6 +2770,7 @@ impl App {
                 .iter()
                 .position(|(c, _)| *c == cfg.metro_sub)
                 .unwrap_or(0),
+            metro_grid_key: String::new(),
             q_sub: sub_idx(cfg.q_sub),
             snap_sub: sub_idx(cfg.snap_sub),
             roll_vel_step: cfg.roll_vel_step.clamp(1, 32),
@@ -6738,26 +6743,53 @@ impl App {
     }
 
     fn send_metro(&mut self) {
-        let bpm = self
-            .metro_bpm
-            .trim()
-            .parse::<u32>()
-            .unwrap_or(120)
-            .clamp(20, 300);
+        let bpm = self.metro_bpm_parsed();
         // v0.11 R5: tempo is automatable (curve wins while it sounds).
         self.note_auto(0, crate::automation::TARGET_MASTER_TEMPO, bpm as f32);
         self.backend.cmd(Cmd::SetMetro {
             on: self.metro_on,
             bpm,
             sub: SUBDIVISIONS[self.metro_sub.min(SUBDIVISIONS.len() - 1)].0,
-            num: self
-                .metro_num
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(4)
-                .clamp(1, 16),
+            num: self.metro_num_parsed(),
         });
         self.save_config();
+    }
+
+    /// v182 (TS-026): the ONE parse/clamp home for the grid tempo box
+    /// (20..300) — `send_metro` and the commit-echo seam read the same law.
+    fn metro_bpm_parsed(&self) -> u32 {
+        self.metro_bpm
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(120)
+            .clamp(20, 300)
+    }
+
+    /// v182 (TS-026): beats-per-measure parse/clamp home (1..16).
+    fn metro_num_parsed(&self) -> u32 {
+        self.metro_num
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(4)
+            .clamp(1, 16)
+    }
+
+    /// v182 (TS-026): the ONE metronome toggle for BOTH entry points — the
+    /// top-bar button and the M shortcut (v68 mix-page idiom: one status
+    /// voice, and the strip is the single source of truth whichever way the
+    /// click started or stopped).
+    fn toggle_metro(&mut self) {
+        self.metro_on = !self.metro_on;
+        self.send_metro();
+        self.status = if self.metro_on {
+            format!(
+                "metronome: on \u{b7} {} bpm \u{b7} {} beats/measure",
+                self.metro_bpm_parsed(),
+                self.metro_num_parsed()
+            )
+        } else {
+            "metronome: off".into()
+        };
     }
 
     /// Rescan the system folders plus the user's extra folders. Loads every
@@ -19826,8 +19858,9 @@ impl App {
             MidiAction::ClearLoop(i) => self.clear_track(i),
             MidiAction::PlayLoop(i) => self.backend.cmd(Cmd::ToggleTrackOn { i }),
             MidiAction::Metronome => {
-                self.metro_on = !self.metro_on;
-                self.send_metro();
+                // v182: the shortcut shares the button's seam — one echo for
+                // both entry points (strip = single source of truth).
+                self.toggle_metro();
             }
             // Selection NEVER wraps: it stops at track 1 and track 16.
             MidiAction::SelectNext => {
@@ -21443,6 +21476,35 @@ impl App {
     }
 }
 
+/// v182 (TS-026): the top-bar geometry homes, measured off the real painter
+/// (probe): the FULL row (title · strip · PLAY · REC GROUP · position ·
+/// METRO · bpm/beat ‖ Export Meter Drums Windows Load Save as Save) needs
+/// ≈1350 px while the window floor is 780 px (`with_min_inner_size`). Below
+/// `TOPBAR_FOLD_AVAIL` the grid zone (REC GROUP / position / bpm / beat)
+/// folds into the More… popup; below `TOPBAR_COMPACT_AVAIL` the view
+/// buttons (Export / Meter / Drums) fold into it too — nothing is ever
+/// clipped or overlapped (v30/v44 horizontal-clip trap, v18 title-push).
+/// The status field takes the leftover width; `TOPBAR_TAIL_*` are the
+/// reserved widths of everything that follows it in the row (fold tier /
+/// compact tier / full row), measured at the painted clusters.
+const TOPBAR_TITLE_W: f32 = 140.0;
+/// Heading line height + the row gap under it (probe-measured 25.75/2.0).
+const TOPBAR_TITLE_H: f32 = 27.75;
+const TOPBAR_STATUS_MAX_W: f32 = 300.0;
+const TOPBAR_STATUS_MIN_W: f32 = 96.0;
+const TOPBAR_FOLD_AVAIL: f32 = 1138.0;
+const TOPBAR_COMPACT_AVAIL: f32 = 700.0;
+const TOPBAR_TAIL_FULL: f32 = 850.0;
+const TOPBAR_TAIL_FOLD: f32 = 600.0;
+const TOPBAR_TAIL_COMPACT: f32 = 346.0;
+/// v182 (TS-026): the echo strip's lifetime, hoisted from the fn-scope so
+/// pins can FREEZE the contract (v182_echo_lifetime): fresh = full until
+/// `STATUS_FADE_START_S`, dims to `STATUS_FADE_FLOOR`, after `STATUS_TTL_S`
+/// the idle summary replaces it and the raw text survives in the tooltip.
+const STATUS_FADE_START_S: f64 = 6.0;
+const STATUS_TTL_S: f64 = 12.0;
+const STATUS_FADE_FLOOR: f32 = 0.15;
+
 fn top_bar(ui: &mut egui::Ui, app: &mut App) {
     egui::Panel::top("topbar")
         .exact_size(TOPBAR_H)
@@ -21474,6 +21536,10 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 }
 
                 ui.separator();
+                // v182 (TS-026): the title rides a FIXED width and TRUNCATES
+                // (full name in the hover). The v18 fix capped the status
+                // field but never the project name — probe: at 1200 px a long
+                // name already overlaps the bpm/beat cluster.
                 let title = match &app.proj_name {
                     n if n.is_empty() => "slooper · untitled".to_string(),
                     n => format!("slooper · {n}"),
@@ -21486,13 +21552,20 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 // (settings footer only; pins v91_* hold the seam).
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.add(egui::Label::new(RichText::new(title).strong().heading()).wrap_mode(egui::TextWrapMode::Extend));
+                    // add_sized (0.36 Label has no max_width): fixed slot,
+                    // truncating text, heading height + normal row gap.
+                    ui.add_sized(
+                        egui::vec2(TOPBAR_TITLE_W, TOPBAR_TITLE_H),
+                        egui::Label::new(RichText::new(&title).strong().heading()).truncate(),
+                    );
                     ui.label(
                         RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                             .weak()
                             .small(),
                     );
-                });
+                })
+                .response
+                .on_hover_text(title);
                 // v25: status display rules —
                 //  * fresh message: exactly as written;
                 //  * v34 R7: TRANSIENT messages fade. Over ~6 s the notice
@@ -21504,19 +21577,35 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 //    old ladder kept the raw text fully lit for a full
                 //    minute, then carried it for TEN minutes behind a "· Nm
                 //    ago" suffix).
+                // v182 (TS-026): the strip is the app's ONE feedback home;
+                // the lifetime constants above freeze the fade/TTL, and
+                // within a frame the LAST write wins (single `status` field,
+                // freshness detected at frame top — see the status_seen seam).
+                let avail = ui.available_width();
+                let fold = avail < TOPBAR_FOLD_AVAIL;
+                let compact = avail < TOPBAR_COMPACT_AVAIL;
                 let age_s = app.status_at.elapsed().as_secs_f64();
-                let idle = match &app.client_name {
-                    Some(_) => format!("{} Hz · ready", app.sample_rate),
-                    None => "audio engine: offline".to_string(),
+                let xruns = app.backend.xruns.load(Ordering::Relaxed);
+                // Narrow tiers fold the standalone xrun/notice side-labels —
+                // the warnings ride the strip line instead (never silent).
+                let xsuf = if xruns > 0 && fold {
+                    format!(" \u{b7} xruns: {xruns}")
+                } else {
+                    String::new()
                 };
-                const NOTICE_FADE_SECS: f64 = 12.0;
-                let fade = if age_s <= 6.0 {
+                let idle = match &app.client_name {
+                    Some(_) => format!("{} Hz \u{b7} ready{xsuf}", app.sample_rate),
+                    None => format!("audio engine: offline{xsuf}"),
+                };
+                let fade = if age_s <= STATUS_FADE_START_S {
                     1.0f32
                 } else {
-                    (1.0 - ((age_s - 6.0) / (NOTICE_FADE_SECS - 6.0)) as f32 * 0.85)
-                        .clamp(0.15, 1.0)
+                    (1.0 - ((age_s - STATUS_FADE_START_S) / (STATUS_TTL_S - STATUS_FADE_START_S))
+                        as f32
+                        * 0.85)
+                        .clamp(STATUS_FADE_FLOOR, 1.0)
                 };
-                let (body, tip) = if age_s > NOTICE_FADE_SECS {
+                let (body, tip) = if age_s > STATUS_TTL_S {
                     (
                         idle,
                         format!("last message {}s ago: {}", age_s as u64, app.status),
@@ -21525,8 +21614,8 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                     (app.status.clone(), app.status.clone())
                 };
                 let status = match &app.client_name {
-                    Some(_) if age_s > NOTICE_FADE_SECS => body,
-                    Some(_) => format!("{} Hz · {}", app.sample_rate, body),
+                    Some(_) if age_s > STATUS_TTL_S => body,
+                    Some(_) => format!("{} Hz · {}{xsuf}", app.sample_rate, body),
                     None => body,
                 };
                 // v18: the status lives in a FIXED-WIDTH, truncating field. It
@@ -21536,14 +21625,26 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 // by hundreds of pixels — mid-session the widgets you had just
                 // right-clicked literally moved out from under the cursor, and
                 // on a narrow window they vanished off-screen entirely.
+                // v182: the width adapts to the fold tier (leftover of what
+                // the row still needs) so the bar fits down to 780 px.
+                let tail = if fold {
+                    if compact {
+                        TOPBAR_TAIL_COMPACT
+                    } else {
+                        TOPBAR_TAIL_FOLD
+                    }
+                } else {
+                    TOPBAR_TAIL_FULL
+                };
+                let status_w = (avail - tail).clamp(TOPBAR_STATUS_MIN_W, TOPBAR_STATUS_MAX_W);
                 let weak_c = ui.visuals().weak_text_color();
                 ui.add_sized(
-                    egui::vec2(300.0, 18.0),
+                    egui::vec2(status_w, 18.0),
                     egui::Label::new(RichText::new(status).color(weak_c.linear_multiply(fade)))
                         .truncate(),
                 )
                 .on_hover_text(tip);
-                if age_s <= NOTICE_FADE_SECS {
+                if age_s <= STATUS_TTL_S && !fold {
                     if let Some((i, o)) = app.applied.filter(|(i, o)| *i + *o > 0) {
                         // v25: zero is shown by the idle summary instead — after
                         // "Stop" the bar reads honestly, not "applied: 0 in / 0
@@ -21552,20 +21653,23 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                         ui.label(RichText::new(format!("applied: {} in / {} out", i, o)).weak());
                     }
                 }
-                let xruns = app.backend.xruns.load(Ordering::Relaxed);
-                if xruns > 0 {
+                if xruns > 0 && !fold {
                     ui.label(RichText::new(format!("xruns: {}", xruns)).color(Color32::YELLOW));
                 }
                 // v115: automation targets dead-drifted by chain edits (RT
                 // raised the sticky flag; a remap scan clears it again).
                 if app.backend.engine.auto_miss() {
-                    ui.label(RichText::new("automation target lost").color(Color32::ORANGE))
-                        .on_hover_text(
-                            "An automation curve aims at a chain slot that no \
-                             longer exists (the plugin was removed or moved). \
-                             The curve stays silent until rebound in the \
-                             Automation window or the chain is fixed.",
-                        );
+                    // v182: the side label only paints at the full tier; the
+                    // strip echo below carries the message at every tier.
+                    if !fold {
+                        ui.label(RichText::new("automation target lost").color(Color32::ORANGE))
+                            .on_hover_text(
+                                "An automation curve aims at a chain slot that no \
+                                 longer exists (the plugin was removed or moved). \
+                                 The curve stays silent until rebound in the \
+                                 Automation window or the chain is fixed.",
+                            );
+                    }
                     if !app.auto_miss_seen {
                         app.auto_miss_seen = true;
                         let dead = app.dead_auto_targets();
@@ -21607,56 +21711,16 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 // v52 R4: RECORD GROUP master — one click arms every grouped
                 // track with its OWN ticked sources; while any member is
                 // recording it becomes STOP GROUP and bounces them together.
-                {
-                    let mem: Vec<usize> = app.rec_group.clone();
-                    let any_rec = mem
-                        .iter()
-                        .copied()
-                        .any(|j| rec_group_member_active(app, j));
-                    let glbl = if any_rec { "STOP GROUP" } else { "REC GROUP" };
-                    let g_btn = egui::Button::new(
-                        RichText::new(glbl)
-                            .color(if mem.is_empty() {
-                                // v177: indicator ternary bound to the kit
-                                // tokens (v174 token doc names REC idle
-                                // button text as WARN scope; identical
-                                // values — zero visual drift).
-                                crate::kit::MUTED
-                            } else if any_rec {
-                                crate::kit::REC_ON
-                            } else {
-                                crate::kit::WARN
-                            })
-                            .strong()
-                            .small(),
-                    )
-                    .min_size(egui::vec2(84.0, 0.0));
-                    let g_resp = ui.add(g_btn).on_hover_text(format!(
-                        "Record group: {} track(s) joined (use the track \
-                         head menu: 'REC group (selection)' / 'Leave \
-                         group'). Click arms every member at once, each \
-                         with its own ticked sources; while any member \
-                         records, this STOPs them all together.",
-                        mem.len()
-                    ));
-                    if g_resp.clicked() && !mem.is_empty() {
-                        for &j in mem.iter() {
-                            // Stop pass: only bounce the members that ARE
-                            // recording; an idle member must not get armed
-                            // by a STOP click.
-                            if any_rec && !rec_group_member_active(app, j) {
-                                continue;
-                            }
-                            app.toggle_record_all(j);
-                        }
-                        app.status = format!(
-                            "record group: {} track(s) {}",
-                            mem.len(),
-                            if any_rec { "stopped" } else { "armed" }
+                // v182: rendered through ONE seam (also shown in the More…
+                // popup when the grid zone folds).
+                if !fold {
+                    rec_group_button(ui, app);
+                    ui.label(RichText::new(pos_label(app)).monospace())
+                        .on_hover_text(
+                            "playhead \u{2014} bar.beat + m:ss; click or drag \
+                             the ruler to scrub",
                         );
-                    }
                 }
-                ui.label(RichText::new(pos_label(app)).monospace());
 
                 // ---- metronome / grid tempo ----
                 ui.separator();
@@ -21677,68 +21741,24 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                      without moving it (never recorded). M also toggles it.",
                     );
                 if metro_btn.clicked() {
-                    app.metro_on = !app.metro_on;
-                    app.send_metro();
+                    // v182: ONE seam for both entry points (button AND the
+                    // M shortcut) — the seam owns the echo, so the strip is
+                    // the single source of truth whichever way it changed.
+                    app.toggle_metro();
                 }
-                ui.label("bpm");
-                // Bound straight to the app state: the old pattern of cloning
-                // into a local EVERY FRAME wiped each keystroke before it could
-                // land, so the box could never be edited (it snapped back to
-                // the saved value). Commit to the engine on Enter / focus-out.
-                let bpm_rt = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut app.metro_bpm)
-                            .desired_width(38.0)
-                            .horizontal_align(egui::Align::Center)
-                            .font(egui::TextStyle::Monospace),
-                    )
-                    .on_hover_text(
-                        "Grid tempo 20..300 BPM. Press Enter to apply; right-click for automation.",
-                    );
-                app.bpm_rect = Some(bpm_rt.rect);
-                if bpm_rt.lost_focus() {
-                    app.send_metro();
-                }
-                ui.label("beat");
-                let num_rt = ui
-                    .add(
-                        egui::TextEdit::singleline(&mut app.metro_num)
-                            .desired_width(24.0)
-                            .horizontal_align(egui::Align::Center)
-                            .font(egui::TextStyle::Monospace),
-                    )
-                    .on_hover_text("Beats per measure 1..16. Press Enter to apply.");
-                if num_rt.lost_focus() {
-                    app.send_metro();
+                if !fold {
+                    grid_boxes(ui, app);
+                } else {
+                    // The box was consumed at frame top (stale-rect rule):
+                    // right-click automation only follows a PAINTED box.
+                    app.bpm_rect = None;
                 }
 
                 // File actions; the master volume + peak meter moved to the top
                 // of the mixer dock (`master_strip`).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Export").on_hover_text("open the export dialog").clicked() {
-                        app.show_export = true;
-                    }
-                    if ui
-                        .button("Meter")
-                        .on_hover_text(
-                            "MASTER OUT panel: stereo meters + live LUFS \
-                         (momentary/short-term/integrated + LRA) + spectrum \
-                         viewer for the master output. Docks next to the mixer.",
-                        )
-                        .clicked()
-                    {
-                        app.show_master = !app.show_master;
-                    }
-                    if ui
-                        .button("Drums")
-                        .on_hover_text(
-                            "Drum machine / pattern builder: pads = \
-                         impulse sounds, grid = velocity per step. Commit \
-                         stamps the pattern into the arrangement.",
-                        )
-                        .clicked()
-                    {
-                        app.show_drums = !app.show_drums;
+                    if !compact {
+                        view_buttons(ui, app);
                     }
                     // v43 R4: the window navigation hub. Everything the GUI
                     // shows is listed here with a live checkmark, plus the
@@ -21800,10 +21820,24 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                             {
                                 app.save_config();
                             }
-                            if ui.checkbox(&mut app.show_binds, "MIDI bindings").changed() {
+                            if ui
+                                .checkbox(&mut app.show_binds, "MIDI bindings")
+                                .on_hover_text(
+                                    "MIDI bindings window: map controller notes / \
+                                     CCs to transport, record and knob actions.",
+                                )
+                                .changed()
+                            {
                                 app.save_config();
                             }
-                            if ui.checkbox(&mut app.show_midi, "MIDI monitor").changed() {
+                            if ui
+                                .checkbox(&mut app.show_midi, "MIDI monitor")
+                                .on_hover_text(
+                                    "MIDI monitor window: live log of every event \
+                                     arriving on slooper:midi_in.",
+                                )
+                                .changed()
+                            {
                                 app.save_config();
                             }
                             if ui
@@ -21895,7 +21929,9 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                             ui.separator();
                             if ui
                                 .button("dock all windows")
-                                .on_hover_text("Snap every visible window back into dock slots.")
+                                .on_hover_text(
+                                    "Snap every floating window back into dock slots.",
+                                )
                                 .clicked()
                             {
                                 dock_all_windows(app);
@@ -21903,7 +21939,7 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                             }
                             if ui
                                 .button("float all windows")
-                                .on_hover_text("Undock every window into free windows.")
+                                .on_hover_text("Undock every docked window into free windows.")
                                 .clicked()
                             {
                                 float_all_windows(app);
@@ -21921,19 +21957,40 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                                 ui.close();
                             }
                         });
-                    if ui
-                        .button("Load")
-                        .on_hover_text("Browse saved projects")
-                        .clicked()
-                    {
-                        app.show_load = true;
+                    // v182 (TS-026): the More… hub carries what the narrow
+                    // tiers folded away — grid controls always (fold tier),
+                    // view buttons too (compact tier). Same render fns as
+                    // the inline row (ONE renderer per control, bridge-kit
+                    // law), CloseOnClickOutside so the bpm/beat TextEdits
+                    // survive focus (v47 trap).
+                    if fold {
+                        let mresp = ui.button("More\u{2026}").on_hover_text(format!(
+                            "folded controls: grid tempo / beats / REC group{} \
+                             \u{b7} widen the window to show them inline",
+                            if compact {
+                                ", Export / master out / drum machine"
+                            } else {
+                                ""
+                            }
+                        ));
+                        egui::Popup::menu(&mresp)
+                            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                            .show(|ui| {
+                                if compact {
+                                    view_buttons(ui, app);
+                                    ui.separator();
+                                    // The compact tier folds the file row too
+                                    // (Save stays inline — the primary verb).
+                                    file_buttons(ui, app);
+                                    ui.separator();
+                                }
+                                rec_group_button(ui, app);
+                                ui.label(RichText::new(pos_label(app)).monospace());
+                                grid_boxes(ui, app);
+                            });
                     }
-                    if ui
-                        .button("Save as")
-                        .on_hover_text("Save under a new name")
-                        .clicked()
-                    {
-                        app.request_save(true);
+                    if !compact {
+                        file_buttons(ui, app);
                     }
                     let save_tip = match &app.proj_name {
                         n if n.is_empty() => "Save — asks for a project name (Ctrl+S)".to_string(),
@@ -21945,6 +22002,172 @@ fn top_bar(ui: &mut egui::Ui, app: &mut App) {
                 });
             });
         });
+}
+
+/// v182 (TS-026): the top bar's file row (Load / Save as) — ONE seam at the
+/// inline cluster or (compact tier) inside the More… popup. Save stays
+/// inline at every tier (the primary verb + Ctrl+S).
+fn file_buttons(ui: &mut egui::Ui, app: &mut App) {
+    if ui
+        .button("Load")
+        .on_hover_text("Browse saved projects")
+        .clicked()
+    {
+        app.show_load = true;
+    }
+    if ui
+        .button("Save as")
+        .on_hover_text("Save under a new name (Ctrl+Shift+S)")
+        .clicked()
+    {
+        app.request_save(true);
+    }
+}
+
+/// v182 (TS-026): the top bar's view-window buttons — Export / master out /
+/// drum machine — rendered from ONE seam at either the inline right cluster
+/// or inside the More… popup (never a second copy of the widgets).
+fn view_buttons(ui: &mut egui::Ui, app: &mut App) {
+    if ui
+        .button("Export")
+        .on_hover_text("open the export dialog (Ctrl+E)")
+        .clicked()
+    {
+        app.show_export = true;
+    }
+    if ui
+        .button("Meter")
+        .on_hover_text(
+            "MASTER OUT panel: stereo meters + live LUFS \
+             (momentary/short-term/integrated + LRA) + spectrum \
+             viewer for the master output. Docks next to the mixer.",
+        )
+        .clicked()
+    {
+        app.show_master = !app.show_master;
+    }
+    if ui
+        .button("Drums")
+        .on_hover_text(
+            "Drum machine / pattern builder: pads = \
+             impulse sounds, grid = velocity per step. Commit \
+             stamps the pattern into the arrangement.",
+        )
+        .clicked()
+    {
+        app.show_drums = !app.show_drums;
+    }
+}
+
+/// v182 (TS-026): the RECORD GROUP master button (top bar + More… popup).
+/// An EMPTY group reads DISABLED with the reason in the hover — never a
+/// silently inert verb (TS-026 AC1); with members it arms/stops them all.
+fn rec_group_button(ui: &mut egui::Ui, app: &mut App) {
+    let mem: Vec<usize> = app.rec_group.clone();
+    let any_rec = mem
+        .iter()
+        .copied()
+        .any(|j| rec_group_member_active(app, j));
+    let glbl = if any_rec { "STOP GROUP" } else { "REC GROUP" };
+    let g_btn = egui::Button::new(
+        RichText::new(glbl)
+            .color(if mem.is_empty() {
+                // v177: indicator ternary bound to the kit
+                // tokens (v174 token doc names REC idle
+                // button text as WARN scope; identical
+                // values — zero visual drift).
+                crate::kit::MUTED
+            } else if any_rec {
+                crate::kit::REC_ON
+            } else {
+                crate::kit::WARN
+            })
+            .strong()
+            .small(),
+    )
+    .min_size(egui::vec2(84.0, 0.0));
+    ui.add_enabled_ui(!mem.is_empty(), |ui| {
+        let g_resp = ui
+            .add(g_btn)
+            .on_hover_text(format!(
+                "Record group: {} track(s) joined (use the track \
+                 head menu: 'REC group (selection)' / 'Leave \
+                 group'). Click arms every member at once, each \
+                 with its own ticked sources; while any member \
+                 records, this STOPs them all together.",
+                mem.len()
+            ))
+            .on_disabled_hover_text(
+                "record group is empty \u{b7} join tracks with the \
+                 track head menu: 'REC group (selection)'",
+            );
+        if g_resp.clicked() {
+            for &j in mem.iter() {
+                // Stop pass: only bounce the members that ARE
+                // recording; an idle member must not get armed
+                // by a STOP click.
+                if any_rec && !rec_group_member_active(app, j) {
+                    continue;
+                }
+                app.toggle_record_all(j);
+            }
+            app.status = format!(
+                "record group: {} track(s) {}",
+                mem.len(),
+                if any_rec { "stopped" } else { "armed" }
+            );
+        }
+    });
+}
+
+/// v182 (TS-026): the metronome grid boxes (bpm + beats/measure), rendered
+/// from ONE seam at the top bar or inside the More… popup. Committing
+/// (Enter / focus-out) echoes the NEW value through the strip — a silent
+/// commit could leave a rejected clamp (20..300 / 1..16) looking like the
+/// typed value.
+fn grid_boxes(ui: &mut egui::Ui, app: &mut App) {
+    ui.label("bpm");
+    // Bound straight to the app state: the old pattern of cloning
+    // into a local EVERY FRAME wiped each keystroke before it could
+    // land, so the box could never be edited (it snapped back to
+    // the saved value). Commit to the engine on Enter / focus-out.
+    let bpm_rt = ui
+        .add(
+            egui::TextEdit::singleline(&mut app.metro_bpm)
+                .desired_width(38.0)
+                .horizontal_align(egui::Align::Center)
+                .font(egui::TextStyle::Monospace),
+        )
+        .on_hover_text(
+            "Grid tempo 20..300 BPM. Press Enter to apply; right-click for automation.",
+        );
+    app.bpm_rect = Some(bpm_rt.rect);
+    let lost_bpm = bpm_rt.lost_focus();
+    ui.label("beat");
+    let num_rt = ui
+        .add(
+            egui::TextEdit::singleline(&mut app.metro_num)
+                .desired_width(24.0)
+                .horizontal_align(egui::Align::Center)
+                .font(egui::TextStyle::Monospace),
+        )
+        .on_hover_text("Beats per measure 1..16. Press Enter to apply.");
+    let lost_num = num_rt.lost_focus();
+    if lost_bpm || lost_num {
+        let key = format!(
+            "{} bpm \u{b7} {} beats",
+            app.metro_bpm_parsed(),
+            app.metro_num_parsed()
+        );
+        let changed = app.metro_grid_key != key;
+        app.send_metro();
+        if changed {
+            // v182: name the COMMITTED (clamped) value, not what was typed —
+            // the strip never lies about what the grid now is.
+            app.status = format!("grid tempo: {key}");
+            app.metro_grid_key = key;
+        }
+    }
 }
 
 /// Playhead position as `bar.beat` + `m:ss.t`.
@@ -23523,6 +23746,7 @@ fn dock_all_windows(app: &mut App) {
             pulled.push((i, f[1]));
         }
     }
+    let pulled_n = pulled.len();
     // v98: every "dock all" pull is a float→dock transition.
     for (i, e) in pulled {
         reset_dock_along(app, i, e);
@@ -23534,6 +23758,7 @@ fn dock_all_windows(app: &mut App) {
         .filter(|(_, w)| w.dock[0] != 1)
         .map(|(n, _)| n)
         .collect();
+    let dyn_n = dyn_floats.len();
     for n in dyn_floats {
         let maxo = (0..win_count(app))
             .filter(|i| is_docked(app, *i) && dock_edge(app, *i) == 1)
@@ -23557,9 +23782,18 @@ fn dock_all_windows(app: &mut App) {
     }
     app.side_dirty = true;
     app.save_config();
+    // v182 (TS-026): layout commands are LAYOUT actions — the strip reports
+    // the verdict, including "nothing moved" (see float_all_windows).
+    let pulled_n = pulled_n + dyn_n;
+    app.status = if pulled_n == 0 {
+        "layout: every window already docked".into()
+    } else {
+        format!("layout: {pulled_n} window(s) docked")
+    };
 }
 
 fn float_all_windows(app: &mut App) {
+    let mut floated = 0usize;
     for i in 0..win_count(app) {
         if is_docked(app, i) {
             let r = app.dock_rects[i];
@@ -23570,10 +23804,19 @@ fn float_all_windows(app: &mut App) {
                 [base[0], base[1]]
             };
             undock_to(app, i, at);
+            floated += 1;
         }
     }
     app.side_dirty = true;
     app.save_config();
+    // v182 (TS-026): layout commands are LAYOUT actions — the strip reports
+    // the verdict, including "nothing moved" (an honest no-op echo beats a
+    // silent button, TS-026 AC2).
+    app.status = if floated == 0 {
+        "layout: every window already floating".into()
+    } else {
+        format!("layout: {floated} window(s) floated")
+    };
 }
 
 /// v43 R4: full restore of the stock arrangement — slots AND recorded
@@ -24611,6 +24854,9 @@ fn draw_docked(ui: &mut egui::Ui, app: &mut App, idx: usize) {
 /// thickness) whose interior is split by nested opposite-orientation
 /// panels, each resizable along the edge and each owning one window.
 fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) {
+    // v182 (TS-026): ONE declaration (ts-028 audit: this was declared twice,
+    // byte-identical, inside the same painter's two edge branches).
+    const MIN_SHARE: f32 = 56.0;
     if ids.len() == 1 {
         draw_docked(ui, app, ids[0]);
         return;
@@ -24651,7 +24897,6 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
                     // strip; when it oversubscribes, every member scales by
                     // ONE common ratio (floored at the old 48) so the user's
                     // proportion survives the boot compromise.
-                    const MIN_SHARE: f32 = 56.0;
                     let strip = ui.max_rect().width();
                     // v98: a member with NO recorded share wants the
                     // UNIFORM split (old fresh behavior) — the def_w float
@@ -24723,8 +24968,7 @@ fn draw_docked_edge(ui: &mut egui::Ui, app: &mut App, edge: i16, ids: &[usize]) 
             wpanel = wpanel.resizable(true).default_size(w).min_size(56.0);
             wpanel.show(ui, |ui| {
                 // v35 R6 fair-share + v49 R4 live max_size + the v98
-                // proportional along-scale — see the bottom-edge branch.
-                const MIN_SHARE: f32 = 56.0;
+                // proportional along-scale — see the bottom-edge branch above.
                 let strip = ui.max_rect().height();
                 // v98: fill member's recorded share joins the scale math;
                 // NEVER-recorded members want the uniform split (see the
@@ -24789,6 +25033,15 @@ fn docked_window(ui: &mut egui::Ui, app: &mut App, idx: usize) {
         window_body(ui, app, idx);
     }
 }
+
+/// v182 (TS-026): the float-window dock affordance chrome — ONE home for
+/// the dock-button face / hot face / tab-strip fill (ts-028 audit: these
+/// were forked literals; the button's idle ring is `kit::MUTED`). The hot
+/// fill shares its role nowhere else: dock chrome, not data. Values frozen
+/// by v182_dock_tints_single_home (byte-equal adoption, zero visual drift).
+const COL_DOCK_BTN: egui::Color32 = egui::Color32::from_rgb(48, 52, 60);
+const COL_DOCK_BTN_HOT: egui::Color32 = egui::Color32::from_rgb(70, 96, 128);
+const COL_DOCK_TAB_BG: egui::Color32 = egui::Color32::from_rgb(24, 26, 30);
 
 fn draw_float(ui: &mut egui::Ui, app: &mut App, idx: usize) {
     let old = win_rect(app, idx);
@@ -25008,14 +25261,11 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
             let br = win_dock_btn_rect(&r);
             let hot = hover.map(|h| br.expand(2.0).contains(h)).unwrap_or(false);
             let (fill, stroke) = if hot {
-                (
-                    Color32::from_rgb(70, 96, 128),
-                    egui::Stroke::new(1.2, crate::kit::ACCENT),
-                )
+                (COL_DOCK_BTN_HOT, egui::Stroke::new(1.2, crate::kit::ACCENT))
             } else {
                 (
-                    Color32::from_rgb(48, 52, 60),
-                    egui::Stroke::new(1.0, Color32::from_gray(110)),
+                    COL_DOCK_BTN,
+                    egui::Stroke::new(1.0, crate::kit::MUTED),
                 )
             };
             p.rect_filled(br, 3.0, fill);
@@ -25046,7 +25296,7 @@ fn side_frames(ui: &mut egui::Ui, app: &mut App) {
                     egui::pos2(br.min.x - 2.0, br.max.y + 6.0),
                     egui::vec2(tw + 10.0, 18.0),
                 );
-                p.rect_filled(tr, 3.0, Color32::from_rgb(24, 26, 30));
+                p.rect_filled(tr, 3.0, COL_DOCK_TAB_BG);
                 p.rect_stroke(
                     tr,
                     3.0,
@@ -59006,6 +59256,61 @@ mod tests {
             texts2.iter().any(|t| t.contains("re-scan the JACK port list")),
             "ports Refresh must tooltip its rescan; galleys: {texts2:?}"
         );
+    }
+
+    #[test]
+    fn v182_tmp_probe_topbar_widths() {
+        let mut app = headless_app("v182probe");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]); // installs fonts
+        let probe = |app: &mut App, w: f32| -> Vec<String> {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w, 480.0),
+                )),
+                time: Some(test_time()),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+            let needles = [
+                "slooper", "PLAY", "REC GROUP", "METRO", "bpm", "beat",
+                "Export", "Meter", "Drums", "Windows", "Load", "Save as",
+                "Save", "Hz", "More", "audio engine",
+            ];
+            let mut rows: Vec<String> = Vec::new();
+            for cs in &out.shapes {
+                if let egui::epaint::Shape::Text(t) = &cs.shape {
+                    let txt = t.galley.text().replace('\n', " / ");
+                    if txt.chars().count() > 60 {
+                        continue;
+                    }
+                    if needles.iter().any(|n| txt.contains(n)) {
+                        let r = egui::Rect::from_min_size(
+                            t.pos + t.galley.rect.min.to_vec2(),
+                            t.galley.rect.size(),
+                        );
+                        rows.push(format!(
+                            "  x{:6.1}..{:6.1} y{:5.1} {txt:?}",
+                            r.min.x, r.max.x, r.min.y
+                        ));
+                    }
+                }
+            }
+            let _ = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+            out.textures_delta.clear();
+            rows
+        };
+        for name in ["", "very long project title that keeps growing and growing"] {
+            app.proj_name = name.to_string();
+            println!("== proj_name={:?}", name);
+            for w in [1440.0f32, 1200.0, 1050.0, 950.0, 780.0] {
+                println!(" -- width {w}");
+                for row in probe(&mut app, w) {
+                    println!("{row}");
+                }
+            }
+        }
     }
 
     /// v72 R1: status-echo inventory (goal 1 sweep 2). Every action the
