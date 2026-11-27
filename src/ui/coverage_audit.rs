@@ -1038,7 +1038,6 @@ const EXEMPTIONS: &[Ex] = &[
     Ex { kind: "hov", site: "ui.rs\ttop_bar\tif ui.checkbox(&mut app.show_midi, \"MIDI monitor\").changed() {", n: 1, why: "skip:self-explaining-label — the checkbox/label text IS the explanation (v76 R2)" },
     Ex { kind: "hov", site: "ui.rs\tvalue_binds_body\t.selectable_value(&mut target, id.clone(), label)", n: 1, why: "skip:popup-item — the item label is the option; the owner shows the selection (v86 R2)" },
     Ex { kind: "hov", site: "ui.rs\tvalue_binds_body\tegui::ComboBox::from_id_salt(\"vb_target\")", n: 1, why: "skip:combo-label — the combo shows the current selection; popup items explain themselves (v86 R2)" },
-    Ex { kind: "hov", site: "ui.rs\tvalue_binds_body\tif ui.small_button(\"relearn\").clicked() {", n: 1, why: "skip:self-explaining-label — sits beside the binding row it relearns (v76 R2)" },
 ];
 
 /// Split gaps vs the table: unmatched gap sites (NEW) + stale rows +
