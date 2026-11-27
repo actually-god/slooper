@@ -16966,7 +16966,10 @@ impl App {
                             kit_changed = true;
                         }
                         if ui
-                            .add(egui::Button::new("\u{25b6}").min_size(egui::vec2(18.0, 18.0)))
+                            .add(
+                                egui::Button::new("\u{25b6}")
+                                    .min_size(egui::vec2(INSTR_PLAY_W, INSTR_ROW_H)),
+                            )
                             .on_hover_text("Audition this pad")
                             .clicked()
                         {
@@ -17034,11 +17037,11 @@ impl App {
                             egui::TextStyle::Button,
                             None,
                         ) {
-                            cresp.on_hover_text(format!(
+                            cresp.response.on_hover_text(format!(
                                 "sound \u{201c}{label}\u{201d} \u{b7} click to change it"
                             ));
                         } else {
-                            cresp.on_hover_text("change this pad's sound (click for the sample list)");
+                            cresp.response.on_hover_text("change this pad's sound (click for the sample list)");
                         }
                         // v69 (S1): import a sound straight from disk —
                         // no file-manager round-trip for a drop. The
@@ -17088,7 +17091,7 @@ impl App {
                         if ui
                             .add(
                                 egui::Button::new(if kit[p].muted { "m" } else { "\u{25cf}" })
-                                    .min_size(egui::vec2(16.0, 18.0)),
+                                    .min_size(egui::vec2(INSTR_KILL_W, INSTR_ROW_H)),
                             )
                             .on_hover_text("Mute pad")
                             .clicked()
@@ -17105,7 +17108,10 @@ impl App {
                             );
                         }
                         if ui
-                            .add(egui::Button::new("\u{2715}").min_size(egui::vec2(16.0, 18.0)))
+                            .add(
+                                egui::Button::new("\u{2715}")
+                                    .min_size(egui::vec2(INSTR_KILL_W, INSTR_ROW_H)),
+                            )
                             .on_hover_text("Remove this pad")
                             .clicked()
                             && kit.len() > 1
@@ -69136,6 +69142,515 @@ mod tests {
         assert!(
             canvas.contains(lab.center()),
             "lane label must ride the canvas rect (canvas {canvas:?}, label {lab:?})"
+        );
+    }
+
+    // =================================================================
+    // v178 — TS-023: STOCK INSTRUMENT EDITORS (drum machine, sampler
+    // map, sample editor, synth-slider/kit window). Hover + echo
+    // completeness, ONE geometry/tint home per surface, drum-grid
+    // scroll, preset-bar parity. Every contract pinned here ships its
+    // behavior in the same commit (acceptance-pass rule).
+    // =================================================================
+
+    /// prod source up to `mod tests` (source-scan pins).
+    fn v178_prod() -> &'static str {
+        let srcs = include_str!("ui.rs");
+        &srcs[..srcs.find("\nmod tests").expect("mod tests anchor")]
+    }
+
+    /// v178 R2.1: the drum machine echoes transport + edit state
+    /// changes: per-row clear, play, stop, clear-all.
+    #[test]
+    fn v178_drum_echo_state_changes() {
+        let mut app = headless_app("v178druecho");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        frame(&mut app, &ctx, vec![]);
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        // Paint a hit on pad 1 so the clears have something to erase.
+        let cell = app
+            .drum_probe
+            .iter()
+            .find(|(p, s, _)| *p == 0 && *s == 0)
+            .map(|(_, _, r)| *r)
+            .expect("grid cell (0,0) painted");
+        click_pt(&mut app, &ctx, cell.center());
+        assert!(app.drum.grid[0][0] > 0, "cell click paints a hit");
+        // Per-row clear (topmost "x" = pad 1's row): names the pad.
+        let mut xs = galley_centers(&mut app, &ctx, "x", true);
+        xs.sort_by(|a, b| a.y.total_cmp(&b.y));
+        click_pt(&mut app, &ctx, *xs.first().expect("per-row clear button"));
+        assert!(
+            app.status.starts_with("drums: cleared pad"),
+            "row clear must name the emptied pad: {:?}",
+            app.status
+        );
+        // Transport verbs.
+        let play = galley_at(&mut app, &ctx, "play")
+            .expect("play button")
+            .center();
+        click_pt(&mut app, &ctx, play);
+        assert!(
+            app.status.contains("drums: playing"),
+            "play must echo: {:?}",
+            app.status
+        );
+        let stop = galley_at(&mut app, &ctx, "stop")
+            .expect("stop button")
+            .center();
+        click_pt(&mut app, &ctx, stop);
+        assert!(
+            app.status.contains("drums: stopped"),
+            "stop must echo: {:?}",
+            app.status
+        );
+        // clear-all: whole-pattern verb.
+        let ca = galley_at(&mut app, &ctx, "clear all")
+            .expect("clear all button")
+            .center();
+        click_pt(&mut app, &ctx, ca);
+        assert!(
+            app.status.contains("cleared the whole pattern"),
+            "clear-all must echo: {:?}",
+            app.status
+        );
+        // Subdivision echo + track-switch echo are combo popups — pinned
+        // at source level here (popup re-arm budget, v50 trap (e)).
+        let prod = v178_prod();
+        let d0 = prod.find("fn drum_win_body").expect("drum body");
+        let drum = &prod[d0..];
+        assert!(
+            drum.contains("\"drums: {label}"),
+            "subdivision change lost its steps-per-bar echo"
+        );
+        assert!(
+            drum.contains("editing track"),
+            "drum track switch lost its kit echo"
+        );
+    }
+
+    /// v178 R4.1: the drum grid SCROLLS — shrink the window below the
+    /// pad stack and the bottom pad becomes reachable by wheeling
+    /// (before v178 those rows died silently at the window floor).
+    #[test]
+    fn v178_drum_grid_scrollable() {
+        let mut app = headless_app("v178drumscroll");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_drums = true;
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        let i = app
+            .dyn_wins
+            .iter()
+            .position(|w| w.kind == DynKind::Drums)
+            .expect("drum registry slot");
+        let r0 = app.dyn_wins[i].rect;
+        // Corner-drag the window down to ~160 px — far below the 8-row stack.
+        let c = egui::pos2(r0[0] + r0[2] - 1.5, r0[1] + r0[3] - 1.5);
+        let to = egui::pos2(c.x, r0[1] + 160.0);
+        drag_steps(&mut app, &ctx, c, to);
+        for _ in 0..6 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let wr = app.dyn_wins[i].rect;
+        assert!(wr[3] < 260.0, "window actually shrank: {wr:?}");
+        // BOTTOM pad row exists but sits BELOW the window floor.
+        let perc = app
+            .drum_probe
+            .iter()
+            .find(|(p, _, _)| *p == 7)
+            .map(|(_, _, r)| *r)
+            .expect("bottom pad row allocated");
+        assert!(
+            perc.max.y > wr[1] + wr[3],
+            "pre-scroll the bottom row must hang below the window floor \
+             (probe {perc:?} window {wr:?})"
+        );
+        // Wheel over the visible grid -> the stack scrolls up.
+        let probe = app
+            .drum_probe
+            .iter()
+            .find(|(p, _, _)| *p == 0)
+            .map(|(_, _, r)| *r)
+            .expect("top row visible");
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![moved(probe.center())]);
+        }
+        for _ in 0..2 {
+            frame(
+                &mut app,
+                &ctx,
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -400.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: Default::default(),
+                }],
+            );
+        }
+        for _ in 0..25 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let perc2 = app
+            .drum_probe
+            .iter()
+            .find(|(p, _, _)| *p == 7)
+            .map(|(_, _, r)| *r)
+            .expect("bottom pad row still allocated");
+        let wr2 = app.dyn_wins[i].rect;
+        assert!(
+            perc2.max.y <= wr2[1] + wr2[3] + 1.0 && perc2.min.y >= wr2[1],
+            "wheeling must bring the bottom pad row fully inside the \
+             window (probe {perc2:?} window {wr2:?})"
+        );
+    }
+
+    /// v178 R4.2: the instrument grids build their chrome from the ONE
+    /// geometry home — values frozen, no inline row literals left in the
+    /// drum grid or the kit pad rows.
+    #[test]
+    fn v178_instr_grid_single_home() {
+        assert_eq!(INSTR_ROW_H, 18.0);
+        assert_eq!(INSTR_NAME_W, 52.0);
+        assert_eq!(INSTR_PLAY_W, 18.0);
+        assert_eq!(INSTR_KILL_W, 16.0);
+        assert_eq!(INSTR_STEP_W, 14.0);
+        assert_eq!(SMAP_LANE_H, 24.0);
+        assert_eq!(SMAP_KEY_H, 22.0);
+        let prod = v178_prod();
+        // The drum grid reads the home…
+        let d0 = prod.find("fn drum_win_body").expect("drum body");
+        let d1 = d0 + prod[d0..].find("fn master_out_window").expect("body end");
+        let drum = &prod[d0..d1];
+        for c in ["INSTR_ROW_H", "INSTR_NAME_W", "INSTR_STEP_W", "INSTR_PLAY_W", "INSTR_KILL_W"] {
+            assert!(drum.contains(c), "drum grid lost {c}");
+        }
+        // …and the old anonymous literals are GONE (sabotage-proof: put
+        // any tuple back and this scan trips).
+        for lit in [
+            "vec2(14.0, 18.0)",
+            "vec2(52.0, 18.0)",
+            "vec2(18.0, 18.0)",
+            "vec2(16.0, 18.0)",
+        ] {
+            assert!(!drum.contains(lit), "drum grid still paints {lit} inline");
+        }
+        // The kit pad rows joined the same home (synth window section).
+        let k0 = prod
+            .find("v69: named kit presets")
+            .expect("kit section start");
+        let k1 = k0
+            + prod[k0..]
+                .find("end of the !sampler (drum kit) section")
+                .expect("kit section end");
+        let kit = &prod[k0..k1];
+        assert!(kit.contains("INSTR_PLAY_W") && kit.contains("INSTR_KILL_W"));
+        for lit in ["vec2(18.0, 18.0)", "vec2(16.0, 18.0)"] {
+            assert!(!kit.contains(lit), "kit pad rows still paint {lit} inline");
+        }
+        // The smap home survived the move to module level.
+        assert!(
+            prod.contains("const SMAP_LANE_H")
+                && prod.contains("const SMAP_KEY_H")
+                && prod.contains("const SMAP_HDR_W"),
+            "smap geometry home vanished"
+        );
+    }
+
+    /// v178 R5.1: instrument-surface tints live in their named homes —
+    /// values frozen bit-for-bit from the pre-v178 literals (zero visual
+    /// drift) and no inline Color32 literals left in the swept bodies.
+    #[test]
+    fn v178_stock_tints_single_home() {
+        assert_eq!(COL_SE_CANVAS, egui::Color32::from_rgb(14, 16, 22));
+        assert_eq!(COL_SE_CANVAS_EDGE, egui::Color32::from_gray(55));
+        assert_eq!(COL_SE_GRID_LINE, egui::Color32::from_gray(30));
+        assert_eq!(COL_SE_TIME_TXT, egui::Color32::from_gray(105));
+        assert_eq!(COL_SE_STRIP_BG, egui::Color32::from_rgb(22, 25, 32));
+        assert_eq!(COL_SE_SRC_TICK, egui::Color32::from_gray(120));
+        assert_eq!(COL_SE_SRC_TXT, egui::Color32::from_gray(130));
+        assert_eq!(COL_SE_READOUT, egui::Color32::from_gray(150));
+        // ts-028 exact-token adoptions carry their documented values:
+        assert_eq!(crate::kit::SEP_SOFT, egui::Color32::from_gray(48));
+        assert_eq!(crate::kit::TEXT, egui::Color32::from_gray(170));
+        // Body scans: every Color32::from_* line in the swept bodies is
+        // either a named `const` or the computed velocity ramp.
+        let prod = v178_prod();
+        let slices = [
+            ("drum_win_body", prod.find("fn drum_win_body").expect("drum body")),
+            (
+                "sample_edit_window",
+                prod.find("fn sample_edit_window").expect("sample editor"),
+            ),
+            ("smap_body", prod.find("fn smap_body").expect("smap body")),
+        ];
+        for (name, start) in slices {
+            let end_rel = match name {
+                "drum_win_body" => prod[start..]
+                    .find("fn master_out_window")
+                    .expect("drum end"),
+                "sample_edit_window" => {
+                    prod[start..].find("fn rekey_path_state").expect("se end")
+                }
+                _ => prod[start..]
+                    .find("fn sampler_editor_open")
+                    .expect("smap end"),
+            };
+            for line in prod[start..start + end_rel].lines() {
+                if line.contains("Color32::from_gray(") || line.contains("Color32::from_rgb(") {
+                    let ok = line.contains("const ")
+                        || line.contains("from_rgb(90 + v / 2, 55 + v / 4, 55)");
+                    assert!(ok, "{name} paints an inline tint: {}", line.trim());
+                }
+            }
+        }
+    }
+
+    /// v178 R2.2: sampler-map slot operations echo — mode toggle, lane
+    /// add, lane removal all name themselves in the status line.
+    #[test]
+    fn v178_smap_echo_slot_ops() {
+        let (mut app, ctx) = v56_open_sampler_map("v178smapecho");
+        let xf = galley_at(&mut app, &ctx, "crossfade")
+            .expect("mode row")
+            .center();
+        click_pt(&mut app, &ctx, xf);
+        assert!(
+            app.status.contains("mode") && app.status.contains("crossfade"),
+            "mode toggle must echo: {:?}",
+            app.status
+        );
+        let hc = galley_at(&mut app, &ctx, "hard cutoff")
+            .expect("mode row")
+            .center();
+        click_pt(&mut app, &ctx, hc);
+        assert!(
+            app.status.contains("hard cutoff"),
+            "mode echo lost hard-cutoff: {:?}",
+            app.status
+        );
+        // Lane add: the new lane lands far below the header — echo it.
+        let add = galley_at(&mut app, &ctx, "+ add sample")
+            .expect("add button")
+            .center();
+        click_pt(&mut app, &ctx, add);
+        assert!(
+            app.status.starts_with("sampler map: +") && app.status.contains("mapped"),
+            "lane add must echo: {:?}",
+            app.status
+        );
+        // Lane removal names the victim + the remaining count.
+        let mut xs = galley_centers(&mut app, &ctx, "\u{d7}", true);
+        xs.sort_by(|a, b| a.y.total_cmp(&b.y));
+        let rem = *xs.last().expect("per-row kill buttons");
+        click_pt(&mut app, &ctx, rem);
+        assert!(
+            app.status.contains("removed") && app.status.contains("mapped"),
+            "lane removal must echo: {:?}",
+            app.status
+        );
+    }
+
+    /// v178 R1.2: the sampler-map piano strip explains its whole gesture
+    /// set (click/drag retarget + rack-sample drop) on hover.
+    #[test]
+    fn v178_smap_keys_hover() {
+        let prod = v178_prod();
+        let i = prod
+            .find("kz.on_hover_text(")
+            .expect("piano strip hover attach");
+        let seg = &prod[i..(i + 500).min(prod.len())]);
+        assert!(
+            seg.contains("click / drag a key") && seg.contains("drop a rack sample"),
+            "piano strip hover lost the gesture copy: {seg}"
+        );
+    }
+
+    /// v178 R1.1: the sample editor's numeric controls explain that the
+    /// canvas carries the same gesture (stretch marker, bend start,
+    /// fade handles, save-as auto-name).
+    #[test]
+    fn v178_sample_edit_hover() {
+        let prod = v178_prod();
+        let e0 = prod
+            .find("fn sample_edit_window")
+            .expect("sample editor");
+        let e1 = e0 + prod[e0..].find("fn rekey_path_state").expect("editor end");
+        let body = &prod[e0..e1];
+        for (site, needle) in [
+            ("stretch slider", "Slider::new(&mut ed.stretch"),
+            ("bend start", "DragValue::new(&mut ed.bend_start_cents"),
+            ("fade ms pair", "DragValue::new(ms)"),
+            ("save-as box", "TextEdit::singleline(&mut self.se_name"),
+        ] {
+            let i = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("{site} lost its call-site shape"));
+            let seg = &body[i..(i + 500).min(body.len())];
+            let seg = &seg[..seg.find(';').unwrap_or(seg.len())];
+            assert!(
+                seg.contains("on_hover_text"),
+                "sample-editor {site} carries no hover explanation"
+            );
+        }
+    }
+
+    /// v178 R2.3: every COMMITTED sample-editor edit echoes one line
+    /// naming what moved; reset says so instead of stacking verbs.
+    #[test]
+    fn v178_sample_edit_echo() {
+        let mut app = headless_app("v178seecho");
+        let samples = std::env::temp_dir()
+            .join("sp-uity-v178seecho")
+            .join("samples");
+        let _ = std::fs::remove_dir_all(&samples);
+        v28_wav(&samples, "rev.wav");
+        let wav = samples.join("rev.wav");
+        app.rack[0].path = samples.display().to_string();
+        app.rack[0].rescan();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        let _ = app.ensure_asset(&wav);
+        let key = wav.to_string_lossy().into_owned();
+        app.sample_edit_win = Some(key.clone());
+        frame(&mut app, &ctx, vec![]);
+        frame(&mut app, &ctx, vec![]);
+        // Toggle reverse: the commit lands straight away.
+        let rev = galley_at(&mut app, &ctx, "reverse")
+            .expect("reverse checkbox")
+            .center();
+        click_pt(&mut app, &ctx, rev);
+        assert!(
+            app.status.starts_with("sample edit:")
+                && app.status.contains("reverse on")
+                && app.status.contains("rev"),
+            "reverse commit must echo verb + asset: {:?}",
+            app.status
+        );
+        assert!(app.sample_edits[&key].reverse, "the edit committed");
+        // Reset replaces the verb stack with one honest line.
+        let rs = galley_at(&mut app, &ctx, "reset")
+            .expect("reset button")
+            .center();
+        click_pt(&mut app, &ctx, rs);
+        assert!(
+            app.status.contains("reset to the source sound"),
+            "reset must echo its own verb: {:?}",
+            app.status
+        );
+        assert!(!app.sample_edits[&key].reverse, "reset cleared the edit");
+    }
+
+    /// v178 R2.4: the kit pad rows echo — mute names pad+sound, removal
+    /// names the victim, add counts; the combo/drop/import echoes are
+    /// pinned at source level (popup/dialog reachability, v50 trap (e)).
+    #[test]
+    fn v178_kit_pad_echo() {
+        let (mut app, ctx) = v65_synth_win("v178kitecho");
+        // Mute pad 1 (stock name Kick): the ●→m flip needs naming.
+        let mut dots = galley_centers(&mut app, &ctx, "\u{25cf}", true);
+        dots.sort_by(|a, b| a.y.total_cmp(&b.y));
+        click_pt(&mut app, &ctx, *dots.first().expect("pad mute buttons"));
+        assert!(
+            app.status.starts_with("drum kit: pad 1 muted")
+                && app.status.contains("Kick"),
+            "mute must name pad + sound: {:?}",
+            app.status
+        );
+        // Remove pad 2 (Snare): a whole row vanishing must be named.
+        let mut xx = galley_centers(&mut app, &ctx, "\u{2715}", true);
+        xx.sort_by(|a, b| a.y.total_cmp(&b.y));
+        click_pt(&mut app, &ctx, xx[1]);
+        assert!(
+            app.status.contains("removed pad")
+                && app.status.contains("Snare")
+                && app.status.contains("pads left"),
+            "pad removal must name the victim + count: {:?}",
+            app.status
+        );
+        // Add pad: the new row can land below the fold — echo counts.
+        let ap = galley_at(&mut app, &ctx, "+ add pad")
+            .expect("add pad button")
+            .center();
+        click_pt(&mut app, &ctx, ap);
+        assert!(
+            app.status.contains("added a pad") && app.status.contains("of"),
+            "pad add must echo the count: {:?}",
+            app.status
+        );
+        // Source-level echoes (combo / drop / import):
+        let prod = v178_prod();
+        let k0 = prod.find("v69: named kit presets").expect("kit start");
+        let k1 = k0
+            + prod[k0..]
+                .find("end of the !sampler (drum kit) section")
+                .expect("kit end");
+        let kit = &prod[k0..k1];
+        assert!(
+            kit.contains("kit[p].asset_path.clear();")
+                && kit[kit.find("kit[p].asset_path.clear();").unwrap()..].contains("silent (sample unassigned)"),
+            "unassign lost its echo"
+        );
+        assert!(
+            kit.contains("sample \\u{201c}{nm}\\u{201d}\""),
+            "combo assign lost its echo"
+        );
+        assert!(
+            kit.contains("dropped asset"),
+            "pad drop echo vanished (v34 contract)"
+        );
+        // The clip combo hovers the FULL sound name (v87 identity law):
+        assert!(
+            kit.contains("kit::label_clipped("),
+            "kit combo dropped the v87 clipped-identity check"
+        );
+    }
+
+    /// v178 R3.1: the stock surfaces share the ONE preset bar and the
+    /// drum machine paints NO preset chrome of its own (TS-003 rule
+    /// extended to the stock instrument family; extends, never
+    /// replaces, v77_preset_bar_parity).
+    #[test]
+    fn v178_preset_bar_parity_stock() {
+        // Synth window: user-synth bar AND kit bar through the renderer.
+        let (mut app, ctx) = v65_synth_win("v178paritysyn");
+        for label in ["user preset", "kit preset"] {
+            assert!(
+                !galleys_all(&mut app, &ctx, label).is_empty(),
+                "synth window lost the {label:?} bar"
+            );
+        }
+        // Sampler-map window: its v56 bar through the same renderer.
+        let (mut app2, ctx2) = v56_open_sampler_map("v178paritysam");
+        assert!(
+            !galleys_all(&mut app2, &ctx2, "preset \u{b7}").is_empty(),
+            "sampler map lost its shared bar"
+        );
+        // Drum window: NO preset chrome — the pointer row to SYNTHS owns
+        // kit presets (source scan: no presetbar call in the drum body).
+        let mut app3 = headless_app("v178paritydrum");
+        let ctx3 = egui::Context::default();
+        clear_canvas(&mut app3);
+        frame(&mut app3, &ctx3, vec![]);
+        app3.show_drums = true;
+        frame(&mut app3, &ctx3, vec![]);
+        frame(&mut app3, &ctx3, vec![]);
+        for label in ["save kit", "kit preset", "load kit"] {
+            assert!(
+                galleys_all(&mut app3, &ctx3, label).is_empty(),
+                "drum window grew per-surface preset chrome {label:?}"
+            );
+        }
+        let prod = v178_prod();
+        let d0 = prod.find("fn drum_win_body").expect("drum body");
+        let d1 = d0 + prod[d0..].find("fn master_out_window").expect("body end");
+        assert!(
+            !prod[d0..d1].contains("presetbar::render"),
+            "the drum body must never fork the preset bar"
         );
     }
 }
