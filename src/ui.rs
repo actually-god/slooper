@@ -26615,7 +26615,7 @@ fn rack_body(ui: &mut egui::Ui, app: &mut App) {
                                 // v181 (TS-025 R2): the standard seam owns
                                 // this confirmation now (Esc = Cancel, Alt =
                                 // save-current hatch, echo on every verdict).
-                                app.request_proj_load(&name, pth.clone());
+                                app.request_proj_load(name, pth.clone());
                             }
                         }
                     }
@@ -33473,31 +33473,30 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                          project MIDI BINDINGS window is untouched",
                     )
                     .clicked()
+                    && app.pending_confirm.is_none()
                 {
-                    if app.pending_confirm.is_none() {
-                        app.pending_confirm = Some(PendingConfirm {
-                            ask: crate::kit::ConfirmAsk {
-                                kind: "bindings_reset",
-                                title: "Reset bindings to defaults?",
-                                body: "Every keyboard shortcut returns to \
-                                       its shipped default, and every \
-                                       app-global MIDI binding and knob \
-                                       calibration is cleared."
+                    app.pending_confirm = Some(PendingConfirm {
+                        ask: crate::kit::ConfirmAsk {
+                            kind: "bindings_reset",
+                            title: "Reset bindings to defaults?",
+                            body: "Every keyboard shortcut returns to \
+                                   its shipped default, and every \
+                                   app-global MIDI binding and knob \
+                                   calibration is cleared."
+                                .into(),
+                            note: Some(
+                                "The MIDI BINDINGS window\u{2019}s \
+                                 per-project bindings are not touched."
                                     .into(),
-                                note: Some(
-                                    "The MIDI BINDINGS window\u{2019}s \
-                                     per-project bindings are not touched."
-                                        .into(),
-                                ),
-                                confirm_label: "Reset",
-                                alt_label: None,
-                                alt_hover: None,
-                                never_warn_label: None,
-                                never_warn: false,
-                            },
-                            effect: ConfirmEffect::ResetBindings,
-                        });
-                    }
+                            ),
+                            confirm_label: "Reset",
+                            alt_label: None,
+                            alt_hover: None,
+                            never_warn_label: None,
+                            never_warn: false,
+                        },
+                        effect: ConfirmEffect::ResetBindings,
+                    });
                 }
             });
             // v68: the mix-page hotkey is intentionally NOT a slot row
