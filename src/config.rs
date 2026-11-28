@@ -794,6 +794,17 @@ pub struct Config {
     /// ride App::set_spectrum_line (one seam: state + save + echo).
     #[serde(default)]
     pub spectrum_line: bool,
+    /// v184 (card t_ef31d00d / MIX-SCR-1): the mixer scroll mode. true
+    /// (default) = LINKED — the scroller moves every strip/column
+    /// together (the mixer's historic behavior). false = PER-STRIP — the
+    /// scroller moves only the strip/column under the cursor. Governs
+    /// the mix-page columns (horizontal always; a vertical axis appears
+    /// only when columns overflow a short page) and the docked mixer's
+    /// horizontal strip axis (a narrow dock clips a strip's tail — the
+    /// scroller reveals it, per strip or as one). The docked mixer's
+    /// VERTICAL scroll stays the v34 R6 / v52 R5 law (follow-tracks).
+    #[serde(default = "default_true")]
+    pub mixer_scroll_linked: bool,
     /// v170 (card t_3d0dfae8): "Never warn again" for removing a NON-EMPTY
     /// child track. Set from the standard confirm dialog (kit::confirm);
     /// true = removing a child track with clips happens without the
@@ -962,6 +973,7 @@ impl Default for Config {
             show_mixer: true,
             mixer_follow_tracks: true,
             spectrum_line: false,
+            mixer_scroll_linked: true,
             lane_rm_never_warn: false,
             save_overwrite_never_warn: false,
             show_midi: true,
