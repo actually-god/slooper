@@ -48314,7 +48314,7 @@ mod tests {
         let saved = cfg.drum.clone().expect("drum in session config");
         assert_eq!(saved.grid[1][7], 111);
         assert!(!cfg.show_drums);
-        let app2 = App::new(Backend::start());
+        let mut app2 = App::new(Backend::start());
         assert_eq!(app2.drum.grid[1][7], 111, "drum grid back from config");
         let pj = app.build_project("v29drum".into());
         let saved_p = pj.drum.as_ref().expect("drum in project");
@@ -72606,6 +72606,45 @@ mod tests {
         );
         frame(&mut app2, &ctx2, vec![]);
         assert!(app2.hscroll > g + 1.0, "shift+wheel over the grid still pans the timeline");
+    }
+
+    /// Completeness audit (v184): the mode has ONE write home (the seam)
+    /// plus exactly the two sanctioned mirrors (boot init, MCP LIVE arm),
+    /// and its echo strings paint from ONE place. Source-scan polarity is
+    /// split with concat! so the pin cannot pass off its own literals.
+    #[test]
+    fn v184_scroll_mode_write_inventory() {
+        let src = include_str!("ui.rs");
+        let active = |needle: &str| {
+            src.lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && !t.starts_with("///") && l.contains(needle)
+                })
+                .count()
+        };
+        // The seam body + the MCP arm are the ONLY `self.mixer_scroll_linked
+        // =` writers; boot uses the `field: cfg.field` init form.
+        assert_eq!(
+            active(concat!("self.mixer_scroll_", "linked = l")),
+            1,
+            "the seam is the only state-write site"
+        );
+        assert_eq!(
+            active(concat!("self.mixer_scroll_", "linked = cfg")),
+            1,
+            "the MCP arm is the only mirror-write site"
+        );
+        assert_eq!(
+            active(concat!("mixer_scroll_linked: cfg.mixer_", "scroll_linked")),
+            1,
+            "boot applies the persisted mode from exactly one init site"
+        );
+        assert_eq!(
+            active(concat!("self.status = if lin", "ked")),
+            1,
+            "the scroll-mode echo paints from one place"
+        );
     }
 
     /// R4: the choice round-trips through Config and a FRESH app boots in
