@@ -3496,24 +3496,6 @@ pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC_V2 }
         out
     }
 
-    /// asset0 = 200 Hz whose amplitude STEPS to 1/10th at frame 15_600,
-    /// asset1 = flat 800 Hz. A voice started at frame 0 is fully in the
-    /// quiet half during the probe window 16_800..21_600, while a voice
-    /// started at 4800 still has ~3/4 of its samples in the loud half —
-    /// so the window measures WHICH press survived, not just energy.
-    fn v183_step_tones() {
-        let a0: Arc<[f32]> = (0..120_000)
-            .map(|i| {
-                let env = if i < 15_600 { 1.0 } else { 0.1 };
-                ((i as f64 * std::f64::consts::TAU * 200.0 / 48000.0).sin() * (0.5 * env)) as f32
-            })
-            .collect();
-        let a1: Arc<[f32]> = (0..120_000)
-            .map(|i| (i as f64 * std::f64::consts::TAU * 800.0 / 48000.0).sin() as f32 * 0.5)
-            .collect();
-        set_host_assets(Arc::new(vec![a0, a1]), 48_000);
-    }
-
     #[test]
     fn v183_sampler_note_off_releases_only_that_note() {
         let reg = v51_registry();
@@ -3543,31 +3525,36 @@ pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC_V2 }
     #[test]
     fn v183_sampler_retrigger_off_keeps_newest_voice() {
         let reg = v51_registry();
-        v183_step_tones();
+        v183_tones();
         let inst = v51_sampler(&reg);
-        inst.set_map(&[(0, 60, 127)], 0);
+        // One key (ch 0, note 60) pressed twice; velocity layers give the
+        // presses distinct FREQUENCIES (vel 64 -> 200 Hz, vel 112 -> 800
+        // Hz), so the probe windows read exactly which press the first
+        // key-up released — energy-only windows are blind to a LIFO bug
+        // (the released voice's fade tail masks the wrong survivor).
+        inst.set_map(&[(0, 60, 64), (1, 60, 112)], 0);
         let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![
-            (0, 3, 0, 60, 110),     // press 1 (its buffer pos == render frame)
-            (4_800, 3, 0, 60, 110), // press 2 (retrigger, no off between)
+            (0, 3, 0, 60, 64),      // press 1 -> 200 Hz
+            (4_800, 3, 0, 60, 112), // press 2 (retrigger, no off between) -> 800 Hz
             (14_400, 0, 0, 60, 0),  // first key-up -> releases press 1 ONLY
-            (24_000, 0, 0, 60, 0),  // second key-up -> releases press 2
+            (45_600, 0, 0, 60, 0),  // second key-up -> releases press 2
         ];
-        let x = v183_render(&inst, &mut ev, 48_000);
+        let x = v183_render(&inst, &mut ev, 72_000);
         let lp = |f: f64, a: usize, b: usize| line_power(&x, f, 48000.0, a, b);
-        // After the FIRST off the sound must be the NEWEST voice: its
-        // buffer pos runs 12_000..16_800 across the probe window (mostly
-        // above the loud threshold) -> loud reading. If instead the
-        // OLDEST voice survived (LIFO — the newest got cut, the exact
-        // defect this criterion bans), its pos runs 16_800..21_600, deep
-        // in the 1/10th-amp half -> power collapses by >100x.
-        let after1 = lp(200.0, 16_800, 21_600);
-        assert!(
-            after1 > 5e4,
-            "the retriggered voice must survive the first off (old voice surviving measures ~1e4): {after1}"
-        );
-        // After BOTH offs it is gone (250–350 ms into the release ramp).
-        let after2 = lp(200.0, 36_000, 40_800);
-        assert!(after2 < 50.0, "second off must end the newest voice: {after2}");
+        let p2 = lp(200.0, 7_200, 9_600);
+        let p8 = lp(800.0, 7_200, 9_600);
+        assert!(p2 > 5e4 && p8 > 5e4, "both presses must sound before the offs: {p2} {p8}");
+        // Probe starts 19.2k frames after the first off (its release
+        // floor kills the dead press by 16.6k): press 2 (800 Hz) still
+        // plays at FULL level, press 1 (200 Hz) is gone. A LIFO release
+        // would show the exact opposite — the defect this criterion bans.
+        let q2 = lp(200.0, 33_600, 38_400);
+        let q8 = lp(800.0, 33_600, 38_400);
+        assert!(q8 > 5e4, "the retriggered press must survive the first key-up: {q8}");
+        assert!(q2 < 50.0, "the first key-up must release the OLDEST press of the key: {q2}");
+        // Second key-up ends the newest press; after the full ramp, gone.
+        let r8 = lp(800.0, 64_800, 69_600);
+        assert!(r8 < 50.0, "second key-up must end the newest voice: {r8}");
     }
 
     #[test]
