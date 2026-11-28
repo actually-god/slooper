@@ -268,6 +268,14 @@ pub const DISPLAY_POINTS: usize = 1024;
 pub const SPEC_F_MIN: f32 = 30.0;
 /// v162: upper end of the display grid (see [`SPEC_F_MIN`]).
 pub const SPEC_F_MAX: f32 = 20_000.0;
+/// v185 (card t_07b9213f): width of the log-domain smoothing kernel applied
+/// to the LINE projection, in OCTAVES. The display grid is equal-per-
+/// octave, so a fixed octave width is a fixed cell radius at every
+/// frequency — the classic RTA/analyzer smoothing practice. 1/12 octave
+/// kills the per-cell max-hold spikes and the sub-bin nearest-bin plateaus
+/// (the "spiky, square" LINE look) while leaving band shape — and, being a
+/// zero-phase symmetric kernel, leaving temporal attack untouched.
+pub const SMOOTH_OCTAVES: f32 = 1.0 / 12.0;
 
 /// Real-time spectrum analyzer: keeps the last `n` mono-summed samples,
 /// applies Hann, and runs an in-place iterative radix-2 FFT on demand
@@ -286,6 +294,11 @@ pub struct Spectrum {
     rev: Vec<u32>,
     re: Vec<f32>,
     im: Vec<f32>,
+    /// v185 (card t_07b9213f): linear-power scratch for
+    /// [`Spectrum::smooth_log`] (constructor-sized; keeps the smoothing
+    /// warm path at ~3·DISPLAY_POINTS transcendental calls per vector
+    /// instead of r·DISPLAY_POINTS).
+    pwr_scratch: Vec<f32>,
     /// n/2 bin magnitudes in dB, and their decaying peak holds.
     pub db: Vec<f32>,
     pub peak_db: Vec<f32>,
@@ -333,6 +346,7 @@ impl Spectrum {
             rev,
             re: vec![0.0; n],
             im: vec![0.0; n],
+            pwr_scratch: Vec::with_capacity(DISPLAY_POINTS),
             db: vec![-240.0; n / 2],
             peak_db: vec![-240.0; n / 2],
             sr: sr.max(1) as f32,
@@ -491,6 +505,61 @@ impl Spectrum {
             }
         }
     }
+
+    /// v185 (card t_07b9213f): the ONE smoothing kernel for the LINE-mode
+    /// display projection. A symmetric triangular window of half-width
+    /// `SMOOTH_OCTAVES` octaves (radius `r` cells, weight `r+1−|k|`,
+    /// normalised by `(r+1)²`) applied as a weighted mean of POWER —
+    /// `10^(db/10)` across cells, back with `10·log10` — the correct
+    /// metering-practice statistic (what a hardware band filter or a
+    /// power-spectral display smoother does). A dB-DOMAIN mean would be a
+    /// rookie error: floor/leakage cells (~-90 dB next to a narrow peak)
+    /// would arithmetically erase the peak. Power averaging keeps a
+    /// constant field a fixed point, keeps `a >= b ⟹ smooth(a) >= smooth(b)`
+    /// (so the smoothed peak-hold line can never cross under the smoothed
+    /// trace), and preserves the dB floor (a silent field stays silent).
+    /// Edges MIRRORED (a clamped edge would smear floor cells into the
+    /// trace's ends). Zero-phase by symmetry: it sharpens nothing and
+    /// delays nothing — a transient jumps on the very frame it arrives,
+    /// which is the metering-practice requirement ("attack still
+    /// visible"): temporal smearing / IIR one-poles across FRAMES would
+    /// violate it. Allocation-free on the warm path (powers land in the
+    /// constructor-sized `pwr_scratch`; `dst` keeps its capacity).
+    pub fn smooth_log(&mut self, src: &[f32], dst: &mut Vec<f32>) {
+        let n = src.len();
+        dst.clear();
+        dst.resize(n, -240.0);
+        if n < 2 {
+            dst.copy_from_slice(src);
+            return;
+        }
+        self.pwr_scratch.clear();
+        self.pwr_scratch.resize(n, 0.0);
+        for (d, p) in src.iter().zip(self.pwr_scratch.iter_mut()) {
+            *p = 10.0f32.powf(*d * 0.1);
+        }
+        // Cell radius from the octave width: the grid is equal-per-octave,
+        // so cells/octave is constant across the span.
+        let cells_per_octave = DISPLAY_POINTS as f32 / (SPEC_F_MAX / SPEC_F_MIN).ln();
+        let r = ((cells_per_octave * SMOOTH_OCTAVES).round() as i64).clamp(1, 4096);
+        let m = 2 * (n as i64 - 1); // mirror period for edge reflection
+        let norm = 1.0f32 / ((r + 1) * (r + 1)) as f32; // Σ (r+1−|k|) = (r+1)²
+        for i in 0..n as i64 {
+            let mut acc = 0.0f32;
+            let mut k = -r;
+            while k <= r {
+                let mut j = (i + k).rem_euclid(m);
+                if j >= n as i64 {
+                    j = m - j;
+                }
+                acc += (r + 1 - k.abs()) as f32 * self.pwr_scratch[j as usize];
+                k += 1;
+            }
+            // acc >= weight(i)*p(i) > 0 for finite dB input; the floor of
+            // -240 dB is 1e-24 — far above f32 underflow.
+            dst[i as usize] = 10.0f32 * (acc * norm).max(1e-30).log10();
+        }
+    }
 }
 
 /// Lock-free single-producer / single-consumer ring of interleaved
@@ -604,6 +673,15 @@ pub struct MasterMeter {
     pub disp_db: Vec<f32>,
     /// v163: peak-hold companion of [`disp_db`](Self::disp_db).
     pub disp_pk: Vec<f32>,
+    /// v185 (card t_07b9213f): LINE-mode projection — the log-domain
+    /// smoothed copy of [`disp_db`](Self::disp_db) (see
+    /// [`Spectrum::smooth_log`]). POINTS mode keeps painting the RAW
+    /// `disp_db`/`disp_pk` (acceptance: POINTS unchanged); LINE paints
+    /// these. Filled by the same single [`MasterMeter::refresh_display`]
+    /// seam, empty before the first call.
+    pub line_db: Vec<f32>,
+    /// v185: smoothed peak-hold companion of [`line_db`](Self::line_db).
+    pub line_pk: Vec<f32>,
 }
 
 impl MasterMeter {
@@ -620,6 +698,8 @@ impl MasterMeter {
             sr,
             disp_db: Vec::new(),
             disp_pk: Vec::new(),
+            line_db: Vec::new(),
+            line_pk: Vec::new(),
         }
     }
 
@@ -627,6 +707,10 @@ impl MasterMeter {
     /// magnitudes AND project them onto the equal-per-octave display
     /// grid that BOTH trace modes paint from. Allocation-free on the
     /// warm path (resample_log keeps the two vectors' capacities).
+    /// v185 (card t_07b9213f): also fills the LINE-mode vectors —
+    /// `line_db`/`line_pk` are the 1/12-octave smoothed copies (single
+    /// kernel home [`Spectrum::smooth_log`]); the raw projection stays
+    /// POINTS data. Still ONE seam, still warm-allocation-free.
     pub fn refresh_display(&mut self, decay_db: f32) {
         self.spectrum.refresh(decay_db);
         self.spectrum.resample_log(
@@ -636,6 +720,8 @@ impl MasterMeter {
             &mut self.disp_db,
             &mut self.disp_pk,
         );
+        self.spectrum.smooth_log(&self.disp_db, &mut self.line_db);
+        self.spectrum.smooth_log(&self.disp_pk, &mut self.line_pk);
     }
 
     /// Feed a drained interleaved stereo chunk (any length).
@@ -1128,5 +1214,240 @@ mod tests {
         // Drained ring is empty again (UI never re-feeds stale audio).
         let mut buf = Vec::new();
         assert_eq!(ring.drain(&mut buf, 4_800), 0);
+    }
+
+    // ---- v185 (card t_07b9213f): LINE-mode projection smoothing -------
+    //
+    // "Recorded buffer" fixture: deterministic long-tone material (110 Hz
+    // harmonic stack + 5 kHz + 12 kHz tones) with periodic broadband
+    // transient hits and a low noise floor, fed at RT block size (480
+    // frames) with a refresh EVERY block — the same pump shape the live UI
+    // uses (ui.rs drains the MeterRing and calls refresh_display(2.5)).
+    // Deterministic LCG noise (dsp-audio-probe convention), CI-portable
+    // (no sample files, no HOME access).
+
+    fn v185_lcg(s: &mut u32) -> f32 {
+        *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((*s >> 8) as f32 / 8_388_608.0) - 1.0
+    }
+
+    fn v185_pump_recorded_material(seconds: f32) -> MasterMeter {
+        let sr = 48_000u32;
+        let mut mm = MasterMeter::new(sr);
+        let total = (seconds * sr as f32) as usize;
+        let mut seed = 0xC0FFEEu32;
+        let mut f0 = 0usize;
+        while f0 < total {
+            let n = 480usize.min(total - f0);
+            let mut blk: Vec<f32> = Vec::with_capacity(n * 2);
+            for i in 0..n {
+                let t = (f0 + i) as f32 / sr as f32;
+                let mut v = 0.0f32;
+                for h in 1..=24 {
+                    v += (2.0 * std::f32::consts::PI * 110.0 * h as f32 * t).sin() / h as f32;
+                }
+                v *= 0.14;
+                v += 0.05 * (2.0 * std::f32::consts::PI * 5_000.0 * t).sin();
+                v += 0.012 * (2.0 * std::f32::consts::PI * 12_000.0 * t).sin();
+                if (f0 + i) % 4_800 < 120 {
+                    v += 0.35 * v185_lcg(&mut seed);
+                }
+                v += 0.001 * v185_lcg(&mut seed);
+                blk.push(v);
+                blk.push(v);
+            }
+            mm.feed(&blk);
+            mm.refresh_display(2.5);
+            f0 += n;
+        }
+        mm
+    }
+
+    fn v185_adjacent_max(v: &[f32]) -> f32 {
+        v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max)
+    }
+
+    fn v185_slope2_max(v: &[f32]) -> f32 {
+        v.windows(3)
+            .map(|w| (w[2] - 2.0 * w[1] + w[0]).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    fn v185_peak(v: &[f32]) -> (f32, usize) {
+        let mut p = (f32::MIN, 0usize);
+        for (i, &x) in v.iter().enumerate() {
+            if x > p.0 {
+                p = (x, i);
+            }
+        }
+        p
+    }
+
+    #[test]
+    fn v185_probe_metrics() {
+        let mm = v185_pump_recorded_material(2.0);
+        let (rp, ri) = v185_peak(&mm.disp_db);
+        let (lp, _li) = v185_peak(&mm.line_db);
+        println!(
+            "v185 PROBE raw_dist={:.2} line_dist={:.2} raw_smax={:.2} line_smax={:.2} raw_peak={rp:.2}@{ri} line_peak={lp:.2} clip={}",
+            v185_adjacent_max(&mm.disp_db),
+            v185_adjacent_max(&mm.line_db),
+            v185_slope2_max(&mm.disp_db),
+            v185_slope2_max(&mm.line_db),
+            mm.clip
+        );
+        let f_of = |i: usize| 30.0f32 * (20_000.0f32 / 30.0).powf(i as f32 / DISPLAY_POINTS as f32);
+        for (tag, v) in [("RAW", &mm.disp_db), ("LINE", &mm.line_db)] {
+            let mut top: Vec<(f32, usize)> = (0..v.len() - 1)
+                .map(|i| ((v[i + 1] - v[i]).abs(), i))
+                .collect();
+            top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+            println!("{tag} top steps:");
+            for (d, i) in top.iter().take(8) {
+                println!(
+                    "  {d:7.2} dB at cell {i} ({} Hz -> {} Hz) vals {:.1} -> {:.1}",
+                    f_of(*i),
+                    f_of(i + 1),
+                    v[*i],
+                    v[i + 1]
+                );
+            }
+        }
+    }
+
+    /// R2: smoothness BEYOND v163's curvature pin, over recorded material
+    /// (the long-tone + transient + noise fixture above, pumped at RT
+    /// block rate): max inter-point spacing (uniform x by construction —
+    /// the visual spacing IS the adjacent dB step) and slope continuity
+    /// (second difference) must both be small on the LINE vector AND big
+    /// multiples better than the raw projection, while the fixture itself
+    /// stays measurably spiky raw (that reproduces the user complaint in
+    /// data) and the trace peak stays visible.
+    #[test]
+    fn v185_line_projection_smooth_on_recorded_material() {
+        let mm = v185_pump_recorded_material(2.0);
+        assert_eq!(mm.disp_db.len(), DISPLAY_POINTS);
+        assert_eq!(mm.line_db.len(), DISPLAY_POINTS);
+        let raw_dist = v185_adjacent_max(&mm.disp_db);
+        let line_dist = v185_adjacent_max(&mm.line_db);
+        let raw_s2 = v185_slope2_max(&mm.disp_db);
+        let line_s2 = v185_slope2_max(&mm.line_db);
+        // The complaint, in data: raw max-hold projection IS spiky.
+        assert!(raw_dist > 20.0, "raw projection must stay raw: {raw_dist}");
+        assert!(raw_s2 > 40.0, "raw second-difference must stay raw: {raw_s2}");
+        // The fix: LINE trace steps and slope swings bounded and orders
+        // of magnitude smoother.
+        assert!(line_dist <= 4.0, "LINE max inter-point step {line_dist} dB");
+        assert!(line_dist * 8.0 < raw_dist, "LINE must be >> smoother than raw: {line_dist} vs {raw_dist}");
+        assert!(line_s2 <= 6.0, "LINE slope continuity {line_s2} dB/cell²");
+        assert!(line_s2 * 8.0 < raw_s2, "LINE slope must be >> smoother: {line_s2} vs {raw_s2}");
+        // Attack content still VISIBLE: the loudest band is only modestly
+        // spread (the 5 kHz tone is ~1 cell wide in the equal-per-octave
+        // grid — kernel-normalised single-cell power dilution is
+        // (r+1)²/14 ≈ 20 dB, the theoretical floor for this fixture).
+        let (rp, _) = v185_peak(&mm.disp_db);
+        let (lp, _) = v185_peak(&mm.line_db);
+        assert!(lp > rp - 24.0, "LINE peak {lp} vs raw peak {rp} — content erased?");
+        // R4 half: the smoothed PEAK-hold vector can never cross under
+        // the smoothed trace (monotone kernel).
+        for (a, b) in mm.line_pk.iter().copied().zip(mm.line_db.iter().copied()) {
+            assert!(a >= b - 0.01, "line_pk {a} crossed under line_db {b}");
+        }
+    }
+
+    /// R3: the kernel is SPATIAL and zero-phase — a broadband transient
+    /// must light the LINE trace on the very first refresh it is inside
+    /// the analysis window (no temporal lag, attack still visible), and
+    /// silence must stay silence (no kernel-generated lift).
+    #[test]
+    fn v185_line_instant_attack_no_temporal_lag() {
+        let sr = 48_000u32;
+        let mut mm = MasterMeter::new(sr);
+        let mut seed = 12345u32;
+        let mut silence: Vec<f32> = Vec::with_capacity(480 * 2 * 40);
+        for _ in 0..480 * 40 {
+            silence.push(0.0);
+            silence.push(0.0);
+        }
+        for w in silence.chunks(480 * 2) {
+            mm.feed(w);
+            mm.refresh_display(2.5);
+        }
+        assert!(
+            mm.line_db.iter().all(|&x| x < -150.0),
+            "pure silence must ride the floor, got peak {:?}",
+            v185_peak(&mm.line_db)
+        );
+        // One broadband click block (~2.5 ms of noise) -> the 341 ms
+        // window now contains it -> the SAME refresh must already show
+        // it. A temporal smoother would still print silence here.
+        let mut click: Vec<f32> = Vec::with_capacity(480 * 2);
+        for _ in 0..120 {
+            let v = 0.5 * v185_lcg(&mut seed);
+            click.push(v);
+            click.push(v);
+        }
+        for _ in 120..480 {
+            click.push(0.0);
+            click.push(0.0);
+        }
+        mm.feed(&click);
+        mm.refresh_display(2.5);
+        let (lp, _) = v185_peak(&mm.line_db);
+        assert!(lp > -55.0, "click not visible on the FIRST frame after arrival: {lp}");
+        let (rp, _) = v185_peak(&mm.disp_db);
+        assert!(lp > rp - 24.0, "smoothed click peak {lp} vs raw {rp}");
+    }
+
+    /// Kernel laws (single home `Spectrum::smooth_log`): a constant field
+    /// is a fixed point; a lone spike smears SYMMETRICALLY and its centre
+    /// keeps the full windowed power (a single-cell peak at weight 14/196
+    /// is the theoretical dilution, not an erasure); the floor field
+    /// stays at the floor (power averaging adds nothing from silence).
+    #[test]
+    fn v185_smooth_kernel_constant_field_and_symmetry() {
+        let mut s = Spectrum::new(48_000);
+        let mut out: Vec<f32> = Vec::new();
+        let flat: Vec<f32> = vec![-63.5; DISPLAY_POINTS];
+        s.smooth_log(&flat, &mut out);
+        for &x in &out {
+            assert!((x + 63.5).abs() < 1e-3, "constant field is a fixed point: {x}");
+        }
+        let floor: Vec<f32> = vec![-240.0; DISPLAY_POINTS];
+        s.smooth_log(&floor, &mut out);
+        for &x in &out {
+            assert!((x + 240.0).abs() < 1e-2, "silence stays silence: {x}");
+        }
+        let mut spike = vec![-240.0f32; DISPLAY_POINTS];
+        spike[512] = -10.0;
+        s.smooth_log(&spike, &mut out);
+        assert_eq!(out.len(), DISPLAY_POINTS);
+        // Power-domain mean of a single weighted cell: the window sums
+        // 14/196 of the spike's power -> exactly -10 + 10*log10(14/196).
+        let centre = -10.0 + 10.0 * (14.0f32 / 196.0).log10();
+        assert!((out[512] - centre).abs() < 0.05, "centre spread {centre} vs {}", out[512]);
+        for k in 1..64 {
+            let (a, b) = (out[512 - k], out[512 + k]);
+            assert!((a - b).abs() < 1e-4, "asymmetric spread at k={k}: {a} vs {b}");
+        }
+        for k in [64usize, 200] {
+            assert!(out[512 - k] < centre - 20.0, "tail at k={k} too high: {}", out[512 - k]);
+        }
+    }
+
+    /// R4: POINTS data untouched — `disp_db`/`disp_pk` stay BIT-IDENTICAL
+    /// to a direct `resample_log` projection of the same analyzer state
+    /// (the LINE smoothing must never leak into the shared raw vectors).
+    #[test]
+    fn v185_disp_vectors_unchanged_by_smoothing() {
+        let mm = v185_pump_recorded_material(1.0);
+        let mut raw_db: Vec<f32> = Vec::new();
+        let mut raw_pk: Vec<f32> = Vec::new();
+        mm.spectrum.resample_log(DISPLAY_POINTS, SPEC_F_MIN, SPEC_F_MAX, &mut raw_db, &mut raw_pk);
+        assert_eq!(raw_db, mm.disp_db, "disp_db must equal the direct projection");
+        assert_eq!(raw_pk, mm.disp_pk, "disp_pk must equal the direct projection");
+        // And it is measurably NOT the smoothed vector (POINTS keeps the
+        // raw spiky look by contract).
+        assert_ne!(raw_db, mm.line_db);
     }
 }
