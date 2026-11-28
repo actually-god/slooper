@@ -1845,6 +1845,13 @@ pub struct App {
     /// the per-strip wheel hit-test; empty until the first mixer paint
     /// (a same-frame-first gesture then simply no-ops).
     mix_strip_rects: Vec<(usize, egui::Rect)>,
+    /// v184: LAST frame's docked-mixer panel rect (NOTHING while the
+    /// dock is hidden). The global wheel router in `ui_root` runs before
+    /// this frame's layout, so it yields shift+wheel to the mixer using
+    /// this one-frame-old rect — over the mix page (full-window view) or
+    /// over the docked strips, shift+wheel belongs to the mixer's
+    /// horizontal scroller, NOT to the (invisible/off-panel) timeline pan.
+    mix_panel_rect: egui::Rect,
     /// Per-track grid-block height in points (0 = automatic:
     /// `lanes × LANE_H`). The user drags the separation bar under a track
     /// to resize it; the mixer strip mirrors the same height.
@@ -2828,6 +2835,7 @@ impl App {
             mix_col_x: [0.0; MAX_LOOPS],
             mix_col_y: [0.0; MAX_LOOPS],
             mix_strip_rects: Vec::new(),
+            mix_panel_rect: egui::Rect::NOTHING,
             sel_clips: Vec::new(),
             sel_anchor: None,
             last_click_track: None,
@@ -20858,6 +20866,20 @@ impl App {
             }
         }
         // ---- global wheel routing (must run first thing in the frame) ----
+        // v184 (MIX-SCR-1): the router runs before any panel layout, so
+        // the mixer yield test uses LAST frame's mixer panel rect (the
+        // reset below re-seeds it from this frame's paint). Over the mix
+        // page — a full-window view where the grid is not even visible —
+        // or over the docked mixer strips, shift+wheel is the mixer's
+        // horizontal scroller; claiming it for the timeline there was a
+        // dead gesture (the mix-page hint has always promised it sideways).
+        let prev_mix_rect =
+            std::mem::replace(&mut self.mix_panel_rect, egui::Rect::NOTHING);
+        let over_mix = self.mix_tab
+            || ui
+                .ctx()
+                .pointer_hover_pos()
+                .is_some_and(|p| prev_mix_rect.contains(p));
         // Ctrl/Cmd+wheel zooms the timeline (same state as the zoom slider);
         // Shift+wheel pans it horizontally. egui turns MouseWheel into
         // smooth_scroll_delta (and its own interface zoom) while processing
@@ -20964,7 +20986,7 @@ impl App {
                         };
                         zoom_ln += (delta.y * s).clamp(-1.5, 1.5);
                         false
-                    } else if modifiers.shift {
+                    } else if modifiers.shift && !over_mix {
                         // Line-unit notches carry ~3 units per click; scale
                         // them so one notch pans a real chunk of the view
                         // (the old unscaled `delta * 2.0` moved ~6 px and
@@ -28041,6 +28063,10 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
     // flow-derived rect drifts between the passes — strips then
     // land ~1700 px below the panel.
     let base = ui.max_rect();
+    // v184 (MIX-SCR-1): publish this frame's panel rect for the wheel
+    // router's shift+wheel yield test (consumed NEXT frame — the router
+    // runs before layout).
+    app.mix_panel_rect = base;
     // v34 R6: the mixer shares the grid's vertical rhythm ONLY
     // while docked LEFT or RIGHT, where every strip must sit level
     // with its track row. Bottom-docked or floating it is an
@@ -72163,5 +72189,454 @@ mod tests {
             1,
             "the Alt slot renders from ONE place"
         );
+    }
+
+    // =====================================================================
+    // v184 (card t_ef31d00d / MIX-SCR-1): MIXER SCROLL MODE — LINKED moves
+    // every strip/column together (historic default); PER-STRIP moves only
+    // the strip/column under the cursor. Mix page columns: horizontal
+    // always, vertical when a short page clips content. Docked strips:
+    // horizontal (narrow-dock tail). Contracts: one seam (state+save+echo),
+    // one header toggle site, config round-trip + boot apply, MCP LIVE.
+    // =====================================================================
+
+    /// v184 helper: full-frame at a CUSTOM viewport (the v182 topbar-floor
+    /// trick, generalised) — drives the real ui_root at any window size.
+    fn v184_vp(app: &mut App, ctx: &egui::Context, w: f32, h: f32, events: Vec<egui::Event>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, h))),
+            time: Some(test_time()),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        let prims = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        drop(prims);
+        out.textures_delta.clear();
+    }
+
+    /// v184 helper: pointer-at + PIXELS-wheel in one frame (trackpad
+    /// semantics: the router only claims ctrl/cmd/shift — plain x/y reach
+    /// the panels untouched).
+    fn v184_wheel(
+        px: f32,
+        py: f32,
+        dx: f32,
+        dy: f32,
+        shift: bool,
+    ) -> Vec<egui::Event> {
+        vec![
+            moved(egui::pos2(px, py)),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(dx, dy),
+                phase: egui::TouchPhase::Move,
+                modifiers: if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE },
+            },
+        ]
+    }
+
+    /// v184 helper: open the mix page (the F9 seam) and settle.
+    fn v184_mix_open(app: &mut App, ctx: &egui::Context) {
+        frame(app, ctx, vec![]);
+        frame_keys(
+            app,
+            ctx,
+            vec![
+                key_ev(egui::Key::F9, egui::Modifiers::NONE),
+                egui::Event::Key {
+                    key: egui::Key::F9,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: Default::default(),
+                },
+            ],
+        );
+        frame(app, ctx, vec![]);
+        frame(app, ctx, vec![]);
+        assert!(app.mix_tab, "F9 opened the mix page");
+    }
+
+    /// v184 helper: painted column x-positions from the pin geometry table
+    /// (index-addressable; NOTHING = scrolled out).
+    fn v184_head_xs(app: &App) -> Vec<(usize, f32)> {
+        app.mix_geom
+            .head
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| **r != egui::Rect::NOTHING)
+            .map(|(t, r)| (t, r.min.x))
+            .collect()
+    }
+
+    fn v184_head_tops(app: &App) -> Vec<(usize, f32)> {
+        app.mix_geom
+            .head
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| **r != egui::Rect::NOTHING)
+            .map(|(t, r)| (t, r.min.y))
+            .collect()
+    }
+
+    /// R1: the toggle paints ONCE in the mix-page header, flips through the
+    /// ONE seam (label + echo + config), and SETTINGS mirrors the choice.
+    #[test]
+    fn v184_scroll_toggle_header() {
+        let mut app = headless_app("v184tog");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        v184_mix_open(&mut app, &ctx);
+        // ONE render site: the label exists, and only once.
+        let g = galleys_all(&mut app, &ctx, "scroll: linked");
+        assert_eq!(g.len(), 1, "the toggle paints from ONE header site");
+        assert!(app.mixer_scroll_linked, "default is LINKED");
+        // Fresh probe, then click (v82/v181 freshness law).
+        let p = galley_centers(&mut app, &ctx, "scroll: linked", true);
+        click_pt(&mut app, &ctx, *p.first().expect("toggle galley"));
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(!app.mixer_scroll_linked, "the click flipped the mode");
+        assert!(
+            app.status.contains("mixer scroll: per-strip"),
+            "the flip echoes the NEW mode: {:?}",
+            app.status
+        );
+        let g2 = galleys_all(&mut app, &ctx, "scroll: per-strip");
+        assert_eq!(g2.len(), 1, "the label now reads per-strip (reserved slot)");
+        assert!(
+            !crate::config::Config::load().mixer_scroll_linked,
+            "the seam persisted the flip"
+        );
+        // SETTINGS carries the searchable mirror.
+        app.show_settings = true;
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(
+            !galleys_all(&mut app, &ctx, "mixer scroll: all strips together").is_empty(),
+            "SETTINGS mirrors the mode"
+        );
+        // Flip back: the shared-position echo names LINKED again.
+        let p2 = galley_centers(&mut app, &ctx, "scroll: per-strip", true);
+        click_pt(&mut app, &ctx, *p2.first().expect("toggle galley (flipped)"));
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.mixer_scroll_linked, "click flips back");
+        assert!(
+            app.status.contains("mixer scroll: linked"),
+            "the flip-back echoes the NEW mode: {:?}",
+            app.status
+        );
+    }
+
+    /// R2: LINKED — one sideways gesture moves EVERY visible column by the
+    /// same delta (the historic shared page scroll, now under a pin).
+    #[test]
+    fn v184_scroll_linked_columns_move_together() {
+        let mut app = headless_app("v184lnk");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        app.n_tracks = 12; // overflow: 12 columns never fit the central page
+        v184_mix_open(&mut app, &ctx);
+        let x0 = v184_head_xs(&app);
+        assert!(x0.len() >= 3, "several columns painted: {x0:?}");
+        // Trackpad-swipe LEFT over column 1 (s.x negative = scroll right).
+        let c1 = app.mix_geom.head[1];
+        frame(&mut app, &ctx, v184_wheel(c1.center().x, c1.center().y, -120.0, 0.0, false));
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let x1 = v184_head_xs(&app);
+        assert_eq!(x0.len(), x1.len());
+        let mut shifts = Vec::new();
+        for ((t, a), (_, b)) in x0.iter().zip(&x1) {
+            shifts.push((t, a - b));
+            assert!(a - b > 5.0, "col {t} did not move: {a} -> {b}");
+        }
+        let d0 = shifts[0].1;
+        for (t, d) in &shifts {
+            assert!((d - d0).abs() < 0.6, "col {t} moved {d:.1}, not together ({d0:.1})");
+        }
+        assert!(app.mix_col_x.iter().all(|v| v.abs() < 0.01), "LINKED never writes per-column tables");
+    }
+
+    /// R3: PER-STRIP — the same gesture over ONE column moves ONLY it; the
+    /// shared page offset stays frozen (switching back restores it).
+    #[test]
+    fn v184_scroll_independent_moves_only_cursor_column() {
+        let mut app = headless_app("v184ind");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        app.n_tracks = 12;
+        v184_mix_open(&mut app, &ctx);
+        app.set_mixer_scroll_linked(false);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let x0 = v184_head_xs(&app);
+        let c1 = app.mix_geom.head[1];
+        frame(&mut app, &ctx, v184_wheel(c1.center().x, c1.center().y, -120.0, 0.0, false));
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let x1 = v184_head_xs(&app);
+        let moved: Vec<usize> = x0
+            .iter()
+            .zip(&x1)
+            .filter(|((_, a), (_, b))| (a - b).abs() > 0.6)
+            .map(|((t, _), _)| *t)
+            .collect();
+        assert_eq!(moved, vec![1], "only the cursor column moved: {moved:?}");
+        assert!(app.mix_hscroll.abs() < 0.01, "PER-STRIP never touches the shared page offset");
+        // Mode switch back: the linked position ignores the per-column
+        // offset entirely (col1 snaps right of its per-strip spot) and
+        // the per-column offset survives untouched. (Comparing exact x
+        // against the pre-gesture frame is NOT stable: egui's
+        // smooth_scroll_delta decays exponentially after the injected
+        // wheel and the v99-inherited read re-applies the residue for a
+        // few frames — the LINKED shared offset drifts a little before
+        // settling, so assert the RELATIONSHIP, not the absolute.)
+        app.set_mixer_scroll_linked(true);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let x2 = v184_head_xs(&app);
+        assert!(x2[1].1 > x1[1].1 + 5.0, "linked ignores the per-strip offset: {} -> {}", x1[1].1, x2[1].1);
+        assert!(app.mix_col_x[1] > 5.0, "the per-strip offset survived the mode switch");
+    }
+
+    /// v184 helper: narrow the RIGHT dock to 260 pt (a strip's natural
+    /// content is 375) and prove the scene really overflows.
+    fn v184_dock_narrow(app: &mut App, ctx: &egui::Context) {
+        app.side_wins.mixer[2] = 260.0;
+        for _ in 0..3 {
+            frame(app, ctx, vec![]);
+        }
+        assert!(
+            !app.mix_panel_rect.is_negative(),
+            "the docked mixer painted its panel rect"
+        );
+        assert!(
+            app.mix_panel_rect.width() < 375.0,
+            "the scene must overflow for the horizontal axis: {:.1}",
+            app.mix_panel_rect.width()
+        );
+    }
+
+    /// v184 helper: is strip `t`'s tail `on` button currently painted
+    /// inside its band? (The band table is panel-space and x-invariant.)
+    fn v184_strip_tail(app: &mut App, ctx: &egui::Context, t: usize) -> bool {
+        let band = app.mix_strip_rects[t].1;
+        galley_centers(app, ctx, "on", true)
+            .into_iter()
+            .any(|c| band.contains(c))
+    }
+
+    /// R2: LINKED dock strips — a sideways gesture slides EVERY strip's
+    /// content together under the panel clip. Measure: the header row's
+    /// `on` button sits at the natural-width tail (~x 321 of 375) — while
+    /// the panel is 243 wide it is clipped out; a scroll of 100 reveals it
+    /// in EVERY strip's band at once (shared mix_scroll_x).
+    #[test]
+    fn v184_dock_strip_hscroll_linked() {
+        let mut app = headless_app("v184dkl");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        v184_dock_narrow(&mut app, &ctx);
+        assert!(
+            !v184_strip_tail(&mut app, &ctx, 0) && !v184_strip_tail(&mut app, &ctx, 1),
+            "the tail button starts clipped out"
+        );
+        let band = app.mix_strip_rects[1].1;
+        frame(&mut app, &ctx, v184_wheel(band.center().x, band.center().y, -100.0, 0.0, false));
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(v184_strip_tail(&mut app, &ctx, 0), "strip 1's tail revealed");
+        assert!(v184_strip_tail(&mut app, &ctx, 1), "strip 2's tail revealed");
+        assert!(app.mix_strip_off.iter().all(|v| v.abs() < 0.01), "LINKED never writes per-strip tables");
+    }
+
+    /// R3: PER-STRIP dock — only the strip under the cursor reveals its
+    /// tail; the others stay clipped (hit-test by last-frame band).
+    #[test]
+    fn v184_dock_strip_hscroll_per_strip() {
+        let mut app = headless_app("v184dkp");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        v184_dock_narrow(&mut app, &ctx);
+        app.set_mixer_scroll_linked(false);
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let band = app.mix_strip_rects[1].1;
+        frame(&mut app, &ctx, v184_wheel(band.center().x, band.center().y, -100.0, 0.0, false));
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(v184_strip_tail(&mut app, &ctx, 1), "the cursor strip revealed its tail");
+        assert!(!v184_strip_tail(&mut app, &ctx, 2), "the other strip stayed clipped");
+        assert!(app.mix_scroll_x.abs() < 0.01, "PER-STRIP never writes the shared offset");
+    }
+
+    /// R2/R3 vertical ("where applicable"): a SHORT mix page lets the wheel
+    /// scroll column content — LINKED moves all together, PER-STRIP the
+    /// cursor column only; a tall page pins the axis at 0 (negative
+    /// control) and shrinking back... wait: resizing back to tall CLAMPS the
+    /// offsets to 0 — asserted too.
+    #[test]
+    fn v184_mix_col_vscroll_short_page() {
+        let mut app = headless_app("v184vy");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        app.mix_tab = true;
+        // Short viewport: content min height is MIX_COL_MIN_H (256).
+        for _ in 0..3 {
+            v184_vp(&mut app, &ctx, 1440.0, 300.0, vec![]);
+        }
+        let t0 = v184_head_tops(&app);
+        assert!(t0.len() >= 2, "columns painted at h=300");
+        v184_vp(&mut app, &ctx, 1440.0, 300.0, v184_wheel(120.0, 200.0, 0.0, -80.0, false));
+        v184_vp(&mut app, &ctx, 1440.0, 300.0, vec![]);
+        v184_vp(&mut app, &ctx, 1440.0, 300.0, vec![]);
+        let t1 = v184_head_tops(&app);
+        let d0 = t0[0].1 - t1[0].1;
+        assert!(d0 > 5.0, "the short page scrolled up: {d0:.1}");
+        for ((t, a), (_, b)) in t0.iter().zip(&t1) {
+            let d = a - b;
+            assert!((d - d0).abs() < 0.6, "LINKED scrolled all columns together: {d:.1} vs {d0:.1} (col {t})");
+        }
+        // Tall viewport: overflow clamps to 0 — the offsets reset and the
+        // plain wheel is a NO-OP (negative control).
+        app.n_tracks = 12;
+        for _ in 0..3 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert_eq!(app.mix_page_y, 0.0, "a tall page pins the vertical axis at 0");
+        let t2 = v184_head_tops(&app);
+        frame(&mut app, &ctx, v184_wheel(120.0, 200.0, 0.0, -80.0, false));
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        let t3 = v184_head_tops(&app);
+        for ((t, a), (_, b)) in t2.iter().zip(&t3) {
+            assert!((a - b).abs() < 0.6, "wheel on a tall page moved col {t}: {a} -> {b}");
+        }
+        // PER-STRIP on the short page: only the cursor column slides.
+        app.set_mixer_scroll_linked(false);
+        for _ in 0..3 {
+            v184_vp(&mut app, &ctx, 1440.0, 300.0, vec![]);
+        }
+        let u0 = v184_head_tops(&app);
+        let cx = app.mix_geom.head[0].center().x;
+        v184_vp(&mut app, &ctx, 1440.0, 300.0, v184_wheel(cx, 200.0, 0.0, -80.0, false));
+        v184_vp(&mut app, &ctx, 1440.0, 300.0, vec![]);
+        let u1 = v184_head_tops(&app);
+        assert!(u0[0].1 - u1[0].1 > 5.0, "the cursor column slid up");
+        assert!((u0[1].1 - u1[1].1).abs() < 0.6, "the other column froze");
+    }
+
+    /// R1/router: shift+wheel is the mixer's sideways scroller over the
+    /// mix page (the global router must YIELD, not claim it for timeline
+    /// pan) — and still pans the timeline everywhere else.
+    #[test]
+    fn v184_shift_wheel_router_yields_to_mixer() {
+        let mut app = headless_app("v184sw");
+        let ctx = egui::Context::default();
+        clear_canvas(&mut app);
+        app.show_master = false;
+        app.n_tracks = 12;
+        v184_mix_open(&mut app, &ctx);
+        let (h0, g0) = (app.mix_hscroll, app.hscroll);
+        let c1 = app.mix_geom.head[1];
+        let shift_line = |dy: f32| {
+            vec![
+                moved(egui::pos2(c1.center().x, c1.center().y)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, dy),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::SHIFT,
+                },
+            ]
+        };
+        frame(&mut app, &ctx, shift_line(-3.0));
+        for _ in 0..2 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(
+            app.mix_hscroll > h0 + 5.0,
+            "shift+wheel scrolls the mix page sideways: {} -> {}",
+            h0,
+            app.mix_hscroll
+        );
+        assert!(
+            (app.hscroll - g0).abs() < 0.01,
+            "the router must not steal it for timeline pan: {g0} -> {}",
+            app.hscroll
+        );
+        // Negative control: the identical gesture over the GRID still pans.
+        let mut app2 = headless_app("v184swg");
+        let ctx2 = egui::Context::default();
+        frame(&mut app2, &ctx2, vec![]);
+        frame(&mut app2, &ctx2, vec![]);
+        let g = app2.hscroll;
+        frame(
+            &mut app2,
+            &ctx2,
+            vec![
+                moved(egui::pos2(500.0, 400.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -3.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::SHIFT,
+                },
+            ],
+        );
+        frame(&mut app2, &ctx2, vec![]);
+        assert!(app2.hscroll > g + 1.0, "shift+wheel over the grid still pans the timeline");
+    }
+
+    /// R4: the choice round-trips through Config and a FRESH app boots in
+    /// the persisted mode (the card's apply-on-next-boot criterion).
+    #[test]
+    fn v184_scroll_mode_config_roundtrip() {
+        let mut app = headless_app("v184rt");
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.set_mixer_scroll_linked(false), "seam reports a real change");
+        assert!(!app.set_mixer_scroll_linked(false), "same-state click is a no-op");
+        let cfg = crate::config::Config::load();
+        assert!(!cfg.mixer_scroll_linked, "the seam saved the mode");
+        drop(app);
+        let mut app2 = App::new(Backend::start());
+        assert!(!app2.mixer_scroll_linked, "boot applies the persisted mode");
+        drop(app2);
+    }
+
+    /// R4: the field is MCP-LIVE (settings.set applies it through the GUI's
+    /// own arm — the v108 classification contract).
+    #[test]
+    fn v184_scroll_mode_mcp_live() {
+        assert!(
+            crate::mcp_settings::LIVE.contains(&"mixer_scroll_linked"),
+            "the new Config field must be LIVE-classified"
+        );
+        let mut app = headless_app("v184mcp");
+        let mut cfg = crate::config::Config::default();
+        cfg.mixer_scroll_linked = false;
+        app.mcp_apply_setting("mixer_scroll_linked", &cfg).expect("mixer_scroll_linked is live-listed");
+        assert!(!app.mixer_scroll_linked, "settings.set applied it live");
     }
 }
