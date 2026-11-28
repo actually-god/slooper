@@ -268,6 +268,8 @@ slooper.desktop  freedesktop menu entry
 docs/           INSTALL.md, USAGE.md, PLUGINS.md, EFFECT-SUITE.md,
                 SIDECHAIN.md, SAMPLER-PITCH.md, MCP.md (human docs),
                 MCP-DESIGN.md (the MCP series design spine),
+                MIXER-ROUTING.md / SAMPLER-XFADE.md (series design
+                spines — binding law for their card series),
                 WINDOWS-PORT.md (the W-series port log), host-notes.md
                 (maintainer-machine plugin lore — NOT user docs), this file.
                 Tutorials live in the GitHub wiki
