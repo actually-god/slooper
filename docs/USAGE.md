@@ -100,7 +100,15 @@ REC and mute, **vertical vol / gain faders** with dB readouts, a pan
 slider, the **FX** and **♪ synth** chips, and the two **send / s-pan**
 rows used by [sidechain routing](#sidechain-sends). **Shift + wheel**
 (or the trackpad sideways) scrolls the page across columns when they
-don't all fit. The mixer dock stays live beside the page and the grid
+don't all fit — and on a short page the plain wheel also scrolls column
+content vertically. A **scroll:** header button toggles the scroll
+**mode**: **linked** (the default — every column or strip moves
+together) or **per-strip** (only the column/strip under the cursor
+moves; the others hold their place). The mode also governs the mixer
+dock: a dock too narrow for a strip's full row scrolls its clipped tail
+into view — all strips together, or just the one under the cursor. The
+choice is remembered across restarts (Settings carries the mirrored
+checkbox). The mixer dock stays live beside the page and the grid
 is untouched underneath — everything is where you left it — and there
 is deliberately **no master column**: master volume and meters live
 only in [Master out](#master-out--loudness). The view is session state
@@ -544,7 +552,9 @@ plugin/effect parameters, grid tempo, …):
   stops.
 - **Zoom & scroll**: **Ctrl + mouse wheel** zooms the timeline (~12 % per
   notch, same state as the grid-toolbar zoom slider), **Shift + mouse
-  wheel** pans horizontally, plain wheel scrolls the track stack vertically.
+  wheel** pans horizontally, plain wheel scrolls the track stack
+  vertically (over the mix page or the docked mixer, **Shift + wheel**
+  belongs to the mixer's own scroller instead).
   (These gestures are intercepted at the top of the frame — egui's own
   Ctrl+wheel interface zoom is pinned back to the GUI-scale setting every
   frame.) The zoom slider is **logarithmic**: at the far-left floor
