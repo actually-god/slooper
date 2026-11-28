@@ -101,6 +101,14 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **Releasing a sampler key stops only that note.** Held several keys on
+  a sampler track and lifting one changed nothing — every note kept
+  playing until the LAST key came up, then they all died together. Each
+  key now owns its release: the note fades out over a short ~0.3 s
+  envelope while the other held notes carry on. Hammering one key
+  (retriggering before releasing) keeps the newest note sounding through
+  the older key-ups, and the fade is identical live and in exported
+  audio.
 - **A rubber-band drag now selects across tracks.** Dragging from one
   track's lane down through another used to select only clips in the
   lane where the drag started. The box now collects every lane it

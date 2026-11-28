@@ -3467,4 +3467,129 @@ pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC_V2 }
         }
         assert!(rows.last().unwrap().1 > 23.9, "bend reaches +23.99 st — UNCLAMPED");
     }
+
+    // ===================== v183 acceptance pins (SAMP-NOTE-1) =====================
+    //
+    // The bundled sampler used to ignore note_off entirely ("one-shots
+    // ring out"), so with several keys held EVERY note rang to buffer end
+    // — releasing one key changed nothing (card t_a5130261). These pins
+    // render the REAL script and assert per-note release: releasing note A
+    // decays A's voices (exponential gain ramp, tau = 50 ms, silence at
+    // rel < 1e-3 ≈ 345 ms) while B sustains untouched; voice identity is
+    // (ch, note) + a per-note_on press id, so a retrigger's off releases
+    // the OLDEST press of that key and never the newest one.
+
+    /// Long host tones (2.5 s) so a late window can only go quiet via a
+    /// release — buffer end would need 2.5 s (v51_tones are 100 ms).
+    fn v183_tones() {
+        let mk = |f: f64| -> Arc<[f32]> {
+            (0..120_000)
+                .map(|i| (i as f64 * std::f64::consts::TAU * f / 48000.0).sin() as f32 * 0.5)
+                .collect()
+        };
+        set_host_assets(Arc::new(vec![mk(200.0), mk(800.0)]), 48_000);
+    }
+
+    fn v183_render(inst: &Arc<Instance>, ev: &mut [(u64, u8, u8, u8, u8)], len: usize) -> Vec<f32> {
+        let mut out = vec![0f32; len];
+        crate::audio::render_midi_events(inst, ev, 0, len, &mut out);
+        out
+    }
+
+    #[test]
+    fn v183_sampler_note_off_releases_only_that_note() {
+        let reg = v51_registry();
+        v183_tones();
+        let inst = v51_sampler(&reg);
+        inst.set_map(&[(0, 60, 127), (1, 64, 127)], 0);
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![
+            (0, 3, 0, 60, 110),
+            (0, 3, 0, 64, 110),
+            (9_600, 0, 0, 60, 0), // release A at 200 ms
+        ];
+        let x = v183_render(&inst, &mut ev, 48_000);
+        let lp = |f: f64, a: usize, b: usize| line_power(&x, f, 48000.0, a, b);
+        // Before the off both zones sound.
+        let (a1, b1) = (lp(200.0, 4_800, 9_600), lp(800.0, 4_800, 9_600));
+        assert!(a1 > 5e4 && b1 > 5e4, "both notes must sound before the off: {a1} {b1}");
+        // 150–250 ms after the off: B unchanged, A decaying hard.
+        let (a2, b2) = (lp(200.0, 16_800, 21_600), lp(800.0, 16_800, 21_600));
+        assert!(b2 > b1 / 2.0 && b2 < b1 * 2.0, "B must sustain unaffected: {b1} -> {b2}");
+        assert!(a2 < a1 / 20.0 && a2 < b2 / 25.0, "A must release while B sustains: {a1} -> {a2} (b {b2})");
+        // 500–600 ms after the off: A's release envelope is over.
+        let (a3, b3) = (lp(200.0, 36_000, 40_800), lp(800.0, 36_000, 40_800));
+        assert!(b3 > 5e4, "B still sounds late (it never offs): {b3}");
+        assert!(a3 < b3 / 100.0 && a3 < 50.0, "A must be gone within its release: {a3} vs {b3}");
+    }
+
+    #[test]
+    fn v183_sampler_retrigger_off_keeps_newest_voice() {
+        let reg = v51_registry();
+        v183_tones();
+        let inst = v51_sampler(&reg);
+        // One key (ch 0, note 60) pressed twice; velocity layers give the
+        // presses distinct FREQUENCIES (vel 64 -> 200 Hz, vel 112 -> 800
+        // Hz), so the probe windows read exactly which press the first
+        // key-up released — energy-only windows are blind to a LIFO bug
+        // (the released voice's fade tail masks the wrong survivor).
+        inst.set_map(&[(0, 60, 64), (1, 60, 112)], 0);
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![
+            (0, 3, 0, 60, 64),      // press 1 -> 200 Hz
+            (4_800, 3, 0, 60, 112), // press 2 (retrigger, no off between) -> 800 Hz
+            (14_400, 0, 0, 60, 0),  // first key-up -> releases press 1 ONLY
+            (45_600, 0, 0, 60, 0),  // second key-up -> releases press 2
+        ];
+        let x = v183_render(&inst, &mut ev, 72_000);
+        let lp = |f: f64, a: usize, b: usize| line_power(&x, f, 48000.0, a, b);
+        let p2 = lp(200.0, 7_200, 9_600);
+        let p8 = lp(800.0, 7_200, 9_600);
+        assert!(p2 > 5e4 && p8 > 5e4, "both presses must sound before the offs: {p2} {p8}");
+        // Probe starts 19.2k frames after the first off (its release
+        // floor kills the dead press by 16.6k): press 2 (800 Hz) still
+        // plays at FULL level, press 1 (200 Hz) is gone. A LIFO release
+        // would show the exact opposite — the defect this criterion bans.
+        let q2 = lp(200.0, 33_600, 38_400);
+        let q8 = lp(800.0, 33_600, 38_400);
+        assert!(q8 > 5e4, "the retriggered press must survive the first key-up: {q8}");
+        assert!(q2 < 50.0, "the first key-up must release the OLDEST press of the key: {q2}");
+        // Second key-up ends the newest press; after the full ramp, gone.
+        let r8 = lp(800.0, 64_800, 69_600);
+        assert!(r8 < 50.0, "second key-up must end the newest voice: {r8}");
+    }
+
+    #[test]
+    fn v183_sampler_note_off_tracks_channel() {
+        let reg = v51_registry();
+        v183_tones();
+        let inst = v51_sampler(&reg);
+        // Same root key, two velocity LAYERS: ch-0 plays with vel 64 ->
+        // the 200 Hz asset; ch-1 plays with vel 112 -> the 800 Hz asset.
+        // Frequency identity survives release tails: which LINE died
+        // says exactly which press the key-up released.
+        inst.set_map(&[(0, 60, 64), (1, 60, 112)], 0);
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![
+            (0, 3, 0, 60, 64),     // ch 0 press -> 200 Hz
+            (4_800, 3, 1, 60, 112), // ch 1 press -> 800 Hz (same note!)
+            (14_400, 0, 1, 60, 0), // release the ch-1 key (NEWER press)
+            (45_600, 0, 0, 60, 0), // release the ch-0 key
+        ];
+        let x = v183_render(&inst, &mut ev, 72_000);
+        let lp = |f: f64, a: usize, b: usize| line_power(&x, f, 48000.0, a, b);
+        let p2 = lp(200.0, 7_200, 9_600);
+        let p8 = lp(800.0, 7_200, 9_600);
+        assert!(p2 > 5e4 && p8 > 5e4, "both layers must sound before the offs: {p2} {p8}");
+        // Window starts 18.2k frames after the ch-1 off (release floor
+        // kills that voice by 16.6k): the 800 Hz LINE is gone while the
+        // 200 Hz line — SAME note, other channel — still plays at full
+        // level. A ch-blind matcher would have released the OLDEST
+        // press (ch 0!) and read the opposite.
+        let q2 = lp(200.0, 33_600, 38_400);
+        let q8 = lp(800.0, 33_600, 38_400);
+        assert!(q2 > 5e4, "the ch-0 voice (same note!) must live through the ch-1 off: {q2}");
+        assert!(q8 < 50.0, "the ch-1 voice must be released by its own key: {q8}");
+        // After the ch-0 off (+ its full release ramp) everything is gone.
+        let r2 = lp(200.0, 64_800, 69_600);
+        let r8 = lp(800.0, 64_800, 69_600);
+        assert!(r2 < 50.0 && r8 < 50.0, "both offs must end the instrument: {r2} {r8}");
+    }
 }
