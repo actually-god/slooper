@@ -3496,6 +3496,24 @@ pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC_V2 }
         out
     }
 
+    /// asset0 = 200 Hz whose amplitude STEPS to 1/10th at frame 15_600,
+    /// asset1 = flat 800 Hz. A voice started at frame 0 is fully in the
+    /// quiet half during the probe window 16_800..21_600, while a voice
+    /// started at 4800 still has ~3/4 of its samples in the loud half —
+    /// so the window measures WHICH press survived, not just energy.
+    fn v183_step_tones() {
+        let a0: Arc<[f32]> = (0..120_000)
+            .map(|i| {
+                let env = if i < 15_600 { 1.0 } else { 0.1 };
+                ((i as f64 * std::f64::consts::TAU * 200.0 / 48000.0).sin() * (0.5 * env)) as f32
+            })
+            .collect();
+        let a1: Arc<[f32]> = (0..120_000)
+            .map(|i| (i as f64 * std::f64::consts::TAU * 800.0 / 48000.0).sin() as f32 * 0.5)
+            .collect();
+        set_host_assets(Arc::new(vec![a0, a1]), 48_000);
+    }
+
     #[test]
     fn v183_sampler_note_off_releases_only_that_note() {
         let reg = v51_registry();
@@ -3525,20 +3543,28 @@ pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC_V2 }
     #[test]
     fn v183_sampler_retrigger_off_keeps_newest_voice() {
         let reg = v51_registry();
-        v183_tones();
+        v183_step_tones();
         let inst = v51_sampler(&reg);
         inst.set_map(&[(0, 60, 127)], 0);
         let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![
-            (0, 3, 0, 60, 110),     // press 1
+            (0, 3, 0, 60, 110),     // press 1 (its buffer pos == render frame)
             (4_800, 3, 0, 60, 110), // press 2 (retrigger, no off between)
             (14_400, 0, 0, 60, 0),  // first key-up -> releases press 1 ONLY
             (24_000, 0, 0, 60, 0),  // second key-up -> releases press 2
         ];
         let x = v183_render(&inst, &mut ev, 48_000);
         let lp = |f: f64, a: usize, b: usize| line_power(&x, f, 48000.0, a, b);
-        // After the FIRST off the newest voice must still sound.
+        // After the FIRST off the sound must be the NEWEST voice: its
+        // buffer pos runs 12_000..16_800 across the probe window (mostly
+        // above the loud threshold) -> loud reading. If instead the
+        // OLDEST voice survived (LIFO — the newest got cut, the exact
+        // defect this criterion bans), its pos runs 16_800..21_600, deep
+        // in the 1/10th-amp half -> power collapses by >100x.
         let after1 = lp(200.0, 16_800, 21_600);
-        assert!(after1 > 5e4, "retriggered voice must survive the first off: {after1}");
+        assert!(
+            after1 > 5e4,
+            "the retriggered voice must survive the first off (old voice surviving measures ~1e4): {after1}"
+        );
         // After BOTH offs it is gone (250–350 ms into the release ramp).
         let after2 = lp(200.0, 36_000, 40_800);
         assert!(after2 < 50.0, "second off must end the newest voice: {after2}");
@@ -3547,24 +3573,32 @@ pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC_V2 }
     #[test]
     fn v183_sampler_note_off_tracks_channel() {
         let reg = v51_registry();
-        v183_tones();
+        v183_step_tones();
         let inst = v51_sampler(&reg);
         inst.set_map(&[(0, 60, 127)], 0);
         let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![
-            (0, 3, 0, 60, 110),
-            (0, 3, 1, 60, 110),     // SAME note, other channel = own voice
-            (14_400, 0, 0, 60, 0),  // release ch 0 only
-            (33_600, 0, 1, 60, 0),  // release ch 1
+            (0, 3, 0, 60, 110),     // ch 0 press (pos == frame: ages fast)
+            (4_800, 3, 1, 60, 110), // ch 1 press, SAME note (4800 behind)
+            (14_400, 0, 1, 60, 0),  // release the ch-1 key only
+            (33_600, 0, 0, 60, 0),  // release the ch-0 key
         ];
         let x = v183_render(&inst, &mut ev, 60_000);
         let lp = |f: f64, a: usize, b: usize| line_power(&x, f, 48000.0, a, b);
         let both = lp(200.0, 9_600, 14_400);
+        assert!(both > 5e4, "both channels must sound before any off: {both}");
+        // Window 16_800..21_600 distinguishes the survivor: the ch-0
+        // press (released? NO — it must live) is deep in the quiet half
+        // (~1e4), while a ch-blind implementation that released the
+        // OLDEST press instead (ch 0!) would show the loud ch-1 press
+        // (~6e5), and releasing both would show silence (~0).
         let one = lp(200.0, 16_800, 21_600);
-        assert!(both > 5e4 && one > 5e4, "the ch-1 voice must outlive the ch-0 off: both {both} one {one}");
-        // ch-1 off was at 33_600; window 40_800..45_600 is 150–250 ms
-        // after it — still inside the ramp, so assert only AFTER the full
-        // ramp: floor at 1e-3 kills the voice by 345 ms = 16_580 frames.
+        assert!(
+            one > 1e2 && one < 5e4,
+            "exactly the ch-0 voice must survive the ch-1 off, in its quiet half: {one}"
+        );
+        // ch-0 off was at 33_600; the ramp floor kills the voice by
+        // ~345 ms (16_580 frames) -> this window is fully silent.
         let none = lp(200.0, 55_200, 60_000);
-        assert!(none < 50.0, "the ch-1 off must end the last voice: {none}");
+        assert!(none < 50.0, "the ch-0 off must end the last voice: {none}");
     }
 }

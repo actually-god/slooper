@@ -1,5 +1,5 @@
 // ============================================================ slooper ==
-// slooper-synth-version: 9
+// slooper-synth-version: 10
 // sampler.rs — pitch-following audio-clip synthesizer (multi-sample).
 //
 // Plays ANY audio asset from the rack as an instrument. A note plays the
@@ -51,6 +51,15 @@
 // Slots pack `(asset << 16) | (velocity << 8) | root`.
 // ---------------------------------------------------------------------------
 
+// v183 (card t_a5130261) — PER-NOTE RELEASE: a key-up releases ITS OWN
+// note only. Voices carry (ch, note) + the press id of the note_on call
+// that started them; note_off fades the OLDEST still-audible press of
+// that key out as a group (crossfade can start up to 4 voices per press)
+// along an exponential gain ramp (tau = 50 ms; voice silent at
+// rel < 1e-3, ~345 ms), so retriggered presses (on-on-off) never lose
+// the newest voice to the earlier key-up. All other held keys sustain
+// untouched. all_off stays an instant kill (host safety net).
+
 // v106: MPE note pressure (poly_at) raises the pressured voice up to
 // +3.5 dB — the note still sounds normally at rest, like every older
 // slooper release (no pressure = the exact pre-v106 render).
@@ -59,6 +68,11 @@ include!("synth_api.rs");
 
 const VOICES: usize = 24;
 const MAX_SLOTS: usize = 64;
+
+/// v183: release-envelope time constant (seconds) and the gain floor at
+/// which a releasing voice is switched off (~345 ms after the key-up).
+const RELEASE_TAU: f64 = 0.05;
+const RELEASE_FLOOR: f64 = 1.0e-3;
 
 /// One cached rack asset copy (identity = host pointer + length, so a
 /// re-recorded/trimmed sample under the SAME id is picked up, v0.10 rule).
@@ -84,6 +98,11 @@ struct Voice {
     rate: f64,
     vel: f64,
     note: u8,
+    // v183: per-note release identity + envelope.
+    ch: u8,          // the channel this voice was played on
+    pid: u64,        // press id of the note_on CALL that started it
+    rel: f64,        // release gain (1.0 while held, ramps after off)
+    releasing: bool, // note_off fired for this voice's press
     press: f64,
     buf: std::rc::Rc<std::vec::Vec<f32>>,
 }
@@ -105,6 +124,9 @@ struct Sampler {
     mode: u32,
     cache: std::collections::BTreeMap<u32, Buf>,
     bend_st: f64, // v100: pitch bend (roll GLIDE lane), semitones
+    // v183: monotonic press id — one increment per note_on CALL; every
+    // voice that call starts shares it, which is what a key-up matches.
+    pid: u64,
     voices: [Voice; VOICES],
     next: usize,
 }
@@ -132,11 +154,16 @@ extern "C" fn create(sr: f64, host: *const SynthHostV1) -> *mut core::ffi::c_voi
             rate: 1.0,
             vel: 0.0,
             note: 0,
+            ch: 0,
+            pid: 0,
+            rel: 1.0,
+            releasing: false,
             press: 0.0,
             buf: std::rc::Rc::new(std::vec::Vec::new()),
         }),
         next: 0,
         bend_st: 0.0,
+        pid: 0,
     });
     Box::into_raw(s) as *mut core::ffi::c_void
 }
@@ -264,7 +291,9 @@ fn vel_gain(note_vel: u8, rec_vel: u8) -> f64 {
 }
 
 /// Start one voice on slot `idx` transposed to `note`, scaled by `w`.
-fn start_voice(s: &mut Sampler, idx: usize, note: u8, vel: u8, w: f64) {
+/// All voices started by ONE `note_on` call share its press id `pid` and
+/// the channel `ch` (v183 release identity).
+fn start_voice(s: &mut Sampler, idx: usize, ch: u8, note: u8, vel: u8, w: f64, pid: u64) {
     let slot = s.slots[idx];
     let buf = match s.cache.get(&slot.asset) {
         Some(b) if !b.data.is_empty() => b.data.clone(),
@@ -303,6 +332,10 @@ fn start_voice(s: &mut Sampler, idx: usize, note: u8, vel: u8, w: f64) {
     v.rate = ((2.0f64).powf(semis / 12.0) * native).clamp(0.0625, 16.0);
     v.vel = vel_gain(vel, slot.vel) * w;
     v.note = note;
+    v.ch = ch;
+    v.pid = pid;
+    v.rel = 1.0;
+    v.releasing = false;
     v.press = 0.0;
     v.buf = buf;
 }
@@ -364,11 +397,16 @@ fn crossfade_layers(s: &Sampler, i: usize, vel: u8) -> std::vec::Vec<(usize, f64
     }
 }
 
-extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
+extern "C" fn note_on(s: *mut core::ffi::c_void, ch: u8, note: u8, vel: u8) {
     if s.is_null() {
         return;
     }
     let sm = unsafe { &mut *(s as *mut Sampler) };
+    // v183: one press id per note_on CALL — every voice this call starts
+    // shares it, so a key-up can release the whole crossfade group and
+    // never touch a later retrigger of the same key.
+    sm.pid += 1;
+    let pid = sm.pid;
     // A map edited since the last block must answer THIS note (and the
     // very first note after a rebind may arrive before any process call —
     // the v0.10 "first note dropped" pin).
@@ -394,7 +432,7 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
             (Some(i), _) if (sm.slots[i].root - n).abs() < 1e-6 => {
                 for (j, w) in crossfade_layers(sm, i, vel) {
                     if w > 0.0 {
-                        start_voice(sm, j, note, vel, w);
+                        start_voice(sm, j, ch, note, vel, w, pid);
                     }
                 }
             }
@@ -408,27 +446,27 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
                 for (k, w) in crossfade_layers(sm, i, vel) {
                     let ww = (1.0 - w_hi) * w;
                     if ww > 0.0 {
-                        start_voice(sm, k, note, vel, ww);
+                        start_voice(sm, k, ch, note, vel, ww, pid);
                     }
                 }
                 for (k, w) in crossfade_layers(sm, j, vel) {
                     let ww = w_hi * w;
                     if ww > 0.0 {
-                        start_voice(sm, k, note, vel, ww);
+                        start_voice(sm, k, ch, note, vel, ww, pid);
                     }
                 }
             }
             (Some(i), None) => {
                 for (j, w) in crossfade_layers(sm, i, vel) {
                     if w > 0.0 {
-                        start_voice(sm, j, note, vel, w);
+                        start_voice(sm, j, ch, note, vel, w, pid);
                     }
                 }
             }
             (None, Some(j)) => {
                 for (j2, w) in crossfade_layers(sm, j, vel) {
                     if w > 0.0 {
-                        start_voice(sm, j2, note, vel, w);
+                        start_voice(sm, j2, ch, note, vel, w, pid);
                     }
                 }
             }
@@ -448,12 +486,35 @@ extern "C" fn note_on(s: *mut core::ffi::c_void, _ch: u8, note: u8, vel: u8) {
             }
         }
         let j = cutoff_layer(sm, best, vel);
-        start_voice(sm, j, note, vel, 1.0);
+        start_voice(sm, j, ch, note, vel, 1.0, pid);
     }
 }
 
-extern "C" fn note_off(_s: *mut core::ffi::c_void, _ch: u8, _note: u8) {
-    // One-shots ring out; note_off has nothing to release.
+extern "C" fn note_off(s: *mut core::ffi::c_void, ch: u8, note: u8) {
+    // v183 (card t_a5130261): release THIS key only. Match voices by
+    // (ch, note) and take the OLDEST press still audible on that key:
+    // a retrigger (on-on-off) must release the first press and leave
+    // the newest sounding. Every voice of the winning press releases
+    // together (crossfade starts up to 4 per note_on). The ramp itself
+    // runs in `process` — no clicks, no hard cut.
+    if s.is_null() {
+        return;
+    }
+    let sm = unsafe { &mut *(s as *mut Sampler) };
+    let mut target = u64::MAX;
+    for v in sm.voices.iter() {
+        if v.on && !v.releasing && v.ch == ch && v.note == note && v.pid < target {
+            target = v.pid;
+        }
+    }
+    if target == u64::MAX {
+        return; // no audible voice for this key (one-shot already ended)
+    }
+    for v in sm.voices.iter_mut() {
+        if v.on && v.ch == ch && v.note == note && v.pid == target {
+            v.releasing = true;
+        }
+    }
 }
 
 extern "C" fn all_off(s: *mut core::ffi::c_void) {
@@ -482,6 +543,21 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
         return;
     }
     let bend_ratio = (sm.bend_st * (1.0 / 12.0)).exp2(); // v100: glide lane
+    // v183: advance every releasing voice's gain ramp ONCE per block
+    // (RT-safe: fixed table walk, no alloc). 512 blocks at 48 kHz step
+    // by x0.81 — smooth, click-free.
+    if n > 0 {
+        let rel_mul = (-(n as f64) / (RELEASE_TAU * sm.sr)).exp();
+        for v in &mut sm.voices {
+            if v.on && v.releasing {
+                v.rel *= rel_mul;
+                if v.rel < RELEASE_FLOOR {
+                    v.on = false;
+                    v.releasing = false;
+                }
+            }
+        }
+    }
     for k in 0..n {
         let mut acc = 0.0f64;
         for v in &mut sm.voices {
@@ -497,7 +573,7 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
             let frac = v.pos - i as f64;
             let a = buf[i] as f64;
             let b = buf[i + 1] as f64;
-            acc += (a + (b - a) * frac) * v.vel * (1.0 + 0.5 * v.press);
+            acc += (a + (b - a) * frac) * v.vel * v.rel * (1.0 + 0.5 * v.press);
             v.pos += v.rate * bend_ratio;
             if v.pos > buf.len() as f64 - 1.0 {
                 v.on = false;
