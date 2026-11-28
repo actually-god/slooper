@@ -48314,7 +48314,7 @@ mod tests {
         let saved = cfg.drum.clone().expect("drum in session config");
         assert_eq!(saved.grid[1][7], 111);
         assert!(!cfg.show_drums);
-        let mut app2 = App::new(Backend::start());
+        let app2 = App::new(Backend::start());
         assert_eq!(app2.drum.grid[1][7], 111, "drum grid back from config");
         let pj = app.build_project("v29drum".into());
         let saved_p = pj.drum.as_ref().expect("drum in project");
@@ -72659,7 +72659,7 @@ mod tests {
         let cfg = crate::config::Config::load();
         assert!(!cfg.mixer_scroll_linked, "the seam saved the mode");
         drop(app);
-        let mut app2 = App::new(Backend::start());
+        let app2 = App::new(Backend::start());
         assert!(!app2.mixer_scroll_linked, "boot applies the persisted mode");
         drop(app2);
     }
@@ -72673,8 +72673,10 @@ mod tests {
             "the new Config field must be LIVE-classified"
         );
         let mut app = headless_app("v184mcp");
-        let mut cfg = crate::config::Config::default();
-        cfg.mixer_scroll_linked = false;
+        let cfg = crate::config::Config {
+            mixer_scroll_linked: false,
+            ..Default::default()
+        };
         app.mcp_apply_setting("mixer_scroll_linked", &cfg).expect("mixer_scroll_linked is live-listed");
         assert!(!app.mixer_scroll_linked, "settings.set applied it live");
     }
