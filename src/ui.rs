@@ -27292,17 +27292,26 @@ fn paint_spectrum(
             // v163 (card t_5cf0f288): the equal-per-octave display
             // projection lives in `MasterMeter::disp_db`/`disp_pk` — the
             // UI pump computes it ONCE per frame (`refresh_display`) and
-            // BOTH trace modes paint from those same vectors: identical
-            // data by construction, and this paint path allocates
+            // BOTH trace modes paint from that one seam: identical SOURCE
+            // by construction, and this paint path allocates
             // nothing (the old per-frame coldb/colpk scratch vecs lived
             // right here). v162 R2/R3 — equal-per-octave cells with
             // uniform on-screen spacing, max-hold + nearest-bin
             // fallback — is unchanged; it now happens upstream, once,
-            // not per mode.
+            // not per mode. v185 (card t_07b9213f): LINE additionally
+            // paints the smoothed COPY (`line_db`/`line_pk`) the same
+            // refresh_display seam fills — POINTS keeps the RAW
+            // projection (unchanged look), LINE stops rendering the raw
+            // max-hold spikes / sub-bin plateaus the spline only could
+            // faithfully reproduce.
             let npts = crate::meter::DISPLAY_POINTS;
-            if m.disp_db.len() == npts && m.disp_pk.len() == npts {
+            if m.disp_db.len() == npts
+                && m.disp_pk.len() == npts
+                && m.line_db.len() == npts
+                && m.line_pk.len() == npts
+            {
                 if line_mode {
-                    paint_trace_line(p, rect, &m.disp_db, &m.disp_pk, &y_of);
+                    paint_trace_line(p, rect, &m.line_db, &m.line_pk, &y_of);
                 } else {
                     paint_trace_points(p, rect, &m.disp_db, &m.disp_pk, &y_of);
                 }
@@ -27376,10 +27385,14 @@ fn paint_trace_points(
 }
 
 /// v163 (card t_5cf0f288) LINE mode: the trace is ONE continuous smooth
-/// curve through the SAME projection vectors — every display cell joins
-/// the curve (in silence it rides the floor), so it never reads as
+/// curve through the display projection — every display cell joins the
+/// curve (in silence it rides the floor), so it never reads as
 /// separate points. Peak hold rides the same rule as one pale continuous
-/// line. Catmull-Rom → cubic Bézier (see [`bezier_curve`]).
+/// line. Catmull-Rom → cubic Bézier (see [`bezier_curve`]). v185 (card
+/// t_07b9213f): the caller passes the SMOOTHED vectors (`line_db`/
+/// `line_pk`) — the spline stays exactly this; only its input data got
+/// the 1/12-octave log-domain smoothing (the raw max-hold projection was
+/// the source of the spiky/square look).
 fn paint_trace_line(
     p: &egui::Painter,
     rect: egui::Rect,
@@ -67343,16 +67356,19 @@ mod tests {
     /// R2: LINE mode paints ONE continuous smooth curve: exactly
     /// npts-1 cubic segments for the trace AND the same count for the
     /// peak hold, chained end-to-start (no breaks), passing THROUGH the
-    /// shared projection at every probed cell — and its interiors
+    /// LINE projection at every probed cell — and its interiors
     /// deviate from the chord midpoints (a Catmull-Rom curve, not a
     /// straight polyline: the sabotage "emit line segments" zeroes this
-    /// deviation).
+    /// deviation). v185 (card t_07b9213f) retarget: the knots ride the
+    /// smoothed `line_db` vector (LINE's source of record); the chain/
+    /// deviate law is unchanged.
     #[test]
     fn v163_line_mode_smooth_curve() {
         let npts = crate::meter::DISPLAY_POINTS;
         let rect = egui::Rect::from_min_max(egui::pos2(0.0, 40.0), egui::pos2(400.0, 140.0));
         let mm = v163_two_tone_meter();
         assert_eq!(mm.disp_db.len(), npts, "projection filled by refresh_display");
+        assert_eq!(mm.line_db.len(), npts, "LINE vector filled by refresh_display");
         let ctx = egui::Context::default();
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -67390,8 +67406,8 @@ mod tests {
         let xc = |i: usize| rect.min.x + (i as f32 + 0.5) * sw;
         let yc = |db: f32| rect.max.y - (db.max(-120.0) - -120.0) / 120.0 * rect.height();
         let mut loud = 0usize;
-        for (i, &d) in mm.disp_db.iter().enumerate() {
-            if d > mm.disp_db[loud] {
+        for (i, &d) in mm.line_db.iter().enumerate() {
+            if d > mm.line_db[loud] {
                 loud = i;
             }
         }
@@ -67399,14 +67415,14 @@ mod tests {
             let s = trace[i];
             assert!((s[0][0] - xc(i)).abs() < 1e-3, "seg {i} starts at its cell center x");
             assert!(
-                (s[0][1] - yc(mm.disp_db[i])).abs() < 0.01,
-                "seg {i} passes through the point (y of the SAME db data)"
+                (s[0][1] - yc(mm.line_db[i])).abs() < 0.01,
+                "seg {i} passes through the point (y of the smoothed LINE data)"
             );
         }
         let last = trace[npts - 2][3];
         assert!(
             (last[0] - xc(npts - 1)).abs() < 1e-3
-                && (last[1] - yc(mm.disp_db[npts - 1])).abs() < 0.01,
+                && (last[1] - yc(mm.line_db[npts - 1])).abs() < 0.01,
             "curve ends on the last data point"
         );
         let mut max_dev = 0.0f32;
@@ -67422,11 +67438,13 @@ mod tests {
     }
 
     /// R3: BOTH modes paint from the identical data pipeline: same
-    /// meter, same frame budget — the points bar top of every loud cell
-    /// and the line curve's knot of that cell sit on the SAME y the
-    /// shared `disp_db` projection implies, and the bar color IS the
-    /// shared spec_color rule (so neither mode can quietly re-read a
-    /// different vector).
+    /// meter, same frame budget — the points bar top of every loud
+    /// cell rides the RAW `disp_db` projection and the line curve's
+    /// knot of that cell rides the smoothed `line_db` copy the SAME
+    /// `refresh_display` seam fills (v185 retarget, card t_07b9213f:
+    /// one source of record, two views — POINTS raw, LINE smoothed;
+    /// the bar color IS the shared spec_color rule, so neither mode
+    /// can quietly re-read a different meter).
     #[test]
     fn v163_both_modes_same_data() {
         let npts = crate::meter::DISPLAY_POINTS;
@@ -67515,9 +67533,10 @@ mod tests {
             if c < npts - 1 {
                 let knot = trace[c][0];
                 assert!(
-                    (knot[1] - want).abs() < 0.01,
-                    "line knot at cell {c} must ride the SAME y: {} vs {want}",
-                    knot[1]
+                    (knot[1] - yc(mm.line_db[c])).abs() < 0.01,
+                    "line knot at cell {c} must ride the smoothed vector: {} vs {}",
+                    knot[1],
+                    yc(mm.line_db[c])
                 );
             }
             probed += 1;
@@ -67590,6 +67609,76 @@ mod tests {
             2,
             "only the seam and the reload-apply write the flag"
         );
+    }
+
+    /// v185 (card t_07b9213f): SEAM SPLIT — LINE knots ride the smoothed
+    /// `line_db` vector while POINTS bars ride the raw `disp_db`. Proof by
+    /// mutation: after the refresh, floor ONLY `disp_db` and repaint.
+    /// POINTS must go EMPTY (its source was floored); LINE must repaint
+    /// BIT-IDENTICALLY (it never reads `disp_db` — the mutation is
+    /// invisible to it). Pre-v185 (both modes read `disp_db`) both
+    /// polarities fail: LINE would lose its curve, POINTS would survive.
+    #[test]
+    fn v185_line_mode_paints_smoothed_seam() {
+        let npts = crate::meter::DISPLAY_POINTS;
+        let rect = egui::Rect::from_min_max(egui::pos2(0.0, 40.0), egui::pos2(400.0, 140.0));
+        let mut mm = v163_two_tone_meter();
+        assert_eq!(mm.line_db.len(), npts, "LINE vector filled by refresh_display");
+        let ctx = egui::Context::default();
+        let mk_raw = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1440.0, 853.0),
+            )),
+            time: Some(test_time()),
+            ..Default::default()
+        };
+        let line_segs = |mm: &crate::meter::MasterMeter| -> Vec<[[f32; 2]; 4]> {
+            let mut out = ctx.run_ui(mk_raw(), |ui| paint_spectrum(ui, Some(mm), rect, true));
+            let v: Vec<[[f32; 2]; 4]> = out
+                .shapes
+                .iter()
+                .filter_map(|cs| match &cs.shape {
+                    egui::epaint::Shape::CubicBezier(cb)
+                        if (cb.stroke.width - 1.6).abs() < 1e-6 =>
+                    {
+                        cb.points.iter().map(|p| [p.x, p.y]).collect::<Vec<_>>().try_into().ok()
+                    }
+                    _ => None,
+                })
+                .collect();
+            out.textures_delta.clear();
+            v
+        };
+        let bar_vertices = |mm: &crate::meter::MasterMeter| -> usize {
+            let mut out = ctx.run_ui(mk_raw(), |ui| paint_spectrum(ui, Some(mm), rect, false));
+            let mut n = 0usize;
+            for cs in &out.shapes {
+                if let egui::epaint::Shape::Mesh(m) = &cs.shape {
+                    for v in &m.vertices {
+                        let (r0, g0, b0, a0) = v.color.to_tuple();
+                        let gray = (r0 as i16 - g0 as i16).abs() <= 6
+                            && (g0 as i16 - b0 as i16).abs() <= 6;
+                        let axis = (r0 == 120 && g0 == 120 && b0 == 128)
+                            || (r0 == 24 && g0 == 24 && b0 == 29);
+                        if a0 > 100 && !gray && !axis {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            out.textures_delta.clear();
+            n
+        };
+        let segs_pre = line_segs(&mm);
+        let bars_pre = bar_vertices(&mm);
+        assert_eq!(segs_pre.len(), npts - 1, "LINE curve intact pre-mutation");
+        assert!(bars_pre >= 20, "POINTS bars painted pre-mutation: {bars_pre}");
+        mm.disp_db.fill(-240.0);
+        let segs_post = line_segs(&mm);
+        let bars_post = bar_vertices(&mm);
+        assert_eq!(segs_post, segs_pre, "LINE never reads disp_db — mutation invisible");
+        assert_eq!(bars_post, 0, "POINTS bars all rode disp_db — floored = gone");
     }
 
     /// R5 + R6: the MASTER OUT panel carries the inline "points | line"

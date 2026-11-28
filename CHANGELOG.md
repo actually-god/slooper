@@ -101,6 +101,15 @@ Versions are the git tags (`v<X.Y.Z>`); builds live on
 
 ### Fixed
 
+- **The smooth spectrum line is now actually smooth.** MASTER OUT's
+  LINE trace still read spiky and square: the curve itself was fine,
+  but it faithfully joined the analyzer's raw per-cell max-hold — a
+  comb of 20–40 dB spikes, with stair-stepped plateaus in the low
+  band. The LINE view now paints a power-spectral 1/12-octave
+  smoothing (the standard analyzer smoothing width): genuine peaks
+  and transients stay visible on the line, the pale peak-hold trace
+  rides above it, and POINTS mode keeps the full-resolution raw
+  picture exactly as before.
 - **Releasing a sampler key stops only that note.** Held several keys on
   a sampler track and lifting one changed nothing — every note kept
   playing until the LAST key came up, then they all died together. Each
