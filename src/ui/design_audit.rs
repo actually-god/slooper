@@ -575,6 +575,7 @@ const GEOM_BASE: &[(&str, &str, usize)] = &[
     ("vsthost.rs", "pub const PRESET_KIND_PLUGIN: u32 = 1;", 1), // non-UI file vsthost.rs: ABI/plumbing const
     ("audio/rt_recovery.rs", "pub const RETRY_BUDGET: u32 = 2;", 1), // non-UI file audio/rt_recovery.rs: ABI/plumbing const
     ("meter.rs", "pub const SPEC_F_MAX: f32 = 20_000.0;", 1), // non-UI file meter.rs: ABI/plumbing const
+    ("meter.rs", "pub const SMOOTH_OCTAVES: f32 = 1.0 / 12.0;", 1), // non-UI file meter.rs: v185 LINE smoothing width (single kernel home, pinned by v185_smooth_kernel_constant_field_and_symmetry)
     ("meter.rs", "pub const SPEC_F_MIN: f32 = 30.0;", 1), // non-UI file meter.rs: ABI/plumbing const
     ("midiin.rs", "pub const STALL_SKIP: u32 = 256;", 1), // non-UI file midiin.rs: ABI/plumbing const
     ("quantize.rs", "pub const TRIM_FLOOR_DB: f32 = -60.0;", 1), // non-UI file quantize.rs: ABI/plumbing const

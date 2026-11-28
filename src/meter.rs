@@ -1114,6 +1114,10 @@ mod tests {
         // only the two warm-reuse `resize` calls (capacity survives
         // clear()). Sabotage-proof: plant `let _v = Vec::<f32>::new();`
         // in push -> RED; drop a resize -> RED.
+        // v185 (card t_07b9213f) region retarget: smooth_log joined the
+        // per-frame pump with the SAME discipline — its own bounded
+        // region now also allows exactly the two warm-reuse resizes
+        // (dst + power scratch) and nothing else.
         let src = include_str!("meter.rs");
         let grab = |a: &str, b: &str| -> String {
             let i = src.find(a).expect("anchor a");
@@ -1127,7 +1131,7 @@ mod tests {
                 "push must not allocate: found {needle}"
             );
         }
-        let res = grab("pub fn resample_log(", "/// Lock-free");
+        let res = grab("pub fn resample_log(", "/// v185 (card t_07b9213f): the ONE smoothing");
         for needle in ["vec![", "Vec::new", "to_vec", "collect"] {
             assert!(!res.contains(needle), "resample allocates: {needle}");
         }
@@ -1135,6 +1139,15 @@ mod tests {
             res.matches("resize").count(),
             2,
             "resample_log must keep exactly the two warm-reuse resizes"
+        );
+        let sm = grab("pub fn smooth_log(", "/// Lock-free");
+        for needle in ["vec![", "Vec::new", "to_vec", "collect"] {
+            assert!(!sm.contains(needle), "smooth_log allocates: {needle}");
+        }
+        assert_eq!(
+            sm.matches("resize").count(),
+            2,
+            "smooth_log must keep exactly the two warm-reuse resizes"
         );
     }
 
