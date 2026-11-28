@@ -1267,12 +1267,6 @@ mod tests {
         v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max)
     }
 
-    fn v185_slope2_max(v: &[f32]) -> f32 {
-        v.windows(3)
-            .map(|w| (w[2] - 2.0 * w[1] + w[0]).abs())
-            .fold(0.0f32, f32::max)
-    }
-
     fn v185_peak(v: &[f32]) -> (f32, usize) {
         let mut p = (f32::MIN, 0usize);
         for (i, &x) in v.iter().enumerate() {
@@ -1281,56 +1275,6 @@ mod tests {
             }
         }
         p
-    }
-
-    #[test]
-    fn v185_probe_metrics() {
-        let mm = v185_pump_recorded_material(2.0);
-        let (rp, ri) = v185_peak(&mm.disp_db);
-        let (lp, _li) = v185_peak(&mm.line_db);
-        println!(
-            "v185 PROBE raw_dist={:.2} line_dist={:.2} raw_smax={:.2} line_smax={:.2} raw_peak={rp:.2}@{ri} line_peak={lp:.2} clip={}",
-            v185_adjacent_max(&mm.disp_db),
-            v185_adjacent_max(&mm.line_db),
-            v185_slope2_max(&mm.disp_db),
-            v185_slope2_max(&mm.line_db),
-            mm.clip
-        );
-        let f_of = |i: usize| 30.0f32 * (20_000.0f32 / 30.0).powf(i as f32 / DISPLAY_POINTS as f32);
-        let revs = |v: &[f32], thr: f32| -> usize {
-            let mut n = 0usize;
-            for i in 2..v.len() {
-                let d0 = v[i - 1] - v[i - 2];
-                let d1 = v[i] - v[i - 1];
-                if d0.abs() > thr && d1.abs() > thr && d0.signum() != d1.signum() {
-                    n += 1;
-                }
-            }
-            n
-        };
-        println!(
-            "v185 PROBE-B reversals3db RAW={} LINE={} reversals5db RAW={} LINE={}",
-            revs(&mm.disp_db, 3.0),
-            revs(&mm.line_db, 3.0),
-            revs(&mm.disp_db, 5.0),
-            revs(&mm.line_db, 5.0)
-        );
-        for (tag, v) in [("RAW", &mm.disp_db), ("LINE", &mm.line_db)] {
-            let mut top: Vec<(f32, usize)> = (0..v.len() - 1)
-                .map(|i| ((v[i + 1] - v[i]).abs(), i))
-                .collect();
-            top.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-            println!("{tag} top steps:");
-            for (d, i) in top.iter().take(8) {
-                println!(
-                    "  {d:7.2} dB at cell {i} ({} Hz -> {} Hz) vals {:.1} -> {:.1}",
-                    f_of(*i),
-                    f_of(i + 1),
-                    v[*i],
-                    v[i + 1]
-                );
-            }
-        }
     }
 
     /// R2: smoothness BEYOND v163's curvature pin, over recorded material
