@@ -33693,26 +33693,6 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 {
                     app.save_config();
                 }
-                // v184 (card t_ef31d00d / MIX-SCR-1): the searchable
-                // SETTINGS home for the scroll mode (v163 spectrum_line
-                // precedent: the view carries the inline toggle, SETTINGS
-                // the mirror). Rides the ONE seam with the mix-page button.
-                let mut linked_on = app.mixer_scroll_linked;
-                if ui
-                    .checkbox(&mut linked_on, "mixer scroll: all strips together")
-                    .on_hover_text(
-                        "On (default): the mixer scroller (shift+wheel / \
-                         trackpad-x, plus the plain wheel vertically on a \
-                         short mix page) moves every strip/column together. \
-                         Off: the same gestures scroll ONLY the strip under \
-                         the cursor \u{2014} each one on its own. The \
-                         docked mixer's vertical follow-tracks scroll is a \
-                         separate setting above.",
-                    )
-                    .changed()
-                {
-                    app.set_mixer_scroll_linked(linked_on);
-                }
                 if ui.checkbox(&mut app.show_midi, "MIDI monitor").changed() {
                     app.save_config();
                 }
@@ -34009,7 +33989,7 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 ui,
                 &app.sett_filter,
                 "MIDI + KEYBOARD BINDINGS",
-                "midi keyboard keys shortcut binding bindings reset defaults global track transport",
+                "midi keyboard keys shortcut binding bindings reset defaults global track transport mixer scroll strips linked per-strip",
             ) {
                 any = true;
             ui.horizontal(|ui| {
@@ -34064,6 +34044,29 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                 .weak()
                 .small(),
             );
+            // v184 (card t_ef31d00d / MIX-SCR-1): the SETTINGS home for the
+            // scroll mode (v163 spectrum_line precedent: the mix-page header
+            // carries the inline toggle, SETTINGS the mirror). Rides the ONE
+            // seam. Placed BELOW the reset button (Windows parity: a row
+            // inserted above it pushed "Reset to Defaults" past the 853-px
+            // click fold — the tall-probe/853-mismatch trap, v50 (a)).
+            let mut linked_on = app.mixer_scroll_linked;
+            if ui
+                .checkbox(&mut linked_on, "mixer scroll: all strips together")
+                .on_hover_text(
+                    "On (default): the mixer scroller (shift+wheel / \
+                     trackpad-x, plus the plain wheel vertically on a \
+                     short mix page) moves every strip/column together. \
+                     Off: the same gestures scroll ONLY the strip under \
+                     the cursor \u{2014} each one on its own. The \
+                     docked mixer's vertical follow-tracks scroll is a \
+                     separate setting (MIXER dock panel).",
+                )
+                .changed()
+            {
+                app.set_mixer_scroll_linked(linked_on);
+            }
+
             ui.label(
                 RichText::new(
                     "Click a MIDI cell, then send a NOTE ON / CC / PROGRAM \
