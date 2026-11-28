@@ -3467,4 +3467,104 @@ pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC_V2 }
         }
         assert!(rows.last().unwrap().1 > 23.9, "bend reaches +23.99 st — UNCLAMPED");
     }
+
+    // ===================== v183 acceptance pins (SAMP-NOTE-1) =====================
+    //
+    // The bundled sampler used to ignore note_off entirely ("one-shots
+    // ring out"), so with several keys held EVERY note rang to buffer end
+    // — releasing one key changed nothing (card t_a5130261). These pins
+    // render the REAL script and assert per-note release: releasing note A
+    // decays A's voices (exponential gain ramp, tau = 50 ms, silence at
+    // rel < 1e-3 ≈ 345 ms) while B sustains untouched; voice identity is
+    // (ch, note) + a per-note_on press id, so a retrigger's off releases
+    // the OLDEST press of that key and never the newest one.
+
+    /// Long host tones (2.5 s) so a late window can only go quiet via a
+    /// release — buffer end would need 2.5 s (v51_tones are 100 ms).
+    fn v183_tones() {
+        let mk = |f: f64| -> Arc<[f32]> {
+            (0..120_000)
+                .map(|i| (i as f64 * std::f64::consts::TAU * f / 48000.0).sin() as f32 * 0.5)
+                .collect()
+        };
+        set_host_assets(Arc::new(vec![mk(200.0), mk(800.0)]), 48_000);
+    }
+
+    fn v183_render(inst: &Arc<Instance>, ev: &mut [(u64, u8, u8, u8, u8)], len: usize) -> Vec<f32> {
+        let mut out = vec![0f32; len];
+        crate::audio::render_midi_events(inst, ev, 0, len, &mut out);
+        out
+    }
+
+    #[test]
+    fn v183_sampler_note_off_releases_only_that_note() {
+        let reg = v51_registry();
+        v183_tones();
+        let inst = v51_sampler(&reg);
+        inst.set_map(&[(0, 60, 127), (1, 64, 127)], 0);
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![
+            (0, 3, 0, 60, 110),
+            (0, 3, 0, 64, 110),
+            (9_600, 0, 0, 60, 0), // release A at 200 ms
+        ];
+        let x = v183_render(&inst, &mut ev, 48_000);
+        let lp = |f: f64, a: usize, b: usize| line_power(&x, f, 48000.0, a, b);
+        // Before the off both zones sound.
+        let (a1, b1) = (lp(200.0, 4_800, 9_600), lp(800.0, 4_800, 9_600));
+        assert!(a1 > 5e4 && b1 > 5e4, "both notes must sound before the off: {a1} {b1}");
+        // 150–250 ms after the off: B unchanged, A decaying hard.
+        let (a2, b2) = (lp(200.0, 16_800, 21_600), lp(800.0, 16_800, 21_600));
+        assert!(b2 > b1 / 2.0 && b2 < b1 * 2.0, "B must sustain unaffected: {b1} -> {b2}");
+        assert!(a2 < a1 / 20.0 && a2 < b2 / 25.0, "A must release while B sustains: {a1} -> {a2} (b {b2})");
+        // 500–600 ms after the off: A's release envelope is over.
+        let (a3, b3) = (lp(200.0, 36_000, 40_800), lp(800.0, 36_000, 40_800));
+        assert!(b3 > 5e4, "B still sounds late (it never offs): {b3}");
+        assert!(a3 < b3 / 100.0 && a3 < 50.0, "A must be gone within its release: {a3} vs {b3}");
+    }
+
+    #[test]
+    fn v183_sampler_retrigger_off_keeps_newest_voice() {
+        let reg = v51_registry();
+        v183_tones();
+        let inst = v51_sampler(&reg);
+        inst.set_map(&[(0, 60, 127)], 0);
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![
+            (0, 3, 0, 60, 110),     // press 1
+            (4_800, 3, 0, 60, 110), // press 2 (retrigger, no off between)
+            (14_400, 0, 0, 60, 0),  // first key-up -> releases press 1 ONLY
+            (24_000, 0, 0, 60, 0),  // second key-up -> releases press 2
+        ];
+        let x = v183_render(&inst, &mut ev, 48_000);
+        let lp = |f: f64, a: usize, b: usize| line_power(&x, f, 48000.0, a, b);
+        // After the FIRST off the newest voice must still sound.
+        let after1 = lp(200.0, 16_800, 21_600);
+        assert!(after1 > 5e4, "retriggered voice must survive the first off: {after1}");
+        // After BOTH offs it is gone (250–350 ms into the release ramp).
+        let after2 = lp(200.0, 36_000, 40_800);
+        assert!(after2 < 50.0, "second off must end the newest voice: {after2}");
+    }
+
+    #[test]
+    fn v183_sampler_note_off_tracks_channel() {
+        let reg = v51_registry();
+        v183_tones();
+        let inst = v51_sampler(&reg);
+        inst.set_map(&[(0, 60, 127)], 0);
+        let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![
+            (0, 3, 0, 60, 110),
+            (0, 3, 1, 60, 110),     // SAME note, other channel = own voice
+            (14_400, 0, 0, 60, 0),  // release ch 0 only
+            (33_600, 0, 1, 60, 0),  // release ch 1
+        ];
+        let x = v183_render(&inst, &mut ev, 60_000);
+        let lp = |f: f64, a: usize, b: usize| line_power(&x, f, 48000.0, a, b);
+        let both = lp(200.0, 9_600, 14_400);
+        let one = lp(200.0, 16_800, 21_600);
+        assert!(both > 5e4 && one > 5e4, "the ch-1 voice must outlive the ch-0 off: both {both} one {one}");
+        // ch-1 off was at 33_600; window 40_800..45_600 is 150–250 ms
+        // after it — still inside the ramp, so assert only AFTER the full
+        // ramp: floor at 1e-3 kills the voice by 345 ms = 16_580 frames.
+        let none = lp(200.0, 55_200, 60_000);
+        assert!(none < 50.0, "the ch-1 off must end the last voice: {none}");
+    }
 }
