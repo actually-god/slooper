@@ -119,6 +119,9 @@ pub const LIVE: &[&str] = &[
     "show_rack",
     "show_mixer",
     "mixer_follow_tracks",
+    // v184 (card t_ef31d00d): mixer scroll mode — pure UI scoping, the
+    // widgets and the wheel law read it every frame, live is correct.
+    "mixer_scroll_linked",
     "show_midi",
     "show_binds",
     "theme",

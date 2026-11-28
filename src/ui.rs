@@ -1601,6 +1601,13 @@ pub struct App {
     /// main GUI's track heights + scroll. Off: strips keep a uniform height,
     /// start at the panel top and own their scroll even when docked.
     mixer_follow_tracks: bool,
+    /// v184 (card t_ef31d00d / MIX-SCR-1): mixer scroll mode — true
+    /// (default) = LINKED, the scroller moves every strip/column
+    /// together; false = PER-STRIP, only the strip/column under the
+    /// cursor moves. Persisted; flipped ONLY through
+    /// [`App::set_mixer_scroll_linked`] (mix-page header toggle + the
+    /// SETTINGS checkbox share that seam).
+    mixer_scroll_linked: bool,
     /// v163 (card t_5cf0f288): master spectrum trace mode — false (default)
     /// = points per display cell, true = one continuous smooth line.
     /// Persisted; flipped ONLY through [`App::set_spectrum_line`] (inline
@@ -1823,6 +1830,21 @@ pub struct App {
     /// v34 R6: the mixer's OWN scroll offset, used while it is bottom-
     /// docked or floating (the grid's `vscroll` no longer drives it).
     mixer_scroll: f32,
+    /// v184 (MIX-SCR-1): the scroll-mode offsets. LINKED mode rides the
+    /// shared scalars (`mix_scroll_x` dock strips, `mix_page_y` mix-page
+    /// columns; horizontal mix-page stays `mix_hscroll`); PER-STRIP mode
+    /// the indexed tables. Neither side resets on a mode switch — each
+    /// remembers its own positions. Dock VERTICAL stays `mixer_scroll` /
+    /// `vscroll` (the v34 R6 law is untouched by this feature).
+    mix_scroll_x: f32,
+    mix_strip_off: [f32; MAX_LOOPS],
+    mix_page_y: f32,
+    mix_col_x: [f32; MAX_LOOPS],
+    mix_col_y: [f32; MAX_LOOPS],
+    /// v184: last-frame strip bands (panel-space, full panel width) for
+    /// the per-strip wheel hit-test; empty until the first mixer paint
+    /// (a same-frame-first gesture then simply no-ops).
+    mix_strip_rects: Vec<(usize, egui::Rect)>,
     /// Per-track grid-block height in points (0 = automatic:
     /// `lanes × LANE_H`). The user drags the separation bar under a track
     /// to resize it; the mixer strip mirrors the same height.
@@ -2696,6 +2718,7 @@ impl App {
             show_mixer: cfg.show_mixer,
             mixer_follow_tracks: cfg.mixer_follow_tracks,
             spectrum_line: cfg.spectrum_line,
+            mixer_scroll_linked: cfg.mixer_scroll_linked,
             auto_preset_name: String::new(),
             show_binds: cfg.show_binds,
             side_wins: cfg.side_wins,
@@ -2799,6 +2822,12 @@ impl App {
             sep_drag: None,
             grid_anchor: 0.0,
             mixer_scroll: 0.0,
+            mix_scroll_x: 0.0,
+            mix_strip_off: [0.0; MAX_LOOPS],
+            mix_page_y: 0.0,
+            mix_col_x: [0.0; MAX_LOOPS],
+            mix_col_y: [0.0; MAX_LOOPS],
+            mix_strip_rects: Vec::new(),
             sel_clips: Vec::new(),
             sel_anchor: None,
             last_click_track: None,
@@ -6876,6 +6905,7 @@ impl App {
             show_mixer: self.show_mixer,
             mixer_follow_tracks: self.mixer_follow_tracks,
             spectrum_line: self.spectrum_line,
+            mixer_scroll_linked: self.mixer_scroll_linked,
             lane_rm_never_warn: self.lane_rm_never_warn,
             save_overwrite_never_warn: self.save_overwrite_never_warn,
             show_midi: self.show_midi,
@@ -7313,6 +7343,9 @@ impl App {
             "show_mixer" => self.show_mixer = cfg.show_mixer,
             "mixer_follow_tracks" => self.mixer_follow_tracks = cfg.mixer_follow_tracks,
             "spectrum_line" => self.spectrum_line = cfg.spectrum_line,
+            // v184 (MIX-SCR-1): pure UI scoping — the wheel law reads the
+            // field every frame, live is correct (MCP LIVE roster).
+            "mixer_scroll_linked" => self.mixer_scroll_linked = cfg.mixer_scroll_linked,
             "lane_rm_never_warn" => self.lane_rm_never_warn = cfg.lane_rm_never_warn,
             // v181 (TS-025 R3): read at the next save — live is correct.
             "save_overwrite_never_warn" => {
@@ -10161,6 +10194,24 @@ impl App {
             "spectrum trace: smooth line".into()
         } else {
             "spectrum trace: points".into()
+        };
+        true
+    }
+
+    /// v184 (card t_ef31d00d / MIX-SCR-1): the ONE seam for the mixer
+    /// scroll mode — state + save + echo, the `set_spectrum_line`
+    /// precedent. True only on a real change (idempotent against the
+    /// mix-page toggle and the SETTINGS mirror double-firing).
+    fn set_mixer_scroll_linked(&mut self, linked: bool) -> bool {
+        if self.mixer_scroll_linked == linked {
+            return false;
+        }
+        self.mixer_scroll_linked = linked;
+        self.save_config();
+        self.status = if linked {
+            "mixer scroll: linked \u{b7} the scroller moves every strip together".into()
+        } else {
+            "mixer scroll: per-strip \u{b7} only the strip under the cursor moves".into()
         };
         true
     }
@@ -27374,6 +27425,26 @@ fn bezier_curve(
 /// and pan rows share one line across the page (goal 4: alignment).
 const MIX_COL_W: f32 = 130.0;
 const MIX_COL_GAP: f32 = 8.0;
+/// v184 (MIX-SCR-1): probe-measured natural width of a mixer strip's
+/// widest row (361.6 pt un-chipped + the 11 pt color-chip row) — strips
+/// lay out at AT LEAST this width so a narrow dock scrolls the clipped
+/// tail into view instead of silently dropping it (the v30 horizontal
+/// clip trap). Dock horizontal clamp = this minus the panel width; at
+/// the comfortable 390 default the clamp is 0 and nothing changes.
+const MIX_STRIP_CONTENT_W: f32 = 375.0;
+/// v184: fixed flow rows ABOVE the mix-page faders (probe: EXACTLY 60.0
+/// pt at every viewport height — headers + rec/mute row + labels +
+/// spacing) and the v99 reserve BELOW them. The fader budget becomes
+/// `(viewport - top - reserve)` — identical to today's
+/// `available_height() - reserve` while unscrolled, but scroll-stable:
+/// a per-column vertical shift must not resize faders mid-gesture.
+const MIX_COL_FH_TOP: f32 = 60.0;
+const MIX_COL_FH_RESERVE: f32 = 140.0;
+/// v184: the shortest page that still shows one column's full content
+/// (top rows + the 56 pt minimum fader + reserve). A shorter page makes
+/// `row_h` the viewport and the vertical scroll axis lives (R2/R3); a
+/// taller page pins that axis at offset 0 (negative control).
+const MIX_COL_MIN_H: f32 = MIX_COL_FH_TOP + 56.0 + MIX_COL_FH_RESERVE;
 
 /// v99 (sc-5): "L40" / "C" / "R40" readout for a send-pan value in engine
 /// units ([0,1], 0.5 = centre). Shared by the slider formatter and the
@@ -27410,42 +27481,153 @@ struct MixGeom {
 /// chips. Every control rides the SAME setter / display / hover sources
 /// as the dock strips (goal 3 parity). NO master column: MASTER OUT is
 /// the only master section (AGENT-GUIDE rule).
+/// v184 (MIX-SCR-1): ONE renderer for the scroll-mode button — the
+/// mix-page header row hosts it (the mixer's one always-painted header;
+/// the docked MIXER strips follow the same global mode), SETTINGS
+/// mirrors the choice as a checkbox, and every entry point rides the
+/// ONE `set_mixer_scroll_linked` seam (state + save + echo).
+fn mix_scroll_mode_toggle(ui: &mut egui::Ui, app: &mut App) {
+    let linked = app.mixer_scroll_linked;
+    let lbl = if linked { "scroll: linked" } else { "scroll: per-strip" };
+    // add_sized holds the RESERVED slot (the wider of the two labels):
+    // a control that reflows with its own text drags every neighbour
+    // sideways mid-click (the v32 law).
+    let r = ui
+        .add_sized(
+            [118.0, 18.0],
+            egui::Button::selectable(!linked, RichText::new(lbl).small()),
+        )
+        .on_hover_text(
+            "Mixer scroll mode (remembered across restarts). LINKED: \
+             shift+wheel / trackpad-x slides ALL strips sideways together \
+             \u{b7} on a short mix page the plain wheel also moves all \
+             columns vertically together. PER-STRIP: the same gestures \
+             scroll ONLY the strip/column under the cursor \u{b7} the \
+             others hold their place. Applies to the docked MIXER strips \
+             as well (its vertical scroll keeps following tracks when \
+             docked \u{2014} Settings > mixer follows tracks).",
+        );
+    if r.clicked() {
+        app.set_mixer_scroll_linked(!linked);
+    }
+}
+
+/// v184: which mix-page column owns the wheel at `px` — the laid-out
+/// rect (WITH per-mode offsets) that contains it; a cursor over a gap
+/// resolves to the nearer column, so the gesture never silently no-ops.
+fn mix_col_hit(app: &App, x0: f32, px: f32) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for t in 0..app.n_tracks {
+        let xo = if app.mixer_scroll_linked { app.mix_hscroll } else { app.mix_col_x[t] };
+        let cx = x0 + t as f32 * (MIX_COL_W + MIX_COL_GAP) - xo;
+        let d = if px < cx {
+            cx - px
+        } else if px > cx + MIX_COL_W {
+            px - (cx + MIX_COL_W)
+        } else {
+            0.0
+        };
+        if best.is_none_or(|(_, bd)| d < bd) {
+            best = Some((t, d));
+            if d == 0.0 {
+                break;
+            }
+        }
+    }
+    best.map(|(t, _)| t)
+}
+
+/// v184: which docked strip band contains the cursor's y — LAST-frame
+/// bands (the wheel is read before this frame's layout runs). Empty on
+/// the very first paint: that frame's gesture simply no-ops.
+fn mix_strip_hit(app: &App, py: f32) -> Option<usize> {
+    app.mix_strip_rects
+        .iter()
+        .find(|(_, r)| py >= r.min.y && py <= r.max.y)
+        .map(|(t, _)| *t)
+}
+
 fn mix_page(ui: &mut egui::Ui, app: &mut App) {
     let base = ui.max_rect();
     app.mix_geom = MixGeom::default();
-    ui.label(
-        RichText::new(
-            "mix page \u{b7} one channel per track \u{b7} shift+wheel or the \
-             scroller moves sideways \u{b7} F9 back to the grid",
-        )
-        .weak()
-        .small(),
-    );
+    // v184 (MIX-SCR-1): the header row carries the scroll-mode toggle.
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(
+                "mix page \u{b7} one channel per track \u{b7} shift+wheel or the \
+                 scroller moves sideways \u{b7} F9 back to the grid",
+            )
+            .weak()
+            .small(),
+        );
+        mix_scroll_mode_toggle(ui, app);
+    });
     let rows = ui.available_rect_before_wrap();
     let total = app.n_tracks as f32 * (MIX_COL_W + MIX_COL_GAP) - MIX_COL_GAP;
     let max_scroll = (total - rows.width()).max(0.0);
+    let row_h = rows.height().max(160.0);
+    // v184: the vertical overflow the wheel may scroll — 0 while the
+    // page is tall enough for content at the smallest fader, so the
+    // vertical gesture then NO-OPS (the pin's negative control).
+    let vover = (MIX_COL_MIN_H - row_h).max(0.0);
     // The page owns its own horizontal offset (the grid's hscroll
     // belongs to the timeline). Trackpad-x AND shift+wheel both work.
+    // v184: LINKED (default) moves EVERY column together — the historic
+    // shared `mix_hscroll`, plus the new shared `mix_page_y`. PER-STRIP
+    // routes the same gesture to the cursor column's own offsets while
+    // the others freeze; `mix_hscroll` stays untouched, so switching
+    // back restores the page position. Plain wheel-y = vertical,
+    // shift+wheel / trackpad-x = horizontal (the existing law).
     if ui.rect_contains_pointer(base) {
-        let d = ui.input(|i| {
+        let (d_x, d_y, pt) = ui.input(|i| {
             let s = i.smooth_scroll_delta;
             if i.modifiers.shift {
-                s.y
+                (s.y, 0.0, i.pointer.interact_pos())
             } else {
-                s.x
+                (s.x, s.y, i.pointer.interact_pos())
             }
         });
-        if d != 0.0 {
-            app.mix_hscroll = (app.mix_hscroll - d).clamp(0.0, max_scroll);
+        if d_x != 0.0 || (d_y != 0.0 && vover > 0.0) {
+            if app.mixer_scroll_linked {
+                if d_x != 0.0 {
+                    app.mix_hscroll = (app.mix_hscroll - d_x).clamp(0.0, max_scroll);
+                }
+                if d_y != 0.0 {
+                    app.mix_page_y = (app.mix_page_y - d_y).clamp(0.0, vover);
+                }
+            } else if let Some(t) = pt.and_then(|p| mix_col_hit(app, rows.min.x, p.x)) {
+                if d_x != 0.0 {
+                    app.mix_col_x[t] = (app.mix_col_x[t] - d_x).clamp(0.0, max_scroll);
+                }
+                if d_y != 0.0 {
+                    app.mix_col_y[t] = (app.mix_col_y[t] - d_y).clamp(0.0, vover);
+                }
+            }
         }
     }
     app.mix_hscroll = app.mix_hscroll.min(max_scroll);
-    let row_h = rows.height().max(160.0);
+    app.mix_page_y = app.mix_page_y.min(vover);
     for t in 0..app.n_tracks {
-        let x = rows.min.x + t as f32 * (MIX_COL_W + MIX_COL_GAP) - app.mix_hscroll;
+        // A resize can shrink either overflow mid-session — per-column
+        // offsets stay clamped to TODAY's extents.
+        app.mix_col_x[t] = app.mix_col_x[t].min(max_scroll);
+        app.mix_col_y[t] = app.mix_col_y[t].min(vover);
+    }
+    // v184: a column scrolled DOWN runs its header above the viewport —
+    // clip the flow to the rows box so nothing paints into the hint row.
+    ui.shrink_clip_rect(rows);
+    for t in 0..app.n_tracks {
+        let xoff =
+            if app.mixer_scroll_linked { app.mix_hscroll } else { app.mix_col_x[t] };
+        let yoff = if app.mixer_scroll_linked { app.mix_page_y } else { app.mix_col_y[t] };
+        let x = rows.min.x + t as f32 * (MIX_COL_W + MIX_COL_GAP) - xoff;
+        // The rect GROWS by the scroll shift: its bottom edge stays at
+        // the viewport bottom (what scrolls off the top comes back from
+        // the bottom), while mix_column budgets faders from `row_h` —
+        // never from this shifted rect (scroll-stable faders).
         let col = egui::Rect::from_min_size(
-            egui::pos2(x, rows.min.y),
-            egui::vec2(MIX_COL_W, row_h),
+            egui::pos2(x, rows.min.y - yoff),
+            egui::vec2(MIX_COL_W, row_h + yoff),
         );
         if col.max.x < base.min.x || col.min.x > base.max.x {
             // Scrolled out: geometry stays index-addressable for pins.
@@ -27462,7 +27644,7 @@ fn mix_page(ui: &mut egui::Ui, app: &mut App) {
                 .id_salt(("mixcol", t))
                 .max_rect(col)
                 .layout(egui::Layout::top_down(egui::Align::Min)),
-            |ui| mix_column(ui, app, t),
+            |ui| mix_column(ui, app, t, row_h),
         );
     }
     // Absolute-layout pass: nothing advanced the flow cursor, so claim
@@ -27473,7 +27655,7 @@ fn mix_page(ui: &mut egui::Ui, app: &mut App) {
 /// One channel column of the mix page. All rows FIXED size and
 /// identical in every column → headers, faders and pan rows align
 /// across the page exactly (goal 4).
-fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
+fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize, view_h: f32) {
     let rect = ui.max_rect();
     ui.shrink_clip_rect(rect);
     let sel = app.is_track_sel(t);
@@ -27608,7 +27790,13 @@ fn mix_column(ui: &mut egui::Ui, app: &mut App, t: usize) {
     // Reserve the rows that come AFTER the faders: dB readouts (14) +
     // pan slider (18) + pan readout (14) + send gain row (18) + send pan
     // row (18) [v99] + chips (20) + spacing slack.
-    let fh = (ui.available_height() - 140.0).clamp(56.0, 360.0);
+    // v184 (MIX-SCR-1): faders budget from the VIEWPORT height (row_h),
+    // not the flow cursor: with the per-column vertical scroll the rect
+    // starts above the viewport and grows, so available_height() would
+    // resize faders mid-gesture. The flow above the faders is FIXED at
+    // MIX_COL_FH_TOP (probe-verified 60.0 pt at every viewport), so
+    // unscrolled this is identical to the old `avail - reserve` formula.
+    let fh = (view_h - MIX_COL_FH_TOP - MIX_COL_FH_RESERVE).clamp(56.0, 360.0);
     let vv0 = vshow;
     let gg0 = gshow;
     let (vv_now, gg_now, rv, rg) = ui
@@ -27868,7 +28056,10 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
     let mut free_scroll = 0.0;
     if !tied {
         let over = ui.rect_contains_pointer(base);
-        let d = if over {
+        // v184 (MIX-SCR-1): shift+wheel belongs to the horizontal strip
+        // law — the vertical free-scroll takes the PLAIN wheel only, so
+        // one gesture can never feed both axes.
+        let d = if over && !ui.input(|i| i.modifiers.shift) {
             ui.input(|i| i.smooth_scroll_delta).y
         } else {
             0.0
@@ -27877,6 +28068,38 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
             app.mixer_scroll = (app.mixer_scroll - d).max(0.0);
         }
         free_scroll = app.mixer_scroll;
+    }
+    // v184 (MIX-SCR-1): the horizontal strip axis, ACTIVE IN BOTH
+    // placements (this is a NEW axis; the vertical law above stays the
+    // v34 R6 / v52 R5 contract). Strip content lays out at AT LEAST
+    // MIX_STRIP_CONTENT_W, so a narrow dock scrolls its clipped tail
+    // back into view instead of losing it (the v30 horizontal trap —
+    // clipped rows are unreachable). Gesture law = the mix page's:
+    // shift+wheel or trackpad-x. LINKED slides every strip together
+    // under the shared `mix_scroll_x`; PER-STRIP moves only the strip
+    // under the cursor (its own table) — the others freeze.
+    let content_w = base.width().max(MIX_STRIP_CONTENT_W);
+    let hover_w = (content_w - base.width()).max(0.0);
+    if hover_w > 0.0 && ui.rect_contains_pointer(base) {
+        let (d_x, pt) = ui.input(|i| {
+            let s = i.smooth_scroll_delta;
+            let d = if i.modifiers.shift { s.y } else { s.x };
+            (d, i.pointer.interact_pos())
+        });
+        if d_x != 0.0 {
+            if app.mixer_scroll_linked {
+                app.mix_scroll_x = (app.mix_scroll_x - d_x).clamp(0.0, hover_w);
+            } else if let Some(p) = pt {
+                if let Some(t) = mix_strip_hit(app, p.y) {
+                    app.mix_strip_off[t] = (app.mix_strip_off[t] - d_x).clamp(0.0, hover_w);
+                }
+            }
+        }
+    }
+    app.mix_scroll_x = app.mix_scroll_x.min(hover_w);
+    for t in 0..app.n_tracks {
+        // A resize can shrink the overflow — offsets never ride past it.
+        app.mix_strip_off[t] = app.mix_strip_off[t].min(hover_w);
     }
     // Clip to the visible column, then lay strips out on absolute
     // rects shifted by the grid's vertical scroll (shared offset —
@@ -27926,6 +28149,7 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
         egui::pos2(base.min.x, band_bottom.max(base.min.y)),
         base.max,
     ));
+    app.mix_strip_rects.clear();
     for t in 0..app.n_tracks {
         // v52 R5: on the independent path the strips keep a UNIFORM
         // mixer-owned height — the main GUI's track heights (which follow
@@ -27937,8 +28161,28 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
             LANE_H.max(TRACK_MIN_H)
         };
         if y + th >= base.min.y && y <= base.max.y {
-            let r =
-                egui::Rect::from_min_size(egui::pos2(base.min.x, y), egui::vec2(base.width(), th));
+            // v184: the strip lays out at content_w and slides under the
+            // panel's fixed clip by its mode's offset (0 while the panel
+            // is wide enough — the default path is byte-unchanged).
+            let xoff = if app.mixer_scroll_linked {
+                app.mix_scroll_x
+            } else {
+                app.mix_strip_off[t]
+            };
+            let r = egui::Rect::from_min_size(
+                egui::pos2(base.min.x - xoff, y),
+                egui::vec2(content_w, th),
+            );
+            // v184: band bookkeeping for the per-strip wheel hit-test —
+            // panel-space, full panel width: a horizontal shift must not
+            // change WHICH strip answers the wheel.
+            app.mix_strip_rects.push((
+                t,
+                egui::Rect::from_min_max(
+                    egui::pos2(base.min.x, y),
+                    egui::pos2(base.max.x, y + th),
+                ),
+            ));
             ui.scope_builder(
                 egui::UiBuilder::new()
                     .id_salt(("mixstrip", t))
@@ -27949,8 +28193,11 @@ fn mixer_body(ui: &mut egui::Ui, app: &mut App) {
             // v0.15: hairline under each strip — consecutive
             // strips used to melt into one wall of controls.
             ui.painter().hline(
-                r.x_range(),
-                r.max.y + TRACK_SEP_HIT * 0.5,
+                // v184: the separator spans the PANEL, never the shifted
+                // layout rect (a scrolled strip used to drag the hairline
+                // partway out of the panel edge with it).
+                base.x_range(),
+                y + th + TRACK_SEP_HIT * 0.5,
                 egui::Stroke::new(1.0, crate::kit::SEP_SOFT),
             );
         }
@@ -33419,6 +33666,26 @@ fn settings_panel(ui: &mut egui::Ui, app: &mut App) {
                     .changed()
                 {
                     app.save_config();
+                }
+                // v184 (card t_ef31d00d / MIX-SCR-1): the searchable
+                // SETTINGS home for the scroll mode (v163 spectrum_line
+                // precedent: the view carries the inline toggle, SETTINGS
+                // the mirror). Rides the ONE seam with the mix-page button.
+                let mut linked_on = app.mixer_scroll_linked;
+                if ui
+                    .checkbox(&mut linked_on, "mixer scroll: all strips together")
+                    .on_hover_text(
+                        "On (default): the mixer scroller (shift+wheel / \
+                         trackpad-x, plus the plain wheel vertically on a \
+                         short mix page) moves every strip/column together. \
+                         Off: the same gestures scroll ONLY the strip under \
+                         the cursor \u{2014} each one on its own. The \
+                         docked mixer's vertical follow-tracks scroll is a \
+                         separate setting above.",
+                    )
+                    .changed()
+                {
+                    app.set_mixer_scroll_linked(linked_on);
                 }
                 if ui.checkbox(&mut app.show_midi, "MIDI monitor").changed() {
                     app.save_config();
