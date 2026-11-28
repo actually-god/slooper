@@ -341,6 +341,9 @@ Each track plays its MIDI clips through its own **synth binding** (the
   asset rack *or straight from your file manager*: the file is decoded,
   joins the rack, and replaces the live patch immediately, even while the
   track plays and MIDI streams in (no restart, no re-selection).
+  Releasing a key now stops **that** key's note — a quick ~0.3 s release
+  fade — while every other held note keeps sounding; hammering the same
+  key keeps the newest note alive through the older key-ups.
 - **sampler key map** — click **map** on a sampler-bound track to spread
   **up to 64 rack samples across the keyboard**: each slot gets a root key
   (the draggable block on the mini-keyboard, or the click-a-key editor) and

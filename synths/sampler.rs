@@ -543,21 +543,13 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
         return;
     }
     let bend_ratio = (sm.bend_st * (1.0 / 12.0)).exp2(); // v100: glide lane
-    // v183: advance every releasing voice's gain ramp ONCE per block
-    // (RT-safe: fixed table walk, no alloc). 512 blocks at 48 kHz step
-    // by x0.81 — smooth, click-free.
-    if n > 0 {
-        let rel_mul = (-(n as f64) / (RELEASE_TAU * sm.sr)).exp();
-        for v in &mut sm.voices {
-            if v.on && v.releasing {
-                v.rel *= rel_mul;
-                if v.rel < RELEASE_FLOOR {
-                    v.on = false;
-                    v.releasing = false;
-                }
-            }
-        }
-    }
+    // v183: per-SAMPLE release ramp (same idiom as `v.pos`). A
+    // per-block coefficient would mis-time the fade on the offline
+    // paths, which render in one giant call between two MIDI events:
+    // the envelope law must hold for any block size (RT 512 blocks and
+    // offline export bounces alike). One extra f64 mul per releasing
+    // voice per sample — RT-safe.
+    let rel_step = (-1.0f64 / (RELEASE_TAU * sm.sr)).exp();
     for k in 0..n {
         let mut acc = 0.0f64;
         for v in &mut sm.voices {
@@ -575,6 +567,13 @@ extern "C" fn process(s: *mut core::ffi::c_void, out: *mut f32, n: usize, params
             let b = buf[i + 1] as f64;
             acc += (a + (b - a) * frac) * v.vel * v.rel * (1.0 + 0.5 * v.press);
             v.pos += v.rate * bend_ratio;
+            if v.releasing {
+                v.rel *= rel_step;
+                if v.rel < RELEASE_FLOOR {
+                    v.on = false;
+                    v.releasing = false;
+                }
+            }
             if v.pos > buf.len() as f64 - 1.0 {
                 v.on = false;
             }

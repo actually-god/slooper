@@ -3573,32 +3573,36 @@ pub extern "C" fn slooper_synth_info_v2() -> *const SynthInfoV2 { &DESC_V2 }
     #[test]
     fn v183_sampler_note_off_tracks_channel() {
         let reg = v51_registry();
-        v183_step_tones();
+        v183_tones();
         let inst = v51_sampler(&reg);
-        inst.set_map(&[(0, 60, 127)], 0);
+        // Same root key, two velocity LAYERS: ch-0 plays with vel 64 ->
+        // the 200 Hz asset; ch-1 plays with vel 112 -> the 800 Hz asset.
+        // Frequency identity survives release tails: which LINE died
+        // says exactly which press the key-up released.
+        inst.set_map(&[(0, 60, 64), (1, 60, 112)], 0);
         let mut ev: Vec<(u64, u8, u8, u8, u8)> = vec![
-            (0, 3, 0, 60, 110),     // ch 0 press (pos == frame: ages fast)
-            (4_800, 3, 1, 60, 110), // ch 1 press, SAME note (4800 behind)
-            (14_400, 0, 1, 60, 0),  // release the ch-1 key only
-            (33_600, 0, 0, 60, 0),  // release the ch-0 key
+            (0, 3, 0, 60, 64),     // ch 0 press -> 200 Hz
+            (4_800, 3, 1, 60, 112), // ch 1 press -> 800 Hz (same note!)
+            (14_400, 0, 1, 60, 0), // release the ch-1 key (NEWER press)
+            (45_600, 0, 0, 60, 0), // release the ch-0 key
         ];
-        let x = v183_render(&inst, &mut ev, 60_000);
+        let x = v183_render(&inst, &mut ev, 72_000);
         let lp = |f: f64, a: usize, b: usize| line_power(&x, f, 48000.0, a, b);
-        let both = lp(200.0, 9_600, 14_400);
-        assert!(both > 5e4, "both channels must sound before any off: {both}");
-        // Window 16_800..21_600 distinguishes the survivor: the ch-0
-        // press (released? NO — it must live) is deep in the quiet half
-        // (~1e4), while a ch-blind implementation that released the
-        // OLDEST press instead (ch 0!) would show the loud ch-1 press
-        // (~6e5), and releasing both would show silence (~0).
-        let one = lp(200.0, 16_800, 21_600);
-        assert!(
-            one > 1e2 && one < 5e4,
-            "exactly the ch-0 voice must survive the ch-1 off, in its quiet half: {one}"
-        );
-        // ch-0 off was at 33_600; the ramp floor kills the voice by
-        // ~345 ms (16_580 frames) -> this window is fully silent.
-        let none = lp(200.0, 55_200, 60_000);
-        assert!(none < 50.0, "the ch-0 off must end the last voice: {none}");
+        let p2 = lp(200.0, 7_200, 9_600);
+        let p8 = lp(800.0, 7_200, 9_600);
+        assert!(p2 > 5e4 && p8 > 5e4, "both layers must sound before the offs: {p2} {p8}");
+        // Window starts 18.2k frames after the ch-1 off (release floor
+        // kills that voice by 16.6k): the 800 Hz LINE is gone while the
+        // 200 Hz line — SAME note, other channel — still plays at full
+        // level. A ch-blind matcher would have released the OLDEST
+        // press (ch 0!) and read the opposite.
+        let q2 = lp(200.0, 33_600, 38_400);
+        let q8 = lp(800.0, 33_600, 38_400);
+        assert!(q2 > 5e4, "the ch-0 voice (same note!) must live through the ch-1 off: {q2}");
+        assert!(q8 < 50.0, "the ch-1 voice must be released by its own key: {q8}");
+        // After the ch-0 off (+ its full release ramp) everything is gone.
+        let r2 = lp(200.0, 64_800, 69_600);
+        let r8 = lp(800.0, 64_800, 69_600);
+        assert!(r2 < 50.0 && r8 < 50.0, "both offs must end the instrument: {r2} {r8}");
     }
 }
